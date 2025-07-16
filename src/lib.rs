@@ -131,6 +131,10 @@ impl<T: Sized> SharedQueue<T> {
         aligned_ptr.cast()
     }
 
+    fn capacity(&self) -> usize {
+        self.buffer_mask + 1
+    }
+
     fn mask(&self, index: usize) -> usize {
         index & self.buffer_mask
     }
@@ -173,6 +177,11 @@ impl<T: Sized> Producer<T> {
         Ok(Self {
             queue: SharedQueue::from_header(header)?,
         })
+    }
+
+    /// Return the capacity of the queue in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
     }
 
     /// Reserves a position, and increments the cached write position.
@@ -231,6 +240,11 @@ impl<T: Sized> Consumer<T> {
         })
     }
 
+    /// Return the capacity of the queue in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
     pub fn try_read(&mut self) -> Option<NonNull<T>> {
@@ -284,9 +298,13 @@ mod tests {
     fn test_producer_consumer() {
         type Item = AtomicU64;
         const ITEM_SIZE: usize = core::mem::size_of::<Item>();
-        const BUFFER_SIZE: usize = HEADER_SIZE + 1024 * ITEM_SIZE;
+        const BUFFER_CAPACITY: usize = 1024;
+        const BUFFER_SIZE: usize = HEADER_SIZE + BUFFER_CAPACITY * ITEM_SIZE;
         let mut buffer = vec![0u8; BUFFER_SIZE];
         let (mut producer, mut consumer) = create_test_queue::<Item>(&mut buffer);
+
+        assert_eq!(producer.capacity(), BUFFER_CAPACITY);
+        assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
 
         unsafe {
             producer
@@ -300,6 +318,38 @@ mod tests {
             consumer.sync();
             let item = consumer.try_read().expect("Failed to read item");
             assert_eq!(item.as_ref().load(Ordering::Acquire), 42);
+            assert!(consumer.try_read().is_none()); // no more items to read
+            consumer.finalize();
+            producer.sync();
+
+            // Ensure we can push up to the capacity.
+            for _ in 0..BUFFER_CAPACITY {
+                let spot = producer.reserve().expect("Failed to reserve");
+                spot.as_ref().store(1, Ordering::Release);
+            }
+            assert!(producer.reserve().is_none()); // buffer is full, we cannot reserve more
+            producer.commit();
+            consumer.sync();
+            for _ in 0..BUFFER_CAPACITY {
+                let item = consumer.try_read().expect("Failed to read item");
+                assert_eq!(item.as_ref().load(Ordering::Acquire), 1);
+            }
+            assert!(consumer.try_read().is_none()); // no more items to read
+            consumer.finalize();
+            producer.sync();
+
+            // Ensure we can reserve again after finalizing/sync.
+            let spot = producer
+                .reserve()
+                .expect("Failed to reserve after finalize");
+            spot.as_ref().store(2, Ordering::Release);
+            producer.commit();
+            consumer.sync();
+            let item = consumer
+                .try_read()
+                .expect("Failed to read item after finalize");
+            assert_eq!(item.as_ref().load(Ordering::Acquire), 2);
+            consumer.finalize();
         }
     }
 }
