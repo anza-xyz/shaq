@@ -46,7 +46,7 @@ impl SharedQueueHeader {
         let mut buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
         if !buffer_size_in_items.is_power_of_two() {
             // If not a power of two, round down to the previous power of two.
-            buffer_size_in_items = buffer_size_in_items.next_power_of_two() << 1;
+            buffer_size_in_items = buffer_size_in_items.next_power_of_two() >> 1;
             if buffer_size_in_items == 0 {
                 return Err(Error::InvalidBufferSize);
             }
@@ -221,6 +221,15 @@ impl<T: Sized> Consumer<T> {
         self.queue.cached_read = self.queue.cached_read.wrapping_add(1);
 
         Some(read_ptr)
+    }
+
+    /// Publishes the read position, making it visible to the producer.
+    /// All previously read items MUST be processed before this is called.
+    pub fn finalize(&self) {
+        self.queue
+            .header()
+            .read
+            .store(self.queue.cached_read, Ordering::Release);
     }
 
     /// Synchronizes the consumer's cached write position with the queue's write position.
