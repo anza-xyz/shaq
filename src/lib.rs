@@ -31,8 +31,17 @@ struct SharedQueueHeader {
     buffer_size: usize,
 }
 
+pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
+
 impl SharedQueueHeader {
     fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
+        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
+        let header = create_and_map_file(path, size)?.cast::<Self>();
+        Self::initialize::<T>(header, buffer_size_in_items);
+        Ok(header)
+    }
+
+    const fn calculate_buffer_size_in_items<T: Sized>(file_size: usize) -> Result<usize, Error> {
         // size of buffer must be a power of two.
         // buffer must also align with T.
         let alignment = core::mem::align_of::<T>();
@@ -41,8 +50,12 @@ impl SharedQueueHeader {
         // Round up to the next alignment of T - `alignment` must be a power of two.
         let buffer_offset = (buffer_offset + alignment - 1) & !(alignment - 1);
 
+        if file_size < buffer_offset {
+            return Err(Error::InvalidBufferSize);
+        }
+
         // The buffer size (in units of T) must be a power of two.
-        let buffer_size_in_bytes = size - buffer_offset;
+        let buffer_size_in_bytes = file_size - buffer_offset;
         let mut buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
         if !buffer_size_in_items.is_power_of_two() {
             // If not a power of two, round down to the previous power of two.
@@ -52,15 +65,14 @@ impl SharedQueueHeader {
             }
         }
 
-        let mut header = create_and_map_file(path, size)?.cast::<Self>();
-        {
-            let header = unsafe { header.as_mut() };
-            header.write.store(0, Ordering::Release);
-            header.read.store(0, Ordering::Release);
-            header.buffer_size = buffer_size_in_items;
-        }
+        Ok(buffer_size_in_items)
+    }
 
-        Ok(header)
+    fn initialize<T: Sized>(mut header: NonNull<Self>, buffer_size_in_items: usize) {
+        let header = unsafe { header.as_mut() };
+        header.write.store(0, Ordering::Release);
+        header.read.store(0, Ordering::Release);
+        header.buffer_size = buffer_size_in_items;
     }
 
     fn join<T: Sized>(path: impl AsRef<Path>) -> Result<NonNull<Self>, Error> {
@@ -96,6 +108,7 @@ impl<T: Sized> SharedQueue<T> {
         debug_assert!(size.is_power_of_two() && size > 0, "Invalid buffer size");
 
         let buffer = Self::buffer_from_header(header);
+
         let mut queue = Self {
             header,
             buffer,
@@ -111,7 +124,8 @@ impl<T: Sized> SharedQueue<T> {
     }
 
     fn buffer_from_header(header: NonNull<SharedQueueHeader>) -> NonNull<T> {
-        let byte_ptr = header.cast::<u8>();
+        let after_header = unsafe { header.add(1) };
+        let byte_ptr = after_header.cast::<u8>();
         let offset_to_align = byte_ptr.align_offset(core::mem::align_of::<T>());
         let aligned_ptr = unsafe { byte_ptr.byte_add(offset_to_align) };
         aligned_ptr.cast()
@@ -243,5 +257,49 @@ impl<T: Sized> Consumer<T> {
     /// Synchronizes the consumer's cached write position with the queue's write position.
     pub fn sync(&mut self) {
         self.queue.load_write();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    use super::*;
+
+    fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
+        let file_size = buffer.len();
+        let buffer_size_in_items =
+            SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
+                .expect("Invalid buffer size");
+        let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
+        SharedQueueHeader::initialize::<T>(header, buffer_size_in_items);
+
+        (
+            Producer::from_header(header).expect("Failed to create producer"),
+            Consumer::from_header(header).expect("Failed to create consumer"),
+        )
+    }
+
+    #[test]
+    fn test_producer_consumer() {
+        type Item = AtomicU64;
+        const ITEM_SIZE: usize = core::mem::size_of::<Item>();
+        const BUFFER_SIZE: usize = HEADER_SIZE + 1024 * ITEM_SIZE;
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let (mut producer, mut consumer) = create_test_queue::<Item>(&mut buffer);
+
+        unsafe {
+            producer
+                .reserve()
+                .expect("Failed to reserve")
+                .as_ref()
+                .store(42, Ordering::Release);
+            assert!(consumer.try_read().is_none()); // not committed yet
+            producer.commit();
+            assert!(consumer.try_read().is_none()); // consumer has not synced yet
+            consumer.sync();
+            let item = consumer.try_read().expect("Failed to read item");
+            assert_eq!(item.as_ref().load(Ordering::Acquire), 42);
+        }
     }
 }
