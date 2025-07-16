@@ -141,6 +141,9 @@ pub struct Producer<T: Sized> {
     queue: SharedQueue<T>,
 }
 
+unsafe impl<T> Send for Producer<T> {}
+unsafe impl<T> Sync for Producer<T> {}
+
 impl<T: Sized> Producer<T> {
     pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(path, size)?;
@@ -161,13 +164,15 @@ impl<T: Sized> Producer<T> {
     /// Reserves a position, and increments the cached write position.
     /// Returns `None` if the queue is full.
     pub fn reserve(&mut self) -> Option<NonNull<T>> {
+        // If write is >= read + buffer_size, the queue is written one iteration
+        // ahead of the consumer, and we cannot reserve more space.
         if self.queue.cached_write.wrapping_sub(self.queue.cached_read)
             >= self.queue.header().buffer_size
         {
-            return None; // Queue is full
+            return None;
         }
 
-        let reserved_index = self.queue.mask(self.queue.cached_read);
+        let reserved_index = self.queue.mask(self.queue.cached_write);
         let reserved_ptr = unsafe { self.queue.buffer.add(reserved_index) };
         self.queue.cached_write = self.queue.cached_write.wrapping_add(1);
 
@@ -191,6 +196,9 @@ impl<T: Sized> Producer<T> {
 pub struct Consumer<T: Sized> {
     queue: SharedQueue<T>,
 }
+
+unsafe impl<T> Send for Consumer<T> {}
+unsafe impl<T> Sync for Consumer<T> {}
 
 impl<T: Sized> Consumer<T> {
     pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
