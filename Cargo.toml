@@ -1,7 +1,15 @@
 [package]
 name = "shaq"
+authors = ["Andrew Fitzgerald <apfitzge@gmail.com>"]
 version = "0.1.0"
+description = "SPSC FIFO queue backed by shared memory for IPC"
+readme = "README.md"
+homepage = "https://github.com/apfitzge/shaq"
+repository = "https://github.com/apfitzge/shaq"
+license-file = "LICENSE"
 edition = "2021"
+include = ["src/*.rs", "Cargo.toml"]
+
 
 [dependencies]
 nix = { version = "0.29.0", features = ["feature", "mman"] }
