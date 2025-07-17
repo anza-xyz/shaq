@@ -17,6 +17,7 @@ pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
     buffer_offset + capacity * core::mem::size_of::<T>()
 }
 
+/// Producer side of the SPSC shared queue.
 pub struct Producer<T: Sized> {
     queue: SharedQueue<T>,
 }
@@ -25,11 +26,13 @@ unsafe impl<T> Send for Producer<T> {}
 unsafe impl<T> Sync for Producer<T> {}
 
 impl<T: Sized> Producer<T> {
+    /// Creates a new producer for the shared queue at the specified path with the given size.
     pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(path, size)?;
         Self::from_header(header)
     }
 
+    /// Joins an existing producer for the shared queue at the specified path.
     pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
         let header = SharedQueueHeader::join::<T>(path)?;
         Self::from_header(header)
@@ -48,6 +51,10 @@ impl<T: Sized> Producer<T> {
 
     /// Reserves a position, and increments the cached write position.
     /// Returns `None` if the queue is full.
+    /// Returns a pointer to the reserved position.
+    ///
+    /// All reserved positions should be written and pointers discarded before
+    /// calling `commit`.
     pub fn reserve(&mut self) -> Option<NonNull<T>> {
         // If write is >= read + buffer_size, the queue is written one iteration
         // ahead of the consumer, and we cannot reserve more space.
@@ -58,6 +65,7 @@ impl<T: Sized> Producer<T> {
         }
 
         let reserved_index = self.queue.mask(self.queue.cached_write);
+        // SAFETY: The reserved index is guaranteed to be within bounds given the mask.
         let reserved_ptr = unsafe { self.queue.buffer.add(reserved_index) };
         self.queue.cached_write = self.queue.cached_write.wrapping_add(1);
 
@@ -78,6 +86,7 @@ impl<T: Sized> Producer<T> {
     }
 }
 
+/// Consumer side of the SPSC shared queue.
 pub struct Consumer<T: Sized> {
     queue: SharedQueue<T>,
 }
@@ -86,11 +95,13 @@ unsafe impl<T> Send for Consumer<T> {}
 unsafe impl<T> Sync for Consumer<T> {}
 
 impl<T: Sized> Consumer<T> {
+    /// Creates a new consumer for the shared queue at the specified path with the given size.
     pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(path, size)?;
         Self::from_header(header)
     }
 
+    /// Joins an existing consumer for the shared queue at the specified path.
     pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
         let header = SharedQueueHeader::join::<T>(path)?;
         Self::from_header(header)
@@ -109,6 +120,10 @@ impl<T: Sized> Consumer<T> {
 
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
+    /// Returns a pointer to the value if available.
+    ///
+    /// All read items should be processed and pointers discarded before
+    /// calling `finalize`.
     pub fn try_read(&mut self) -> Option<NonNull<T>> {
         if self.queue.cached_read == self.queue.cached_write {
             return None; // Queue is empty
