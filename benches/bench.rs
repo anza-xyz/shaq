@@ -22,6 +22,7 @@ fn bench_queue_with_size<const N: usize>(c: &mut Criterion) {
     group.bench_function("push_pop", |b| {
         b.iter(|| {
             // Sync. Enqueue. Commit.
+            producer.sync();
             for _ in 0..NUM_ITEMS_PER_ITERATION {
                 let mut spot = producer.reserve().unwrap();
                 unsafe { spot.as_mut() }.data = [5; N];
