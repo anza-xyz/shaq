@@ -53,17 +53,17 @@ fn open_file(path: impl AsRef<Path>) -> Result<File, Error> {
 /// Maps a file into memory.
 fn map(file: &File, size: usize) -> Result<*mut u8, Error> {
     let addr = unsafe {
-        nix::libc::mmap(
+        libc::mmap(
             core::ptr::null_mut(),
             size,
-            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
-            nix::libc::MAP_SHARED,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
             file.as_raw_fd(),
             0,
         )
     };
 
-    if addr == nix::libc::MAP_FAILED {
+    if addr == libc::MAP_FAILED {
         Err(Error::Mmap(std::io::Error::last_os_error()))
     } else {
         Ok(addr.cast())

@@ -12,7 +12,7 @@ include = ["src/*.rs", "Cargo.toml"]
 
 
 [dependencies]
-nix = { version = "0.29.0", features = ["feature", "mman"] }
+libc = { version = "0.2.174" }
 
 [dev-dependencies]
 core_affinity = "0.8.3"
