@@ -8,9 +8,4 @@ nix = { version = "0.29.0", features = ["feature", "mman"] }
 
 [dev-dependencies]
 core_affinity = "0.8.3"
-criterion = "0.5.1"
 ctrlc = "3.4.6"
-
-[[bench]]
-name = "bench"
-harness = false
