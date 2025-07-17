@@ -225,7 +225,7 @@ impl SharedQueueHeader {
     fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
         let header = create_and_map_file(path, size)?.cast::<Self>();
-        Self::initialize::<T>(header, buffer_size_in_items);
+        Self::initialize(header, buffer_size_in_items);
         Ok(header)
     }
 
@@ -254,7 +254,7 @@ impl SharedQueueHeader {
         Ok(buffer_size_in_items)
     }
 
-    fn initialize<T: Sized>(mut header: NonNull<Self>, buffer_size_in_items: usize) {
+    fn initialize(mut header: NonNull<Self>, buffer_size_in_items: usize) {
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
@@ -306,7 +306,7 @@ mod tests {
             SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
                 .expect("Invalid buffer size");
         let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
-        SharedQueueHeader::initialize::<T>(header, buffer_size_in_items);
+        SharedQueueHeader::initialize(header, buffer_size_in_items);
 
         (
             Producer::from_header(header).expect("Failed to create producer"),

@@ -8,13 +8,13 @@ struct BenchItem<const N: usize> {
 }
 
 fn bench_queue_with_size<const N: usize>(c: &mut Criterion) {
-    let queue_path = format!("/tmp/shaq_bench_queue");
+    let queue_path = "/tmp/shaq_bench_queue";
 
-    let _ = std::fs::remove_file(&queue_path);
+    let _ = std::fs::remove_file(queue_path);
     let size = MAP_SIZE;
 
-    let mut producer = Producer::<BenchItem<N>>::create(&queue_path, size).unwrap();
-    let mut consumer = Consumer::<BenchItem<N>>::join(&queue_path).unwrap();
+    let mut producer = Producer::<BenchItem<N>>::create(queue_path, size).unwrap();
+    let mut consumer = Consumer::<BenchItem<N>>::join(queue_path).unwrap();
 
     const NUM_ITEMS_PER_ITERATION: usize = 1024;
     let mut group = c.benchmark_group(format!("queue/{N}"));
@@ -37,7 +37,7 @@ fn bench_queue_with_size<const N: usize>(c: &mut Criterion) {
             consumer.finalize();
         })
     });
-    let _ = std::fs::remove_file(&queue_path);
+    let _ = std::fs::remove_file(queue_path);
 }
 
 fn bench_queue(c: &mut Criterion) {
