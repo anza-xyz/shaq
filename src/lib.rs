@@ -24,6 +24,7 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
+/// Header in shared memory for the queue.
 #[repr(C)]
 struct SharedQueueHeader {
     write: CacheAlignedAtomicSize,
@@ -31,7 +32,16 @@ struct SharedQueueHeader {
     buffer_size: usize,
 }
 
+/// Size of the header in bytes.
 pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
+
+/// Calculates the minimum file size required for a queue with given capacity.
+/// Note that file size MAY need to be increased beyond this to account for
+/// page-size requirements.
+pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
+    let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
+    buffer_offset + capacity * core::mem::size_of::<T>()
+}
 
 impl SharedQueueHeader {
     fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
@@ -41,15 +51,13 @@ impl SharedQueueHeader {
         Ok(header)
     }
 
+    const fn buffer_offset<T: Sized>() -> usize {
+        (core::mem::size_of::<Self>() + core::mem::align_of::<T>() - 1)
+            & !(core::mem::align_of::<T>() - 1)
+    }
+
     const fn calculate_buffer_size_in_items<T: Sized>(file_size: usize) -> Result<usize, Error> {
-        // size of buffer must be a power of two.
-        // buffer must also align with T.
-        let alignment = core::mem::align_of::<T>();
-
-        let buffer_offset = core::mem::size_of::<Self>();
-        // Round up to the next alignment of T - `alignment` must be a power of two.
-        let buffer_offset = (buffer_offset + alignment - 1) & !(alignment - 1);
-
+        let buffer_offset = Self::buffer_offset::<T>();
         if file_size < buffer_offset {
             return Err(Error::InvalidBufferSize);
         }
