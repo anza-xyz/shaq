@@ -27,20 +27,20 @@ unsafe impl<T> Sync for Producer<T> {}
 
 impl<T: Sized> Producer<T> {
     /// Creates a new producer for the shared queue at the specified path with the given size.
-    pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
-        let header = SharedQueueHeader::create::<T>(path, size)?;
-        Self::from_header(header)
+    pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
+        let header = SharedQueueHeader::create::<T>(path, file_size)?;
+        Self::from_header(header, file_size)
     }
 
     /// Joins an existing producer for the shared queue at the specified path.
     pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let header = SharedQueueHeader::join::<T>(path)?;
-        Self::from_header(header)
+        let (header, file_size) = SharedQueueHeader::join::<T>(path)?;
+        Self::from_header(header, file_size)
     }
 
-    fn from_header(header: NonNull<SharedQueueHeader>) -> Result<Self, Error> {
+    fn from_header(header: NonNull<SharedQueueHeader>, file_size: usize) -> Result<Self, Error> {
         Ok(Self {
-            queue: SharedQueue::from_header(header)?,
+            queue: SharedQueue::from_header(header, file_size)?,
         })
     }
 
@@ -96,20 +96,20 @@ unsafe impl<T> Sync for Consumer<T> {}
 
 impl<T: Sized> Consumer<T> {
     /// Creates a new consumer for the shared queue at the specified path with the given size.
-    pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
-        let header = SharedQueueHeader::create::<T>(path, size)?;
-        Self::from_header(header)
+    pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
+        let header = SharedQueueHeader::create::<T>(path, file_size)?;
+        Self::from_header(header, file_size)
     }
 
     /// Joins an existing consumer for the shared queue at the specified path.
     pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let header = SharedQueueHeader::join::<T>(path)?;
-        Self::from_header(header)
+        let (header, file_size) = SharedQueueHeader::join::<T>(path)?;
+        Self::from_header(header, file_size)
     }
 
-    fn from_header(header: NonNull<SharedQueueHeader>) -> Result<Self, Error> {
+    fn from_header(header: NonNull<SharedQueueHeader>, file_size: usize) -> Result<Self, Error> {
         Ok(Self {
-            queue: SharedQueue::from_header(header)?,
+            queue: SharedQueue::from_header(header, file_size)?,
         })
     }
 
@@ -155,19 +155,36 @@ struct SharedQueue<T: Sized> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
 
+    file_size: usize,
     buffer_mask: usize,
     cached_write: usize,
     cached_read: usize,
 }
 
+impl<T> Drop for SharedQueue<T> {
+    fn drop(&mut self) {
+        // Tests do not mmap so skip unmapping in tests.
+        #[cfg(test)]
+        {
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        unsafe {
+            libc::munmap(self.buffer.as_ptr().cast(), self.file_size);
+        }
+    }
+}
+
 impl<T: Sized> SharedQueue<T> {
-    fn from_header(header: NonNull<SharedQueueHeader>) -> Result<Self, Error> {
+    fn from_header(header: NonNull<SharedQueueHeader>, file_size: usize) -> Result<Self, Error> {
         let size = unsafe { header.as_ref().buffer_size };
         debug_assert!(size.is_power_of_two() && size > 0, "Invalid buffer size");
 
         let buffer = Self::buffer_from_header(header);
 
         let mut queue = Self {
+            file_size,
             header,
             buffer,
             buffer_mask: size - 1,
@@ -261,7 +278,7 @@ impl SharedQueueHeader {
         header.buffer_size = buffer_size_in_items;
     }
 
-    fn join<T: Sized>(path: impl AsRef<Path>) -> Result<NonNull<Self>, Error> {
+    fn join<T: Sized>(path: impl AsRef<Path>) -> Result<(NonNull<Self>, usize), Error> {
         let (header, file_size) = open_and_map_file(path)?;
         let header = header.cast::<Self>();
         {
@@ -275,7 +292,7 @@ impl SharedQueueHeader {
             }
         }
 
-        Ok(header)
+        Ok((header, file_size))
     }
 }
 
@@ -309,8 +326,8 @@ mod tests {
         SharedQueueHeader::initialize(header, buffer_size_in_items);
 
         (
-            Producer::from_header(header).expect("Failed to create producer"),
-            Consumer::from_header(header).expect("Failed to create consumer"),
+            Producer::from_header(header, file_size).expect("Failed to create producer"),
+            Consumer::from_header(header, file_size).expect("Failed to create consumer"),
         )
     }
 
