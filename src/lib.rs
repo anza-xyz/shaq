@@ -54,6 +54,11 @@ impl<T: Sized> Producer<T> {
         self.queue.len()
     }
 
+    /// Returns true if the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     /// Reserves a position, and increments the cached write position.
     /// Returns `None` if the queue is full.
     /// Returns a pointer to the reserved position.
@@ -126,6 +131,11 @@ impl<T: Sized> Consumer<T> {
     /// Return the current length of the queue.
     pub fn len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Returns true if the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     /// Attempts to read a value from the queue.
@@ -222,6 +232,10 @@ impl<T: Sized> SharedQueue<T> {
 
     fn len(&self) -> usize {
         self.cached_write.wrapping_sub(self.cached_read)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cached_write == self.cached_read
     }
 
     fn mask(&self, index: usize) -> usize {
