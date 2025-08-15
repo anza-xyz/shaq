@@ -269,15 +269,12 @@ impl<T: Sized> SharedQueue<T> {
     /// - The allocation at `header` must be of sufficient size to hold the
     ///   header and padding bytes to align the trailing buffer of `T`.
     unsafe fn buffer_from_header(header: NonNull<SharedQueueHeader>) -> NonNull<T> {
-        // SAFETY: The header is guaranteed to be non-null and properly aligned.
-        let after_header = unsafe { header.add(1) };
-        let byte_ptr = after_header.cast::<u8>();
+        let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
 
-        let offset_to_align = byte_ptr.align_offset(core::mem::align_of::<T>());
         // SAFETY:
-        // - offset_to_align * core::mem::size_of::<u8>() does not overflow isize.
+        // - buffer_offset will not overflow isize.
         // - header allocation is large enough to accommodate the alignment.
-        let aligned_ptr = unsafe { byte_ptr.byte_add(offset_to_align) };
+        let aligned_ptr = unsafe { header.byte_add(buffer_offset) };
         aligned_ptr.cast()
     }
 
