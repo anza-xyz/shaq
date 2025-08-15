@@ -323,8 +323,11 @@ impl SharedQueueHeader {
     fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
         let header = create_and_map_file(path, size)?.cast::<Self>();
-        // SAFETY: `header` is non-null and aligned properly, and the allocation
-        //         is large enough to hold the header and the buffer.
+        // SAFETY: The header is non-null and aligned properly.
+        //         Alignment is guaranteed because `create_and_map_file` will return
+        //         a pointer only if mapping was successful. mmap ensures that the
+        //         memory is aligned to the page size, which is sufficient for the
+        //         alignment of `SharedQueueHeader`.
         unsafe { Self::initialize(header, buffer_size_in_items) };
         Ok(header)
     }
@@ -380,11 +383,7 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.buffer_size == 0
-                || !header.buffer_size.is_power_of_two()
-                || header.buffer_size * core::mem::size_of::<T>() + core::mem::size_of::<Self>()
-                    > file_size
-            {
+            if header.buffer_size != Self::calculate_buffer_size_in_items::<T>(file_size)? {
                 return Err(Error::InvalidBufferSize);
             }
         }
