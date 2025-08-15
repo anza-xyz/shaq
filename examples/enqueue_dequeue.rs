@@ -37,19 +37,20 @@ fn main() {
     println!("Cleaning queue file: {queue_path}");
     let _ = std::fs::remove_file(queue_path);
 
-    println!("Initializing file");
-    let producer = shaq::Producer::create(queue_path, 16 * 1024 * 1024).unwrap();
-    let consumer = shaq::Consumer::join(queue_path).unwrap();
-
+    let begin_signal = Arc::new(AtomicBool::new(false));
     let consumer_hdl = std::thread::Builder::new()
         .name("shaqConsumer".to_string())
         .spawn({
+            let begin = begin_signal.clone();
             let exit = exit.clone();
             move || {
                 if let Some(id) = consumer_core_id {
                     core_affinity::set_for_current(id);
                 }
 
+                // Wait until the producer is ready - it creates the file.
+                while !begin.load(Ordering::Acquire) {}
+                let consumer = shaq::Consumer::join(queue_path).unwrap();
                 run_consumer(consumer, exit)
             }
         })
@@ -62,6 +63,8 @@ fn main() {
                 core_affinity::set_for_current(id);
             }
 
+            let producer = shaq::Producer::create(queue_path, 16 * 1024 * 1024).unwrap();
+            begin_signal.store(true, Ordering::Release);
             run_producer(producer, exit);
         })
         .unwrap();
