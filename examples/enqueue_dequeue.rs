@@ -50,7 +50,8 @@ fn main() {
 
                 // Wait until the producer is ready - it creates the file.
                 while !begin.load(Ordering::Acquire) {}
-                let consumer = shaq::Consumer::join(queue_path).unwrap();
+                // SAFETY: The file is created by the producer and is uniquely accessed as a Consumer.
+                let consumer = unsafe { shaq::Consumer::join(queue_path) }.unwrap();
                 run_consumer(consumer, exit)
             }
         })

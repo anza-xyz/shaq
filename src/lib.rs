@@ -26,18 +26,33 @@ impl<T: Sized> Producer<T> {
     /// Creates a new producer for the shared queue at the specified path with the given size.
     pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(path, file_size)?;
-        Self::from_header(header, file_size)
+        // SAFETY: `header` is non-null and aligned properly and allocated with
+        //         size of `file_size`.
+        unsafe { Self::from_header(header, file_size) }
     }
 
     /// Joins an existing producer for the shared queue at the specified path.
+    ///
+    /// # SAFETY: The file at `path` must be uniquely accessed as a Producer.
     pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(path)?;
-        Self::from_header(header, file_size)
+        // SAFETY: `header` is non-null and aligned properly and allocated with
+        //         size of `file_size`.
+        unsafe { Self::from_header(header, file_size) }
     }
 
-    fn from_header(header: NonNull<SharedQueueHeader>, file_size: usize) -> Result<Self, Error> {
+    /// # Safety
+    /// - `header` must be non-null and properly aligned.
+    /// - allocation at `header` must be of size `file_size` or greater.
+    unsafe fn from_header(
+        header: NonNull<SharedQueueHeader>,
+        file_size: usize,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            queue: SharedQueue::from_header(header, file_size)?,
+            // SAFETY:
+            // - `header` is non-null and aligned properly.
+            // - allocation at `header` is large enough to hold the header and the buffer.
+            queue: unsafe { SharedQueue::from_header(header, file_size) }?,
         })
     }
 
@@ -102,18 +117,34 @@ impl<T: Sized> Consumer<T> {
     /// Creates a new consumer for the shared queue at the specified path with the given size.
     pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(path, file_size)?;
-        Self::from_header(header, file_size)
+        // SAFETY: `header` is non-null and aligned properly and allocated with
+        //         size of `file_size`.
+        unsafe { Self::from_header(header, file_size) }
     }
 
     /// Joins an existing consumer for the shared queue at the specified path.
-    pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
+    ///
+    /// # Safety
+    /// - The file at `path` must be uniquely accessed as a Consumer.
+    pub unsafe fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(path)?;
-        Self::from_header(header, file_size)
+        // SAFETY: `header` is non-null and aligned properly and allocated with
+        //         size of `file_size`.
+        unsafe { Self::from_header(header, file_size) }
     }
 
-    fn from_header(header: NonNull<SharedQueueHeader>, file_size: usize) -> Result<Self, Error> {
+    /// # Safety
+    /// - `header` must be non-null and properly aligned.
+    /// - allocation at `header` must be of size `file_size` or greater.
+    unsafe fn from_header(
+        header: NonNull<SharedQueueHeader>,
+        file_size: usize,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            queue: SharedQueue::from_header(header, file_size)?,
+            // SAFETY:
+            // - `header` is non-null and aligned properly.
+            // - allocation at `header` is large enough to hold the header and the buffer.
+            queue: unsafe { SharedQueue::from_header(header, file_size) }?,
         })
     }
 
@@ -144,6 +175,7 @@ impl<T: Sized> Consumer<T> {
         }
 
         let read_index = self.queue.mask(self.queue.cached_read);
+        // SAFETY: read_index is guaranteed to be within bounds given the mask.
         let read_ptr = unsafe { self.queue.buffer.add(read_index) };
         self.queue.cached_read = self.queue.cached_read.wrapping_add(1);
 
@@ -184,6 +216,7 @@ impl<T> Drop for SharedQueue<T> {
         }
 
         #[allow(unreachable_code)]
+        // SAFETY: buffer is mmapped and of size `file_size`.
         unsafe {
             libc::munmap(self.buffer.as_ptr().cast(), self.file_size);
         }
@@ -191,11 +224,28 @@ impl<T> Drop for SharedQueue<T> {
 }
 
 impl<T: Sized> SharedQueue<T> {
-    fn from_header(header: NonNull<SharedQueueHeader>, file_size: usize) -> Result<Self, Error> {
+    /// Creates a new shared queue from a header pointer and file size.
+    ///
+    /// # Safety
+    /// - `header` must be non-null and properly aligned.
+    /// - allocation at `header` must be of size `file_size`.
+    unsafe fn from_header(
+        header: NonNull<SharedQueueHeader>,
+        file_size: usize,
+    ) -> Result<Self, Error> {
+        // SAFETY: `header` is non-null and aligned properly.
         let size = unsafe { header.as_ref().buffer_size };
-        debug_assert!(size.is_power_of_two() && size > 0, "Invalid buffer size");
 
-        let buffer = Self::buffer_from_header(header);
+        if !size.is_power_of_two()
+            || size == 0
+            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)? != size
+        {
+            return Err(Error::InvalidBufferSize);
+        }
+
+        // SAFETY: `header` is non-null and aligned properly with allocation
+        //         of size file_size.
+        let buffer = unsafe { Self::buffer_from_header(header) };
 
         let mut queue = Self {
             file_size,
@@ -212,10 +262,21 @@ impl<T: Sized> SharedQueue<T> {
         Ok(queue)
     }
 
-    fn buffer_from_header(header: NonNull<SharedQueueHeader>) -> NonNull<T> {
+    /// Gets a pointer to the buffer following the header.
+    ///
+    /// # Safety
+    /// - The header must be non-null and properly aligned.
+    /// - The allocation at `header` must be of sufficient size to hold the
+    ///   header and padding bytes to align the trailing buffer of `T`.
+    unsafe fn buffer_from_header(header: NonNull<SharedQueueHeader>) -> NonNull<T> {
+        // SAFETY: The header is guaranteed to be non-null and properly aligned.
         let after_header = unsafe { header.add(1) };
         let byte_ptr = after_header.cast::<u8>();
+
         let offset_to_align = byte_ptr.align_offset(core::mem::align_of::<T>());
+        // SAFETY:
+        // - offset_to_align * core::mem::size_of::<u8>() does not overflow isize.
+        // - header allocation is large enough to accommodate the alignment.
         let aligned_ptr = unsafe { byte_ptr.byte_add(offset_to_align) };
         aligned_ptr.cast()
     }
@@ -238,6 +299,7 @@ impl<T: Sized> SharedQueue<T> {
 
     #[inline]
     fn header(&self) -> &SharedQueueHeader {
+        // SAFETY: See safety on `from_header`. `header` is non-null and aligned.
         unsafe { self.header.as_ref() }
     }
 
@@ -264,7 +326,9 @@ impl SharedQueueHeader {
     fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
         let header = create_and_map_file(path, size)?.cast::<Self>();
-        Self::initialize(header, buffer_size_in_items);
+        // SAFETY: `header` is non-null and aligned properly, and the allocation
+        //         is large enough to hold the header and the buffer.
+        unsafe { Self::initialize(header, buffer_size_in_items) };
         Ok(header)
     }
 
@@ -293,7 +357,16 @@ impl SharedQueueHeader {
         Ok(buffer_size_in_items)
     }
 
-    fn initialize(mut header: NonNull<Self>, buffer_size_in_items: usize) {
+    /// Initializes the shared queue header.
+    ///
+    /// # Safety
+    /// - `header` must be non-null and properly aligned.
+    /// - `header` allocation must be large enough to hold the header and the buffer.
+    /// - `access` to `header` must be unique when this is called.
+    unsafe fn initialize(mut header: NonNull<Self>, buffer_size_in_items: usize) {
+        // SAFETY:
+        // - `header` is non-null and aligned properly.
+        // - `access` to `header` is unique.
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
@@ -304,6 +377,11 @@ impl SharedQueueHeader {
         let (header, file_size) = open_and_map_file(path)?;
         let header = header.cast::<Self>();
         {
+            // SAFETY: The header is non-null and aligned properly.
+            //         Alignment is guaranteed because `open_and_map_file` will return
+            //         a pointer only if mapping was successful. mmap ensures that the
+            //         memory is aligned to the page size, which is sufficient for the
+            //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
             if header.buffer_size == 0
                 || !header.buffer_size.is_power_of_two()
@@ -345,11 +423,11 @@ mod tests {
             SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
                 .expect("Invalid buffer size");
         let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
-        SharedQueueHeader::initialize(header, buffer_size_in_items);
+        unsafe { SharedQueueHeader::initialize(header, buffer_size_in_items) };
 
         (
-            Producer::from_header(header, file_size).expect("Failed to create producer"),
-            Consumer::from_header(header, file_size).expect("Failed to create consumer"),
+            unsafe { Producer::from_header(header, file_size) }.expect("Failed to create producer"),
+            unsafe { Consumer::from_header(header, file_size) }.expect("Failed to create consumer"),
         )
     }
 
