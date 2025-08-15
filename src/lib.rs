@@ -22,9 +22,6 @@ pub struct Producer<T: Sized> {
     queue: SharedQueue<T>,
 }
 
-unsafe impl<T> Send for Producer<T> {}
-unsafe impl<T> Sync for Producer<T> {}
-
 impl<T: Sized> Producer<T> {
     /// Creates a new producer for the shared queue at the specified path with the given size.
     pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
@@ -100,9 +97,6 @@ impl<T: Sized> Producer<T> {
 pub struct Consumer<T: Sized> {
     queue: SharedQueue<T>,
 }
-
-unsafe impl<T> Send for Consumer<T> {}
-unsafe impl<T> Sync for Consumer<T> {}
 
 impl<T: Sized> Consumer<T> {
     /// Creates a new consumer for the shared queue at the specified path with the given size.
