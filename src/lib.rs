@@ -370,6 +370,7 @@ impl SharedQueueHeader {
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
         header.buffer_size = buffer_size_in_items;
     }
 
@@ -377,13 +378,17 @@ impl SharedQueueHeader {
         let (header, file_size) = open_and_map_file(path)?;
         let header = header.cast::<Self>();
         {
+            let expected_buffer_size = Self::calculate_buffer_size_in_items::<T>(file_size)?;
+
             // SAFETY: The header is non-null and aligned properly.
             //         Alignment is guaranteed because `open_and_map_file` will return
             //         a pointer only if mapping was successful. mmap ensures that the
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
+            //         `calculate_buffer_size_in_items` verifies the file_size is sufficient
+            //         to contain the header.
             let header = unsafe { header.as_ref() };
-            if header.buffer_size != Self::calculate_buffer_size_in_items::<T>(file_size)? {
+            if header.buffer_size != expected_buffer_size {
                 return Err(Error::InvalidBufferSize);
             }
         }
