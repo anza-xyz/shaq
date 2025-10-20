@@ -1,5 +1,6 @@
 use shaq::{Consumer, Producer};
 use std::{
+    fs::File,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -36,8 +37,15 @@ fn main() {
     let queue_path = "/tmp/shaq";
     println!("Cleaning queue file: {queue_path}");
     let _ = std::fs::remove_file(queue_path);
+    let queue_file = File::options()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(queue_path)
+        .unwrap();
 
     let begin_signal = Arc::new(AtomicBool::new(false));
+    let consumer_file = queue_file.try_clone().unwrap();
     let consumer_hdl = std::thread::Builder::new()
         .name("shaqConsumer".to_string())
         .spawn({
@@ -51,7 +59,7 @@ fn main() {
                 // Wait until the producer is ready - it creates the file.
                 while !begin.load(Ordering::Acquire) {}
                 // SAFETY: The file is created by the producer and is uniquely accessed as a Consumer.
-                let consumer = unsafe { shaq::Consumer::join(queue_path) }.unwrap();
+                let consumer = unsafe { shaq::Consumer::join(&consumer_file) }.unwrap();
                 run_consumer(consumer, exit)
             }
         })
@@ -64,7 +72,7 @@ fn main() {
                 core_affinity::set_for_current(id);
             }
 
-            let producer = shaq::Producer::create(queue_path, 16 * 1024 * 1024).unwrap();
+            let producer = shaq::Producer::create(&queue_file, 16 * 1024 * 1024).unwrap();
             begin_signal.store(true, Ordering::Release);
             run_producer(producer, exit);
         })

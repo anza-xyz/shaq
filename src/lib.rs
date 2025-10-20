@@ -1,10 +1,7 @@
 use core::{ptr::NonNull, sync::atomic::AtomicUsize};
-use std::{path::Path, sync::atomic::Ordering};
+use std::{fs::File, sync::atomic::Ordering};
 
-use crate::{
-    error::Error,
-    shmem::{create_and_map_file, open_and_map_file},
-};
+use crate::{error::Error, shmem::map_file};
 
 pub mod error;
 mod shmem;
@@ -23,19 +20,20 @@ pub struct Producer<T: Sized> {
 }
 
 impl<T: Sized> Producer<T> {
-    /// Creates a new producer for the shared queue at the specified path with the given size.
-    pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
-        let header = SharedQueueHeader::create::<T>(path, file_size)?;
+    /// Creates a new producer for the shared queue in the provided file with
+    /// the given size.
+    pub fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+        let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(header, file_size) }
     }
 
-    /// Joins an existing producer for the shared queue at the specified path.
+    /// Joins an existing producer for the shared queue in the provided file.
     ///
-    /// # SAFETY: The file at `path` must be uniquely accessed as a Producer.
-    pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let (header, file_size) = SharedQueueHeader::join::<T>(path)?;
+    /// # SAFETY: The provided file must be uniquely accessed as a Producer.
+    pub fn join(file: &File) -> Result<Self, Error> {
+        let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(header, file_size) }
@@ -102,7 +100,8 @@ impl<T: Sized> Producer<T> {
             .store(self.queue.cached_write, Ordering::Release);
     }
 
-    /// Synchronize the producer's cached read position with the queue's read position.
+    /// Synchronize the producer's cached read position with the queue's read
+    /// position.
     pub fn sync(&mut self) {
         self.queue.load_read();
     }
@@ -114,20 +113,21 @@ pub struct Consumer<T: Sized> {
 }
 
 impl<T: Sized> Consumer<T> {
-    /// Creates a new consumer for the shared queue at the specified path with the given size.
-    pub fn create(path: impl AsRef<Path>, file_size: usize) -> Result<Self, Error> {
-        let header = SharedQueueHeader::create::<T>(path, file_size)?;
+    /// Creates a new consumer for the shared queue in the provided file with
+    /// the given size.
+    pub fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+        let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(header, file_size) }
     }
 
-    /// Joins an existing consumer for the shared queue at the specified path.
+    /// Joins an existing consumer for the shared queue in the provided file.
     ///
     /// # Safety
-    /// - The file at `path` must be uniquely accessed as a Consumer.
-    pub unsafe fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let (header, file_size) = SharedQueueHeader::join::<T>(path)?;
+    /// - The provided file must be uniquely accessed as a Consumer.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+        let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(header, file_size) }
@@ -320,9 +320,11 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
+    fn create<T: Sized>(file: &File, size: usize) -> Result<NonNull<Self>, Error> {
+        file.set_len(size as u64)?;
+
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
-        let header = create_and_map_file(path, size)?.cast::<Self>();
+        let header = map_file(file, size)?.cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because `create_and_map_file` will return
         //         a pointer only if mapping was successful. mmap ensures that the
@@ -373,8 +375,9 @@ impl SharedQueueHeader {
         header.buffer_size = buffer_size_in_items;
     }
 
-    fn join<T: Sized>(path: impl AsRef<Path>) -> Result<(NonNull<Self>, usize), Error> {
-        let (header, file_size) = open_and_map_file(path)?;
+    fn join<T: Sized>(file: &File) -> Result<(NonNull<Self>, usize), Error> {
+        let file_size = file.metadata()?.len() as usize;
+        let header = map_file(file, file_size)?;
         let header = header.cast::<Self>();
         {
             // SAFETY: The header is non-null and aligned properly.
