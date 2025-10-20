@@ -107,6 +107,8 @@ impl<T: Sized> Producer<T> {
     }
 }
 
+unsafe impl<T> Send for Producer<T> where T: Sized {}
+
 /// Consumer side of the SPSC shared queue.
 pub struct Consumer<T: Sized> {
     queue: SharedQueue<T>,
@@ -196,6 +198,8 @@ impl<T: Sized> Consumer<T> {
         self.queue.load_write();
     }
 }
+
+unsafe impl<T> Send for Consumer<T> where T: Sized {}
 
 struct SharedQueue<T: Sized> {
     header: NonNull<SharedQueueHeader>,
