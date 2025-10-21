@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use core::{ptr::NonNull, sync::atomic::AtomicUsize};
 use std::{fs::File, sync::atomic::Ordering};
 

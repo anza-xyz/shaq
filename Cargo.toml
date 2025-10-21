@@ -10,8 +10,7 @@ license-file = "LICENSE"
 edition = "2021"
 include = ["src/*.rs", "Cargo.toml"]
 
-
-[dependencies]
+[target."cfg(unix)".dependencies]
 libc = { version = "0.2.174" }
 
 [dev-dependencies]
