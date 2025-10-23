@@ -1,7 +1,7 @@
 [package]
 name = "shaq"
 authors = ["Andrew Fitzgerald <apfitzge@gmail.com>"]
-version = "0.1.0"
+version = "0.2.0"
 description = "SPSC FIFO queue backed by shared memory for IPC"
 readme = "README.md"
 homepage = "https://github.com/apfitzge/shaq"
