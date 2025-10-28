@@ -95,7 +95,8 @@ fn run_producer(mut producer: Producer<Item>, exit: Arc<AtomicBool>) {
     while !exit.load(Ordering::Acquire) {
         producer.sync();
         for _ in 0..SYNC_CADENCE {
-            let Some(mut spot) = producer.reserve() else {
+            // SAFETY: ptr written below with fill
+            let Some(mut spot) = (unsafe { producer.reserve() }) else {
                 break;
             };
             unsafe {

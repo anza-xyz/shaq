@@ -73,7 +73,8 @@ impl<T: Sized> Producer<T> {
 
     /// Writes item into the queue or returns it if there is not enough space.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
-        match self.reserve() {
+        // SAFETY: pointer is written below if successfully reserved.
+        match unsafe { self.reserve() } {
             Some(p) => {
                 // SAFETY: `reserve` returns a properly aligned ptr with enough
                 //         space to write T.
@@ -88,9 +89,10 @@ impl<T: Sized> Producer<T> {
     /// Returns `None` if the queue is full.
     /// Returns a pointer to the reserved position.
     ///
-    /// All reserved positions should be written and pointers discarded before
-    /// calling `commit`.
-    pub fn reserve(&mut self) -> Option<NonNull<T>> {
+    /// # Safety
+    /// All reserved positions must be fully initialized before calling `commit`.
+    /// Pointers should be dropped before calling `commit`.
+    pub unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
         // If write is >= read + buffer_size, the queue is written one iteration
         // ahead of the consumer, and we cannot reserve more space.
         if self.queue.cached_write.wrapping_sub(self.queue.cached_read)
