@@ -72,7 +72,8 @@ fn main() {
                 core_affinity::set_for_current(id);
             }
 
-            let producer = shaq::Producer::create(&queue_file, 16 * 1024 * 1024).unwrap();
+            let producer =
+                unsafe { shaq::Producer::create(&queue_file, 16 * 1024 * 1024) }.unwrap();
             begin_signal.store(true, Ordering::Release);
             run_producer(producer, exit);
         })
