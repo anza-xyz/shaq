@@ -23,7 +23,7 @@ pub struct Producer<T: Sized> {
 
 impl<T: Sized> Producer<T> {
     /// Creates a new producer for the shared queue in the provided file with
-    /// the given size.
+    /// the given capacity (in terms of elements).
     ///
     /// # Safety
     /// - The provided file must be created accessed as a Producer.
@@ -137,7 +137,7 @@ pub struct Consumer<T: Sized> {
 
 impl<T: Sized> Consumer<T> {
     /// Creates a new consumer for the shared queue in the provided file with
-    /// the given size.
+    /// the given capacity (in terms of elements).
     ///
     /// # SAFETY: The provided file must be uniquely created as a Consumer.
     pub fn create(file: &File, capacity: usize) -> Result<Self, Error> {
