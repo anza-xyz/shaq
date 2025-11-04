@@ -26,7 +26,7 @@ impl<T: Sized> Producer<T> {
     /// the given size.
     ///
     /// # Safety
-    /// - The provided file must be created accessed as a Producer.
+    /// - The provided file must be uniquely created as a Producer.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
@@ -139,8 +139,9 @@ impl<T: Sized> Consumer<T> {
     /// Creates a new consumer for the shared queue in the provided file with
     /// the given size.
     ///
-    /// # SAFETY: The provided file must be uniquely created as a Consumer.
-    pub fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+    /// # Safety
+    /// - The provided file must be uniquely created as a Consumer.
+    pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
