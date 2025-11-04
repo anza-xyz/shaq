@@ -1,12 +1,16 @@
 #![cfg(unix)]
 
-use core::{ptr::NonNull, sync::atomic::AtomicUsize};
-use std::{fs::File, sync::atomic::Ordering};
-
 use crate::{error::Error, shmem::map_file};
+use core::{ptr::NonNull, sync::atomic::AtomicUsize};
+use std::{
+    fs::File,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 pub mod error;
 mod shmem;
+
+const VERSION: u8 = 1;
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
@@ -356,6 +360,7 @@ struct SharedQueueHeader {
     write: CacheAlignedAtomicSize,
     read: CacheAlignedAtomicSize,
     buffer_size: usize,
+    version: AtomicU8,
 }
 
 impl SharedQueueHeader {
@@ -412,6 +417,7 @@ impl SharedQueueHeader {
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
         header.buffer_size = buffer_size_in_items;
+        header.version.store(VERSION, Ordering::SeqCst);
     }
 
     fn join<T: Sized>(file: &File) -> Result<(NonNull<Self>, usize), Error> {
@@ -425,6 +431,9 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
+            if header.version.load(Ordering::SeqCst) != VERSION {
+                return Err(Error::InvalidVersion);
+            }
             if header.buffer_size != Self::calculate_buffer_size_in_items::<T>(file_size)? {
                 return Err(Error::InvalidBufferSize);
             }
