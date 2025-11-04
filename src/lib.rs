@@ -27,7 +27,7 @@ impl<T: Sized> Producer<T> {
     ///
     /// # Safety
     /// - The provided file must be created accessed as a Producer.
-    pub unsafe fn create(file: &File, capacity: u32) -> Result<Self, Error> {
+    pub unsafe fn create(file: &File, capacity: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, capacity)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -140,7 +140,7 @@ impl<T: Sized> Consumer<T> {
     /// the given size.
     ///
     /// # SAFETY: The provided file must be uniquely created as a Consumer.
-    pub fn create(file: &File, capacity: u32) -> Result<Self, Error> {
+    pub fn create(file: &File, capacity: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, capacity)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -358,13 +358,13 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T: Sized>(file: &File, capacity: u32) -> Result<NonNull<Self>, Error> {
+    fn create<T: Sized>(file: &File, capacity: usize) -> Result<NonNull<Self>, Error> {
         if !capacity.is_power_of_two() {
             return Err(Error::InvalidBufferSize);
         }
 
         // Resize the file to fit the capacity.
-        let size = Self::buffer_offset::<T>() + capacity as usize * core::mem::size_of::<T>();
+        let size = Self::buffer_offset::<T>() + capacity * core::mem::size_of::<T>();
         file.set_len(size as u64)?;
 
         let header = map_file(file, size)?.cast::<Self>();
@@ -408,14 +408,14 @@ impl SharedQueueHeader {
     /// - `header` must be non-null and properly aligned.
     /// - `header` allocation must be large enough to hold the header and the buffer.
     /// - `access` to `header` must be unique when this is called.
-    unsafe fn initialize(mut header: NonNull<Self>, capacity: u32) {
+    unsafe fn initialize(mut header: NonNull<Self>, capacity: usize) {
         // SAFETY:
         // - `header` is non-null and aligned properly.
         // - `access` to `header` is unique.
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
-        header.buffer_size = capacity as usize;
+        header.buffer_size = capacity;
     }
 
     fn join<T: Sized>(file: &File) -> Result<(NonNull<Self>, usize), Error> {
@@ -465,7 +465,7 @@ mod tests {
             SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
                 .expect("Invalid buffer size");
         let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
-        unsafe { SharedQueueHeader::initialize(header, buffer_size_in_items as u32) };
+        unsafe { SharedQueueHeader::initialize(header, buffer_size_in_items) };
 
         (
             unsafe { Producer::from_header(header, file_size) }.expect("Failed to create producer"),
