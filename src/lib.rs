@@ -259,9 +259,9 @@ impl<T> Drop for SharedQueue<T> {
         }
 
         #[allow(unreachable_code)]
-        // SAFETY: buffer is mmapped and of size `file_size`.
+        // SAFETY: header is mmapped and of size `file_size`.
         unsafe {
-            libc::munmap(self.buffer.as_ptr().cast(), self.file_size);
+            libc::munmap(self.header.as_ptr().cast(), self.file_size);
         }
     }
 }
