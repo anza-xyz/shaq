@@ -8,9 +8,10 @@ use std::{
 };
 
 pub mod error;
+pub mod mpmc;
 mod shmem;
 
-const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 1;
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for

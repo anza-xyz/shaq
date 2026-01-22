@@ -1,135 +1,394 @@
-use shaq::{Consumer, Producer};
-use std::{
-    fs::File,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Instant,
+#[path = "shared/common.rs"]
+mod common;
+
+use common::{
+    cleanup_queue_file, prepare_queue_file, run_consumer_loop, run_producer_loop,
+    run_total_throughput_loop, setup_exit_handler, Item, SYNC_CADENCE,
+};
+use shaq::{
+    mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
+    Consumer as SpscConsumer, Producer as SpscProducer,
+};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
 };
 
-struct Item {
-    data: [u8; 512],
+const QUEUE_SIZE: usize = 16 * 1024 * 1024;
+
+enum Mode {
+    Spsc,
+    Mpmc { producers: usize, consumers: usize },
+}
+
+struct Config {
+    mode: Mode,
+    verbose: bool,
 }
 
 fn main() {
-    let (consumer_core_id, producer_core_id) = core_affinity::get_core_ids()
-        .map(|c| {
-            // Get the last 2 cores - assuming these are sorted.
-            (Some(c[c.len() - 2]), Some(c[c.len() - 1]))
+    let config = parse_config_or_exit();
+    match config.mode {
+        Mode::Spsc => run_spsc(config.verbose),
+        Mode::Mpmc {
+            producers,
+            consumers,
+        } => run_mpmc(producers, consumers, config.verbose),
+    }
+}
+
+fn parse_config_or_exit() -> Config {
+    let mut verbose = false;
+    let mut positional = Vec::new();
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "-v" | "--verbose" => {
+                verbose = true;
+            }
+            _ => positional.push(arg),
+        }
+    }
+
+    let mode = match positional.first().map(String::as_str) {
+        None | Some("spsc") => {
+            if positional.len() > 1 {
+                eprintln!("Too many arguments for spsc mode");
+                print_usage();
+                std::process::exit(2);
+            }
+            Mode::Spsc
+        }
+        Some("mpmc") => {
+            let producers = parse_usize_arg(positional.get(1).cloned(), 2, "producers");
+            let consumers = parse_usize_arg(positional.get(2).cloned(), 2, "consumers");
+            if positional.len() > 3 {
+                eprintln!("Too many arguments for mpmc mode");
+                print_usage();
+                std::process::exit(2);
+            }
+            Mode::Mpmc {
+                producers,
+                consumers,
+            }
+        }
+        Some(mode) => {
+            eprintln!("Unknown mode: {mode}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+
+    Config { mode, verbose }
+}
+
+fn parse_usize_arg(value: Option<String>, default: usize, name: &str) -> usize {
+    value
+        .map(|v| {
+            v.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("Invalid {name}: {v}");
+                std::process::exit(2);
+            })
         })
-        .unwrap_or_default();
+        .unwrap_or(default)
+}
 
-    if let Some(consumer_core_id) = consumer_core_id.as_ref() {
-        println!("Consumer core id: {}", consumer_core_id.id);
+fn print_usage() {
+    eprintln!(
+        "Usage: cargo run --example enqueue_dequeue -- [-v|--verbose] [spsc|mpmc [producers] [consumers]]"
+    );
+}
+
+fn run_spsc(verbose: bool) {
+    let (consumer_core_id, producer_core_id) = spsc_core_ids();
+    if let Some(core) = consumer_core_id {
+        println!("Consumer core id: {}", core.id);
     }
-    if let Some(producer_core_id) = producer_core_id.as_ref() {
-        println!("Producer core id: {}", producer_core_id.id);
+    if let Some(core) = producer_core_id {
+        println!("Producer core id: {}", core.id);
     }
 
-    let exit = Arc::new(AtomicBool::new(false));
-    ctrlc::set_handler({
-        let exit = exit.clone();
-        move || exit.store(true, Ordering::Release)
-    })
-    .unwrap();
-
+    let exit = setup_exit_handler();
     let queue_path = "/tmp/shaq";
-    println!("Cleaning queue file: {queue_path}");
-    let _ = std::fs::remove_file(queue_path);
-    let queue_file = File::options()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(queue_path)
-        .unwrap();
+    let queue_file = prepare_queue_file(queue_path);
+    let total_items_produced = Arc::new(AtomicU64::new(0));
+    let producer_reserve_failures = Arc::new(AtomicU64::new(0));
+    let consumer_reserve_failures = Arc::new(AtomicU64::new(0));
 
     let begin_signal = Arc::new(AtomicBool::new(false));
     let consumer_file = queue_file.try_clone().unwrap();
-    let consumer_hdl = std::thread::Builder::new()
+    let consumer_handle = std::thread::Builder::new()
         .name("shaqConsumer".to_string())
         .spawn({
             let begin = begin_signal.clone();
             let exit = exit.clone();
+            let consumer_reserve_failures = consumer_reserve_failures.clone();
             move || {
-                if let Some(id) = consumer_core_id {
-                    core_affinity::set_for_current(id);
+                if let Some(core_id) = consumer_core_id {
+                    core_affinity::set_for_current(core_id);
                 }
 
-                // Wait until the producer is ready - it creates the file.
-                while !begin.load(Ordering::Acquire) {}
-                // SAFETY: The file is created by the producer and is uniquely accessed as a Consumer.
-                let consumer = unsafe { shaq::Consumer::join(&consumer_file) }.unwrap();
-                run_consumer(consumer, exit)
+                while !begin.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                // SAFETY: The file is created by the producer and uniquely joined as a consumer.
+                let consumer = unsafe { SpscConsumer::join(&consumer_file) }.unwrap();
+                run_spsc_consumer(consumer, exit, consumer_reserve_failures);
             }
         })
         .unwrap();
 
-    let producer_hdl = std::thread::Builder::new()
+    let producer_handle = std::thread::Builder::new()
         .name("shaqProducer".to_string())
-        .spawn(move || {
-            if let Some(id) = producer_core_id {
-                core_affinity::set_for_current(id);
-            }
+        .spawn({
+            let exit = exit.clone();
+            let total_items_produced = total_items_produced.clone();
+            let producer_reserve_failures = producer_reserve_failures.clone();
+            move || {
+                if let Some(core_id) = producer_core_id {
+                    core_affinity::set_for_current(core_id);
+                }
 
-            let producer =
-                unsafe { shaq::Producer::create(&queue_file, 16 * 1024 * 1024) }.unwrap();
-            begin_signal.store(true, Ordering::Release);
-            run_producer(producer, exit);
+                // SAFETY: This thread uniquely creates the queue.
+                let producer = unsafe { SpscProducer::create(&queue_file, QUEUE_SIZE) }.unwrap();
+                begin_signal.store(true, Ordering::Release);
+                run_spsc_producer(
+                    producer,
+                    exit,
+                    verbose,
+                    total_items_produced,
+                    producer_reserve_failures,
+                );
+            }
         })
         .unwrap();
 
-    consumer_hdl.join().unwrap();
-    producer_hdl.join().unwrap();
-
-    println!("Cleaning up files");
-    let _ = std::fs::remove_file(queue_path);
+    run_total_throughput_loop::<Item>(
+        exit.clone(),
+        total_items_produced,
+        producer_reserve_failures,
+        consumer_reserve_failures,
+    );
+    consumer_handle.join().unwrap();
+    producer_handle.join().unwrap();
+    cleanup_queue_file(queue_path);
 }
 
-// Synchronize, Commit, Finalize every SYNC_CADENCE items.
-const SYNC_CADENCE: usize = 1024;
-
-fn run_producer(mut producer: Producer<Item>, exit: Arc<AtomicBool>) {
-    let mut now = Instant::now();
-    let mut items_produced = 0u64;
-
-    while !exit.load(Ordering::Acquire) {
-        producer.sync();
-        for _ in 0..SYNC_CADENCE {
-            // SAFETY: ptr written below with fill
-            let Some(mut spot) = (unsafe { producer.reserve() }) else {
-                break;
-            };
-            unsafe {
-                spot.as_mut().data.fill(42); // Fill with some data
+fn run_spsc_producer(
+    mut producer: SpscProducer<Item>,
+    exit: Arc<AtomicBool>,
+    verbose: bool,
+    total_items_produced: Arc<AtomicU64>,
+    producer_reserve_failures: Arc<AtomicU64>,
+) {
+    run_producer_loop::<Item, _>(
+        exit,
+        verbose.then(|| "Producer".to_string()),
+        total_items_produced,
+        move || {
+            producer.sync();
+            let mut produced = 0;
+            for _ in 0..SYNC_CADENCE {
+                // SAFETY: reserve() yields a valid write slot.
+                let Some(mut spot) = (unsafe { producer.reserve() }) else {
+                    producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+                    break;
+                };
+                // SAFETY: the reserved slot can be fully initialized.
+                unsafe {
+                    spot.as_mut().data.fill(42);
+                }
+                produced += 1;
             }
-            items_produced += 1;
-        }
-        producer.commit();
-
-        let new_now = Instant::now();
-        if new_now.duration_since(now).as_secs() >= 1 {
-            println!(
-                "{}/s ( GiB/s: {:.2} )",
-                items_produced,
-                items_produced as f64 * (core::mem::size_of::<Item>() as f64)
-                    / (1024.0 * 1024.0 * 1024.0)
-            );
-
-            now = new_now;
-            items_produced = 0;
-        }
-    }
+            producer.commit();
+            (produced > 0).then_some(produced)
+        },
+    );
 }
 
-fn run_consumer(mut consumer: Consumer<Item>, exit: Arc<AtomicBool>) {
-    while !exit.load(Ordering::Acquire) {
+fn run_spsc_consumer(
+    mut consumer: SpscConsumer<Item>,
+    exit: Arc<AtomicBool>,
+    consumer_reserve_failures: Arc<AtomicU64>,
+) {
+    run_consumer_loop(exit, move || {
         consumer.sync();
         for _ in 0..SYNC_CADENCE {
             let Some(_item) = consumer.try_read() else {
+                consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                 break;
             };
         }
         consumer.finalize();
+    });
+}
+
+fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
+    let (consumer_cores, producer_cores) = mpmc_core_ids(consumers, producers);
+    let exit = setup_exit_handler();
+    let queue_path = "/tmp/shaq_mpmc";
+    let queue_file = prepare_queue_file(queue_path);
+    let total_items_produced = Arc::new(AtomicU64::new(0));
+    let producer_reserve_failures = Arc::new(AtomicU64::new(0));
+    let consumer_reserve_failures = Arc::new(AtomicU64::new(0));
+
+    // SAFETY: This thread uniquely creates the queue.
+    unsafe {
+        let _ = MpmcProducer::<Item>::create(&queue_file, QUEUE_SIZE).unwrap();
     }
+
+    let mut handles = Vec::new();
+
+    for (idx, core_id) in consumer_cores.into_iter().enumerate() {
+        let exit = exit.clone();
+        let file = queue_file.try_clone().unwrap();
+        let consumer_reserve_failures = consumer_reserve_failures.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("shaqMpmcConsumer{idx}"))
+                .spawn(move || {
+                    if let Some(core_id) = core_id {
+                        println!("Consumer {idx} core id: {}", core_id.id);
+                        core_affinity::set_for_current(core_id);
+                    }
+
+                    // SAFETY: Queue was created once and this handle joins as a consumer.
+                    let consumer = unsafe { MpmcConsumer::join(&file) }.unwrap();
+                    run_mpmc_consumer(consumer, exit, consumer_reserve_failures);
+                })
+                .unwrap(),
+        );
+    }
+
+    for (idx, core_id) in producer_cores.into_iter().enumerate() {
+        let exit = exit.clone();
+        let file = queue_file.try_clone().unwrap();
+        let report_prefix = verbose.then(|| format!("Producer {idx}"));
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("shaqMpmcProducer{idx}"))
+                .spawn({
+                    let total_items_produced = total_items_produced.clone();
+                    let producer_reserve_failures = producer_reserve_failures.clone();
+                    move || {
+                        if let Some(core_id) = core_id {
+                            println!("Producer {idx} core id: {}", core_id.id);
+                            core_affinity::set_for_current(core_id);
+                        }
+
+                        // SAFETY: Queue was created once and this handle joins as a producer.
+                        let producer = unsafe { MpmcProducer::join(&file) }.unwrap();
+                        run_mpmc_producer(
+                            producer,
+                            exit,
+                            report_prefix,
+                            total_items_produced,
+                            producer_reserve_failures,
+                        );
+                    }
+                })
+                .unwrap(),
+        );
+    }
+
+    run_total_throughput_loop::<Item>(
+        exit.clone(),
+        total_items_produced,
+        producer_reserve_failures,
+        consumer_reserve_failures,
+    );
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    cleanup_queue_file(queue_path);
+}
+
+fn run_mpmc_producer(
+    producer: MpmcProducer<Item>,
+    exit: Arc<AtomicBool>,
+    report_prefix: Option<String>,
+    total_items_produced: Arc<AtomicU64>,
+    producer_reserve_failures: Arc<AtomicU64>,
+) {
+    run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
+        let Some(mut batch) = producer.reserve_batch(SYNC_CADENCE) else {
+            producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        for index in 0..batch.len() {
+            // SAFETY: reserve_batch() yields valid contiguous slots.
+            unsafe {
+                batch.as_mut(index).data.fill(42);
+            }
+        }
+        Some(batch.len())
+    });
+}
+
+fn run_mpmc_consumer(
+    consumer: MpmcConsumer<Item>,
+    exit: Arc<AtomicBool>,
+    consumer_reserve_failures: Arc<AtomicU64>,
+) {
+    run_consumer_loop(exit, move || {
+        let Some(batch) = consumer.try_read_batch(SYNC_CADENCE) else {
+            consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let _ = batch.len();
+    });
+}
+
+fn spsc_core_ids() -> (Option<core_affinity::CoreId>, Option<core_affinity::CoreId>) {
+    core_affinity::get_core_ids()
+        .map(|cores| {
+            if cores.len() >= 2 {
+                (Some(cores[cores.len() - 2]), Some(cores[cores.len() - 1]))
+            } else {
+                (None, cores.last().copied())
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn mpmc_core_ids(
+    consumers: usize,
+    producers: usize,
+) -> (
+    Vec<Option<core_affinity::CoreId>>,
+    Vec<Option<core_affinity::CoreId>>,
+) {
+    core_affinity::get_core_ids()
+        .map(|cores| {
+            let mut index = cores.len();
+            let mut consumer_cores = Vec::with_capacity(consumers);
+            let mut producer_cores = Vec::with_capacity(producers);
+
+            for _ in 0..consumers {
+                if index == 0 {
+                    consumer_cores.push(None);
+                } else {
+                    index -= 1;
+                    consumer_cores.push(Some(cores[index]));
+                }
+            }
+
+            for _ in 0..producers {
+                if index == 0 {
+                    producer_cores.push(None);
+                } else {
+                    index -= 1;
+                    producer_cores.push(Some(cores[index]));
+                }
+            }
+
+            (consumer_cores, producer_cores)
+        })
+        .unwrap_or_else(|| (vec![None; consumers], vec![None; producers]))
 }
