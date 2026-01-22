@@ -18,6 +18,34 @@ fn main() {
     let producers: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(2);
     let consumers: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(2);
 
+    let (consumer_cores, producer_cores) = core_affinity::get_core_ids()
+        .map(|cores| {
+            let mut index = cores.len();
+            let mut consumer_cores = Vec::with_capacity(consumers);
+            let mut producer_cores = Vec::with_capacity(producers);
+
+            for _ in 0..consumers {
+                if index == 0 {
+                    consumer_cores.push(None);
+                    continue;
+                }
+                index -= 1;
+                consumer_cores.push(Some(cores[index]));
+            }
+
+            for _ in 0..producers {
+                if index == 0 {
+                    producer_cores.push(None);
+                    continue;
+                }
+                index -= 1;
+                producer_cores.push(Some(cores[index]));
+            }
+
+            (consumer_cores, producer_cores)
+        })
+        .unwrap_or_else(|| (vec![None; consumers], vec![None; producers]));
+
     let exit = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let exit = exit.clone();
@@ -46,10 +74,15 @@ fn main() {
     for idx in 0..consumers {
         let exit = exit.clone();
         let file = queue_file.try_clone().unwrap();
+        let core_id = consumer_cores.get(idx).copied().flatten();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("shaqMpmcConsumer{idx}"))
                 .spawn(move || {
+                    if let Some(core_id) = core_id {
+                        println!("Consumer {idx} core id: {}", core_id.id);
+                        core_affinity::set_for_current(core_id);
+                    }
                     // SAFETY: The file is created once and is uniquely joined as a Consumer.
                     let consumer = unsafe { Consumer::join(&file) }.unwrap();
                     run_consumer(consumer, exit);
@@ -62,10 +95,15 @@ fn main() {
         let exit = exit.clone();
         let file = queue_file.try_clone().unwrap();
         let report = idx == 0;
+        let core_id = producer_cores.get(idx).copied().flatten();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("shaqMpmcProducer{idx}"))
                 .spawn(move || {
+                    if let Some(core_id) = core_id {
+                        println!("Producer {idx} core id: {}", core_id.id);
+                        core_affinity::set_for_current(core_id);
+                    }
                     // SAFETY: The file is created once and is uniquely joined as a Producer.
                     let producer = unsafe { Producer::join(&file) }.unwrap();
                     run_producer(producer, exit, report);
@@ -89,14 +127,17 @@ fn run_producer(producer: Producer<Item>, exit: Arc<AtomicBool>, report: bool) {
     let mut now = Instant::now();
     let mut items_produced = 0u64;
 
-    let item = Item { data: [42; 512] };
     while !exit.load(Ordering::Acquire) {
-        for _ in 0..SYNC_CADENCE {
-            if producer.try_write(item).is_err() {
-                break;
+        let Some(mut batch) = producer.reserve_batch(SYNC_CADENCE) else {
+            continue;
+        };
+        for index in 0..batch.len() {
+            // SAFETY: The batch reserves valid slots.
+            unsafe {
+                batch.as_mut(index).data.fill(42);
             }
-            items_produced += 1;
         }
+        items_produced += batch.len() as u64;
 
         if report {
             let new_now = Instant::now();
@@ -117,10 +158,8 @@ fn run_producer(producer: Producer<Item>, exit: Arc<AtomicBool>, report: bool) {
 
 fn run_consumer(consumer: Consumer<Item>, exit: Arc<AtomicBool>) {
     while !exit.load(Ordering::Acquire) {
-        for _ in 0..SYNC_CADENCE {
-            if consumer.try_read().is_none() {
-                break;
-            }
+        if let Some(batch) = consumer.try_read_batch(SYNC_CADENCE) {
+            let _ = batch.len();
         }
     }
 }

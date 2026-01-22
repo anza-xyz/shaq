@@ -461,9 +461,42 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
     use std::sync::atomic::AtomicU64;
 
     use super::*;
+
+    struct AlignedBuffer {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    impl AlignedBuffer {
+        fn new(len: usize) -> Self {
+            let layout = Layout::from_size_align(len, 64).expect("invalid layout");
+            // SAFETY: Layout has non-zero size and valid alignment.
+            let ptr = unsafe { alloc_zeroed(layout) };
+            let ptr = NonNull::new(ptr).expect("alloc failed");
+            Self { ptr, len }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: The allocation is valid for `len` bytes.
+            unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    impl Drop for AlignedBuffer {
+        fn drop(&mut self) {
+            // SAFETY: The allocation matches this layout and is still live.
+            unsafe {
+                dealloc(
+                    self.ptr.as_ptr(),
+                    Layout::from_size_align(self.len, 64).expect("invalid layout"),
+                );
+            }
+        }
+    }
 
     fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
         let file_size = buffer.len();
@@ -484,8 +517,8 @@ mod tests {
         type Item = AtomicU64;
         const BUFFER_CAPACITY: usize = 1024;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
-        let mut buffer = vec![0u8; BUFFER_SIZE];
-        let (mut producer, mut consumer) = create_test_queue::<Item>(&mut buffer);
+        let mut buffer = AlignedBuffer::new(BUFFER_SIZE);
+        let (mut producer, mut consumer) = create_test_queue::<Item>(buffer.as_mut_slice());
 
         assert_eq!(producer.capacity(), BUFFER_CAPACITY);
         assert_eq!(consumer.capacity(), BUFFER_CAPACITY);

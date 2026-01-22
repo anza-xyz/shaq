@@ -2,6 +2,7 @@
 
 use crate::{error::Error, shmem::map_file, CacheAlignedAtomicSize, VERSION};
 use core::{
+    marker::PhantomData,
     mem::MaybeUninit,
     ptr::NonNull,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
@@ -55,6 +56,32 @@ impl<T> Producer<T> {
     pub fn try_write(&self, item: T) -> Result<(), T> {
         self.queue.push(item)
     }
+
+    /// Reserves a slot for writing.
+    /// The slot is committed when the guard is dropped.
+    pub fn reserve(&self) -> Option<WriteGuard<'_, T>> {
+        self.queue
+            .reserve_write()
+            .map(|(cell, position)| WriteGuard {
+                cell,
+                position,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Reserves up to `max` slots for writing.
+    /// The slots are committed when the batch is dropped.
+    pub fn reserve_batch(&self, max: usize) -> Option<WriteBatch<'_, T>> {
+        self.queue
+            .reserve_write_batch(max)
+            .map(|(start, count)| WriteBatch {
+                buffer: self.queue.buffer,
+                start,
+                count,
+                buffer_mask: self.queue.buffer_mask,
+                _marker: PhantomData,
+            })
+    }
 }
 
 unsafe impl<T> Send for Producer<T> {}
@@ -107,6 +134,33 @@ impl<T> Consumer<T> {
     pub fn try_read(&self) -> Option<T> {
         self.queue.try_pop()
     }
+
+    /// Attempts to reserve a value from the queue, returning a guard.
+    /// The slot is released back to producers when the guard is dropped.
+    pub fn try_read_ptr(&self) -> Option<ReadGuard<'_, T>> {
+        self.queue
+            .reserve_read()
+            .map(|(cell, position, buffer_mask)| ReadGuard {
+                cell,
+                position,
+                buffer_mask,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Attempts to reserve up to `max` values from the queue.
+    /// The slots are released back to producers when the batch is dropped.
+    pub fn try_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T>> {
+        self.queue
+            .reserve_read_batch(max)
+            .map(|(start, count)| ReadBatch {
+                buffer: self.queue.buffer,
+                start,
+                count,
+                buffer_mask: self.queue.buffer_mask,
+                _marker: PhantomData,
+            })
+    }
 }
 
 unsafe impl<T> Send for Consumer<T> {}
@@ -124,6 +178,7 @@ struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<Cell<T>>,
     file_size: usize,
+    buffer_mask: usize,
 }
 
 impl<T> Drop for SharedQueue<T> {
@@ -148,9 +203,7 @@ impl<T> SharedQueue<T> {
             Some(position) => position,
             None => return Err(value),
         };
-        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
-        let header = unsafe { self.header.as_ref() };
-        let cell_index = position & header.buffer_mask;
+        let cell_index = position & self.buffer_mask;
         // SAFETY: Mask ensures index is in bounds. Same cell is not accessed concurrently.
         let cell = unsafe { self.buffer.add(cell_index).as_mut() };
         cell.value.write(value);
@@ -163,7 +216,7 @@ impl<T> SharedQueue<T> {
         let header = unsafe { self.header.as_ref() };
         let mut position = header.read_position.load(Ordering::Relaxed);
         loop {
-            let cell = unsafe { self.buffer.add(position & header.buffer_mask).as_ref() };
+            let cell = unsafe { self.buffer.add(position & self.buffer_mask).as_ref() };
             let sequence = cell.sequence.load(Ordering::Acquire);
             match sequence.cmp(&position.wrapping_add(1)) {
                 core::cmp::Ordering::Less => return None,
@@ -180,7 +233,7 @@ impl<T> SharedQueue<T> {
                     {
                         let value = unsafe { cell.value.as_ptr().read() };
                         cell.sequence.store(
-                            position.wrapping_add(header.buffer_mask + 1),
+                            position.wrapping_add(self.buffer_mask + 1),
                             Ordering::Release,
                         );
                         return Some(value);
@@ -201,8 +254,8 @@ impl<T> SharedQueue<T> {
         let mut position = header.write_position.load(Ordering::Relaxed);
         loop {
             // SAFETY: Mask ensures index is in bounds
-            let cell = unsafe { self.buffer.add(position & header.buffer_mask).as_ref() };
-            let sequence = cell.sequence.load(Ordering::Acquire);
+            let cell = unsafe { self.buffer.add(position & self.buffer_mask).as_ref() };
+            let sequence = cell.sequence.load(Ordering::Relaxed);
             match sequence.cmp(&position) {
                 core::cmp::Ordering::Less => return None,
                 core::cmp::Ordering::Equal => {
@@ -218,15 +271,156 @@ impl<T> SharedQueue<T> {
                     {
                         return Some(position);
                     }
-                    break;
+                    position = header.write_position.load(Ordering::Relaxed);
                 }
                 core::cmp::Ordering::Greater => {
                     position = header.write_position.load(Ordering::Relaxed);
                 }
             }
         }
+    }
 
-        None
+    fn reserve_write(&self) -> Option<(NonNull<Cell<T>>, usize)> {
+        let position = self.reserve_position()?;
+        let cell_index = position & self.buffer_mask;
+        // SAFETY: Mask ensures index is in bounds.
+        let cell = unsafe { self.buffer.add(cell_index) };
+        Some((cell, position))
+    }
+
+    fn reserve_read(&self) -> Option<(NonNull<Cell<T>>, usize, usize)> {
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+
+        let mut position = header.read_position.load(Ordering::Relaxed);
+        loop {
+            let cell = unsafe { self.buffer.add(position & self.buffer_mask) };
+            let sequence = unsafe { cell.as_ref().sequence.load(Ordering::Acquire) };
+            match sequence.cmp(&position.wrapping_add(1)) {
+                core::cmp::Ordering::Less => return None,
+                core::cmp::Ordering::Equal => {
+                    if header
+                        .read_position
+                        .compare_exchange_weak(
+                            position,
+                            position.wrapping_add(1),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        return Some((cell, position, self.buffer_mask));
+                    }
+                }
+                core::cmp::Ordering::Greater => {
+                    position = header.read_position.load(Ordering::Relaxed);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn reserve_write_batch(&self, max: usize) -> Option<(usize, usize)> {
+        if max == 0 {
+            return None;
+        }
+
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+        let mut position = header.write_position.load(Ordering::Relaxed);
+
+        'outer: loop {
+            let mut count = 0usize;
+            let mut saw_full = false;
+            while count < max {
+                let pos = position.wrapping_add(count);
+                let cell = unsafe { self.buffer.add(pos & self.buffer_mask).as_ref() };
+                let sequence = cell.sequence.load(Ordering::Relaxed);
+                match sequence.cmp(&pos) {
+                    core::cmp::Ordering::Less => {
+                        saw_full = true;
+                        break;
+                    }
+                    core::cmp::Ordering::Equal => {
+                        count += 1;
+                    }
+                    core::cmp::Ordering::Greater => {
+                        position = header.write_position.load(Ordering::Relaxed);
+                        continue 'outer;
+                    }
+                }
+            }
+
+            if count == 0 {
+                if saw_full {
+                    return None;
+                }
+                continue;
+            }
+
+            let new_position = position.wrapping_add(count);
+            if header
+                .write_position
+                .compare_exchange_weak(position, new_position, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some((position, count));
+            }
+
+            position = header.write_position.load(Ordering::Relaxed);
+        }
+    }
+
+    fn reserve_read_batch(&self, max: usize) -> Option<(usize, usize)> {
+        if max == 0 {
+            return None;
+        }
+
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+        let mut position = header.read_position.load(Ordering::Relaxed);
+
+        'outer: loop {
+            let mut count = 0usize;
+            let mut saw_empty = false;
+            while count < max {
+                let pos = position.wrapping_add(count);
+                let cell = unsafe { self.buffer.add(pos & self.buffer_mask).as_ref() };
+                let expected = pos.wrapping_add(1);
+                let sequence = cell.sequence.load(Ordering::Acquire);
+                match sequence.cmp(&expected) {
+                    core::cmp::Ordering::Less => {
+                        saw_empty = true;
+                        break;
+                    }
+                    core::cmp::Ordering::Equal => {
+                        count += 1;
+                    }
+                    core::cmp::Ordering::Greater => {
+                        position = header.read_position.load(Ordering::Relaxed);
+                        continue 'outer;
+                    }
+                }
+            }
+
+            if count == 0 {
+                if saw_empty {
+                    return None;
+                }
+                continue;
+            }
+
+            let new_position = position.wrapping_add(count);
+            if header
+                .read_position
+                .compare_exchange_weak(position, new_position, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some((position, count));
+            }
+
+            position = header.read_position.load(Ordering::Relaxed);
+        }
     }
 
     /// Creates a new shared queue from a header pointer and file size.
@@ -257,6 +451,7 @@ impl<T> SharedQueue<T> {
             header,
             buffer,
             file_size,
+            buffer_mask,
         })
     }
 
@@ -380,10 +575,221 @@ struct Cell<T> {
     value: MaybeUninit<T>,
 }
 
+pub struct WriteGuard<'a, T> {
+    cell: NonNull<Cell<T>>,
+    position: usize,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<'a, T> WriteGuard<'a, T> {
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        // SAFETY: The cell was reserved for writing.
+        unsafe { self.cell.as_mut().value.as_mut_ptr() }
+    }
+
+    pub fn write(mut self, value: T) {
+        // SAFETY: The cell was reserved for writing.
+        unsafe { self.cell.as_mut().value.write(value) };
+    }
+}
+
+impl<'a, T> Drop for WriteGuard<'a, T> {
+    fn drop(&mut self) {
+        // SAFETY: The cell was reserved for writing, so publishing is safe.
+        unsafe {
+            self.cell
+                .as_mut()
+                .sequence
+                .store(self.position + 1, Ordering::Release);
+        }
+    }
+}
+
+pub struct ReadGuard<'a, T> {
+    cell: NonNull<Cell<T>>,
+    position: usize,
+    buffer_mask: usize,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> ReadGuard<'a, T> {
+    pub fn as_ptr(&self) -> *const T {
+        // SAFETY: The cell was reserved for reading.
+        unsafe { self.cell.as_ref().value.as_ptr() }
+    }
+
+    pub fn read(self) -> T {
+        // SAFETY: The cell was reserved for reading and holds an initialized value.
+        unsafe { self.cell.as_ref().value.as_ptr().read() }
+    }
+}
+
+impl<'a, T> Drop for ReadGuard<'a, T> {
+    fn drop(&mut self) {
+        // SAFETY: The cell was reserved for reading, so publishing is safe.
+        unsafe {
+            self.cell.as_mut().sequence.store(
+                self.position.wrapping_add(self.buffer_mask + 1),
+                Ordering::Release,
+            );
+        }
+    }
+}
+
+pub struct WriteBatch<'a, T> {
+    buffer: NonNull<Cell<T>>,
+    start: usize,
+    count: usize,
+    buffer_mask: usize,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<'a, T> WriteBatch<'a, T> {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Returns a mutable reference to the reserved slot.
+    ///
+    /// # Safety
+    /// The slot is uninitialized; caller must fully initialize `T`.
+    pub unsafe fn as_mut(&mut self, index: usize) -> &mut T {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for writing.
+        unsafe {
+            &mut *self
+                .buffer
+                .add(position & self.buffer_mask)
+                .as_mut()
+                .value
+                .as_mut_ptr()
+        }
+    }
+
+    pub fn as_mut_ptr(&mut self, index: usize) -> *mut T {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for writing.
+        unsafe {
+            let cell = self.buffer.add(position & self.buffer_mask).as_mut();
+            cell.value.as_mut_ptr()
+        }
+    }
+}
+
+impl<'a, T> Drop for WriteBatch<'a, T> {
+    fn drop(&mut self) {
+        for index in 0..self.count {
+            let position = self.start.wrapping_add(index);
+            // SAFETY: Each position was reserved for writing, so publishing is safe.
+            unsafe {
+                self.buffer
+                    .add(position & self.buffer_mask)
+                    .as_mut()
+                    .sequence
+                    .store(position.wrapping_add(1), Ordering::Release);
+            }
+        }
+    }
+}
+
+pub struct ReadBatch<'a, T> {
+    buffer: NonNull<Cell<T>>,
+    start: usize,
+    count: usize,
+    buffer_mask: usize,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> ReadBatch<'a, T> {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn as_ptr(&self, index: usize) -> *const T {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for reading.
+        unsafe {
+            let cell = self.buffer.add(position & self.buffer_mask).as_ref();
+            cell.value.as_ptr()
+        }
+    }
+}
+
+impl<'a, T> Drop for ReadBatch<'a, T> {
+    fn drop(&mut self) {
+        for index in 0..self.count {
+            let position = self.start.wrapping_add(index);
+            // SAFETY: Each position was reserved for reading, so publishing is safe.
+            unsafe {
+                self.buffer
+                    .add(position & self.buffer_mask)
+                    .as_mut()
+                    .sequence
+                    .store(
+                        position.wrapping_add(self.buffer_mask + 1),
+                        Ordering::Release,
+                    );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::ptr::NonNull;
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+    struct AlignedBuffer {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    impl AlignedBuffer {
+        fn new(len: usize) -> Self {
+            let layout = Layout::from_size_align(len, 64).expect("invalid layout");
+            // SAFETY: Layout has non-zero size and valid alignment.
+            let ptr = unsafe { alloc_zeroed(layout) };
+            let ptr = NonNull::new(ptr).expect("alloc failed");
+            Self { ptr, len }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: The allocation is valid for `len` bytes.
+            unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.ptr.as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl Drop for AlignedBuffer {
+        fn drop(&mut self) {
+            // SAFETY: The allocation matches this layout and is still live.
+            unsafe {
+                dealloc(
+                    self.ptr.as_ptr(),
+                    Layout::from_size_align(self.len, 64).expect("invalid layout"),
+                );
+            }
+        }
+    }
 
     fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
         let file_size = buffer.len();
@@ -404,8 +810,8 @@ mod tests {
         type Item = u64;
         const BUFFER_CAPACITY: usize = 1024;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
-        let mut buffer = vec![0u8; BUFFER_SIZE];
-        let (producer, consumer) = create_test_queue::<Item>(&mut buffer);
+        let mut buffer = AlignedBuffer::new(BUFFER_SIZE);
+        let (producer, consumer) = create_test_queue::<Item>(buffer.as_mut_slice());
         let capacity =
             SharedQueueHeader::calculate_buffer_size_in_items::<Item>(BUFFER_SIZE).unwrap();
 
@@ -421,11 +827,55 @@ mod tests {
     }
 
     #[test]
+    fn test_reserve_and_try_read_ptr() {
+        type Item = u64;
+        const BUFFER_CAPACITY: usize = 8;
+        const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
+        let mut buffer = AlignedBuffer::new(BUFFER_SIZE);
+        let (producer, consumer) = create_test_queue::<Item>(buffer.as_mut_slice());
+
+        let mut guard = producer.reserve().expect("reserve failed");
+        unsafe {
+            *guard.as_mut_ptr() = 42;
+        }
+        drop(guard);
+
+        let guard = consumer.try_read_ptr().expect("try_read_ptr failed");
+        unsafe {
+            assert_eq!(*guard.as_ptr(), 42);
+        }
+    }
+
+    #[test]
+    fn test_reserve_batch_and_try_read_batch() {
+        type Item = u64;
+        const BUFFER_CAPACITY: usize = 16;
+        const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
+        let mut buffer = AlignedBuffer::new(BUFFER_SIZE);
+        let (producer, consumer) = create_test_queue::<Item>(buffer.as_mut_slice());
+
+        let mut batch = producer.reserve_batch(4).expect("reserve_batch failed");
+        for index in 0..batch.len() {
+            unsafe {
+                *batch.as_mut_ptr(index) = index as u64;
+            }
+        }
+        drop(batch);
+
+        let batch = consumer.try_read_batch(4).expect("try_read_batch failed");
+        for index in 0..batch.len() {
+            unsafe {
+                assert_eq!(*batch.as_ptr(index), index as u64);
+            }
+        }
+    }
+
+    #[test]
     fn test_multiple_producers_consumers() {
         type Item = u64;
         const BUFFER_CAPACITY: usize = 64;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
-        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut buffer = AlignedBuffer::new(BUFFER_SIZE);
         let file_size = buffer.len();
         let buffer_size_in_items =
             SharedQueueHeader::calculate_buffer_size_in_items::<Item>(file_size)
