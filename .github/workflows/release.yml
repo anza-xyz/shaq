@@ -37,7 +37,7 @@ jobs:
             exit 1
           fi
 
-          tag="$v${version}"
+          tag="v${version}"
           ref="$(git rev-parse HEAD)"
 
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
