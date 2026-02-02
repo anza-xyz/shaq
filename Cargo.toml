@@ -1,7 +1,7 @@
 [package]
 name = "shaq"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
-version = "1.0.1"
+version = "1.0.2"
 description = "SPSC FIFO queue backed by shared memory for IPC"
 readme = "README.md"
 homepage = "https://anza.xyz/"
