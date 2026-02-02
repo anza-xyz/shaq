@@ -12,7 +12,7 @@ on:
       ref:
         description: "git ref to tag (can be a branch or a commit hash)"
         required: true
-        default: "master"
+        default: "main"
         type: string
 
 jobs:
