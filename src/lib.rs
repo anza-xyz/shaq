@@ -459,7 +459,15 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
 }
 
 #[cfg(test)]
+pub(crate) mod aligned_buffer {
+    #[repr(C, align(64))]
+    pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
+}
+
+#[cfg(test)]
 mod tests {
+    use crate::aligned_buffer::AlignedBuffer;
+
     use super::*;
     use std::sync::atomic::AtomicU64;
 
@@ -482,8 +490,6 @@ mod tests {
         type Item = AtomicU64;
         const BUFFER_CAPACITY: usize = 1024;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
-        #[repr(C, align(64))]
-        struct AlignedBuffer([u8; BUFFER_SIZE]);
 
         let mut buffer = Box::new(AlignedBuffer([0; BUFFER_SIZE]));
         let slice = buffer.0.as_mut_slice();
