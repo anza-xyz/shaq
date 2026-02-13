@@ -482,14 +482,11 @@ mod tests {
         type Item = AtomicU64;
         const BUFFER_CAPACITY: usize = 1024;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
-        let mut buffer = (0..(BUFFER_SIZE / core::mem::size_of::<CacheAlignedAtomicSize>()))
-            .map(|_| CacheAlignedAtomicSize {
-                inner: AtomicUsize::default(),
-            })
-            .collect::<Vec<_>>();
-        let slice = unsafe {
-            std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), BUFFER_SIZE)
-        };
+        #[repr(C, align(64))]
+        struct AlignedBuffer([u8; BUFFER_SIZE]);
+
+        let mut buffer = Box::new(AlignedBuffer([0; BUFFER_SIZE]));
+        let slice = buffer.0.as_mut_slice();
         let (mut producer, mut consumer) = create_test_queue::<Item>(slice);
 
         assert_eq!(producer.capacity(), BUFFER_CAPACITY);
