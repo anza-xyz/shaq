@@ -153,6 +153,11 @@ impl<T> Consumer<T> {
 
     /// Attempts to reserve a value from the queue, returning a guard.
     /// The slot is released back to producers when the guard is dropped.
+    ///
+    /// Other [`Consumer`]s may read in parallel, but reads must be
+    /// released in order they were reserved. Holding a [`ReadGuard`] should
+    /// be treated similarly to holding a lock on a critical section.
+    #[must_use]
     pub fn try_read_ptr(&self) -> Option<ReadGuard<'_, T>> {
         self.queue.reserve_read().map(|(cell, position)| ReadGuard {
             header: self.queue.header,
@@ -164,6 +169,12 @@ impl<T> Consumer<T> {
 
     /// Attempts to reserve up to `max` values from the queue.
     /// The slots are released back to producers when the batch is dropped.
+    ///
+    ///
+    /// Other [`Consumer`]s may read in parallel, but reads must be
+    /// released in order they were reserved. Holding a [`ReadBatch`] should
+    /// be treated similarly to holding a lock on a critical section.
+    #[must_use]
     pub fn try_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T>> {
         let (start, count) = self.queue.reserve_read_batch(max)?;
         Some(ReadBatch {
