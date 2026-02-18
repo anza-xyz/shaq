@@ -26,10 +26,7 @@ impl<T> Producer<T> {
     }
 
     /// Joins an existing producer for the shared queue in the provided file.
-    ///
-    /// # Safety
-    /// - The provided file must be uniquely joined as a Producer.
-    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+    pub fn join(file: &File) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -109,10 +106,7 @@ impl<T> Consumer<T> {
     }
 
     /// Joins an existing consumer for the shared queue in the provided file.
-    ///
-    /// # Safety
-    /// - The provided file must be uniquely joined as a Consumer.
-    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+    pub fn join(file: &File) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.

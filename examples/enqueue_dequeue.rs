@@ -258,7 +258,7 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
                     }
 
                     // SAFETY: Queue was created once and this handle joins as a consumer.
-                    let consumer = unsafe { MpmcConsumer::join(&file) }.unwrap();
+                    let consumer = MpmcConsumer::join(&file).unwrap();
                     run_mpmc_consumer(consumer, exit, consumer_reserve_failures);
                 })
                 .unwrap(),
@@ -282,7 +282,7 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
                         }
 
                         // SAFETY: Queue was created once and this handle joins as a producer.
-                        let producer = unsafe { MpmcProducer::join(&file) }.unwrap();
+                        let producer = MpmcProducer::join(&file).unwrap();
                         run_mpmc_producer(
                             producer,
                             exit,
