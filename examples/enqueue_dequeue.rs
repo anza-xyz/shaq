@@ -317,7 +317,8 @@ fn run_mpmc_producer(
     producer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
-        let Some(mut batch) = producer.reserve_batch(SYNC_CADENCE) else {
+        // SAFETY: we write the batch below.
+        let Some(mut batch) = (unsafe { producer.reserve_batch(SYNC_CADENCE) }) else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
         };

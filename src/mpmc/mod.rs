@@ -50,7 +50,8 @@ impl<T> Producer<T> {
 
     /// Writes item into the queue or returns it if there is not enough space.
     pub fn try_write(&self, item: T) -> Result<(), T> {
-        let guard = match self.reserve() {
+        // SAFETY: On successful reservation the item is written below.
+        let guard = match unsafe { self.reserve() } {
             Some(guard) => guard,
             None => return Err(item),
         };
@@ -60,7 +61,15 @@ impl<T> Producer<T> {
 
     /// Reserves a slot for writing.
     /// The slot is committed when the guard is dropped.
-    pub fn reserve(&self) -> Option<WriteGuard<'_, T>> {
+    ///
+    /// Other [`Producer`]s may write in parallel, but writes must be
+    /// published in order they were reserved. Holding a [`WriteGuard`] should
+    /// be treated similarly to holding a lock on a critical section.
+    ///
+    /// # Safety
+    /// - The caller must initialize the reserved slot before the guard is dropped.
+    #[must_use]
+    pub unsafe fn reserve(&self) -> Option<WriteGuard<'_, T>> {
         self.queue
             .reserve_write()
             .map(|(cell, position)| WriteGuard {
@@ -73,7 +82,15 @@ impl<T> Producer<T> {
 
     /// Reserves exactly `count` slots for writing.
     /// The slots are committed when the batch is dropped.
-    pub fn reserve_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
+    ///
+    /// Other [`Producer`]s may write in parallel, but writes must be
+    /// published in the order they were reserved. Holding a [`WriteBatch`]
+    /// should be treated similarly to holding a lock on a critical section.
+    ///
+    /// # Safety
+    /// - The caller must initialize all reserved slots before the batch is dropped.
+    #[must_use]
+    pub unsafe fn reserve_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
         let start = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             header: self.queue.header,
@@ -658,7 +675,7 @@ mod tests {
         let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
         let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
 
-        let mut guard = producer.reserve().expect("reserve failed");
+        let mut guard = unsafe { producer.reserve() }.expect("reserve failed");
         unsafe {
             *guard.as_mut_ptr() = 42;
         }
@@ -675,7 +692,7 @@ mod tests {
         let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
         let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
 
-        let mut batch = producer.reserve_batch(4).expect("reserve_batch failed");
+        let mut batch = unsafe { producer.reserve_batch(4) }.expect("reserve_batch failed");
         for index in 0..batch.len() {
             unsafe {
                 *batch.as_mut_ptr(index) = index as u64;
@@ -696,8 +713,10 @@ mod tests {
         let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
         let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
 
-        assert!(producer.reserve_batch(0).is_none());
-        assert!(producer.reserve_batch(BUFFER_CAPACITY + 1).is_none());
+        unsafe {
+            assert!(producer.reserve_batch(0).is_none());
+            assert!(producer.reserve_batch(BUFFER_CAPACITY + 1).is_none());
+        }
 
         for i in 0..4 {
             assert_eq!(producer.try_write(i as Item), Ok(()));
