@@ -532,6 +532,7 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
     }
 }
 
+#[must_use]
 pub struct ReadGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
@@ -607,6 +608,7 @@ impl<'a, T> Drop for WriteBatch<'a, T> {
     }
 }
 
+#[must_use]
 pub struct ReadBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
