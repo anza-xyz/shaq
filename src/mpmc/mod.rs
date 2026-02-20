@@ -1,6 +1,10 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{error::Error, shmem::map_file, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::Error,
+    shmem::{map_file, unmap_file},
+    CacheAlignedAtomicSize, VERSION,
+};
 use core::{
     marker::PhantomData,
     ptr::NonNull,
@@ -237,7 +241,7 @@ impl<T> Drop for SharedQueue<T> {
         #[allow(unreachable_code)]
         // SAFETY: header is mmapped and of size `file_size`.
         unsafe {
-            libc::munmap(self.header.as_ptr().cast(), self.file_size);
+            unmap_file(self.header.cast::<u8>(), self.file_size);
         }
     }
 }

@@ -1,6 +1,7 @@
-#![cfg(unix)]
-
-use crate::{error::Error, shmem::map_file};
+use crate::{
+    error::Error,
+    shmem::{map_file, unmap_file},
+};
 use core::{ptr::NonNull, sync::atomic::AtomicUsize};
 use std::{
     fs::File,
@@ -278,7 +279,7 @@ impl<T> Drop for SharedQueue<T> {
         #[allow(unreachable_code)]
         // SAFETY: header is mmapped and of size `file_size`.
         unsafe {
-            libc::munmap(self.header.as_ptr().cast(), self.file_size);
+            unmap_file(self.header.cast::<u8>(), self.file_size);
         }
     }
 }
