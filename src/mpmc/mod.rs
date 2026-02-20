@@ -232,12 +232,6 @@ struct SharedQueue<T> {
 
 impl<T> Drop for SharedQueue<T> {
     fn drop(&mut self) {
-        // Tests do not mmap so skip unmapping in tests.
-        #[cfg(test)]
-        {
-            return;
-        }
-
         #[allow(unreachable_code)]
         // SAFETY: header is mmapped and of size `file_size`.
         unsafe {
@@ -671,30 +665,24 @@ impl<'a, T> Drop for ReadBatch<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aligned_buffer::AlignedBuffer;
+    use crate::shmem::create_temp_shmem_file;
 
     type Item = u64;
     const BUFFER_CAPACITY: usize = 512;
     const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
 
-    fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
-        let file_size = buffer.len();
-        let buffer_size_in_items =
-            SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
-                .expect("Invalid buffer size");
-        let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
-        unsafe { SharedQueueHeader::initialize(header, buffer_size_in_items) };
+    fn create_test_queue<T: Sized>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
+        let file = create_temp_shmem_file().unwrap();
+        let producer =
+            unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
+        let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
 
-        (
-            unsafe { Producer::from_header(header, file_size) }.expect("Failed to create producer"),
-            unsafe { Consumer::from_header(header, file_size) }.expect("Failed to create consumer"),
-        )
+        (file, producer, consumer)
     }
 
     #[test]
     fn test_producer_consumer() {
-        let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
-        let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
         let capacity =
             SharedQueueHeader::calculate_buffer_size_in_items::<Item>(BUFFER_SIZE).unwrap();
 
@@ -711,8 +699,7 @@ mod tests {
 
     #[test]
     fn test_reserve_and_try_read_ptr() {
-        let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
-        let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         let mut guard = unsafe { producer.reserve() }.expect("reserve failed");
         unsafe {
@@ -728,8 +715,7 @@ mod tests {
 
     #[test]
     fn test_reserve_batch_and_try_read_batch() {
-        let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
-        let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         let mut batch = unsafe { producer.reserve_batch(4) }.expect("reserve_batch failed");
         for index in 0..batch.len() {
@@ -749,8 +735,7 @@ mod tests {
 
     #[test]
     fn test_batch_write_exact_read_upto_max() {
-        let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
-        let (producer, consumer) = create_test_queue::<Item>(&mut buffer.0);
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         unsafe {
             assert!(producer.reserve_batch(0).is_none());
@@ -774,25 +759,11 @@ mod tests {
 
     #[test]
     fn test_multiple_producers_consumers() {
-        let mut buffer = AlignedBuffer([0u8; BUFFER_SIZE]);
+        let (file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let producer2 = unsafe { Producer::join(&file) }.expect("Failed to create producer2");
+        let consumer2 = unsafe { Consumer::join(&file) }.expect("Failed to create consumer2");
 
-        let file_size = buffer.0.len();
-        let buffer_size_in_items =
-            SharedQueueHeader::calculate_buffer_size_in_items::<Item>(file_size)
-                .expect("Invalid buffer size");
-        let header = NonNull::new(buffer.0.as_mut_ptr().cast()).expect("Failed to create header");
-        unsafe { SharedQueueHeader::initialize(header, buffer_size_in_items) };
-
-        let producer =
-            unsafe { Producer::from_header(header, file_size) }.expect("Failed to create producer");
-        let producer2 = unsafe { Producer::from_header(header, file_size) }
-            .expect("Failed to create producer2");
-        let consumer = unsafe { Consumer::<Item>::from_header(header, file_size) }
-            .expect("Failed to create consumer");
-        let consumer2 = unsafe { Consumer::from_header(header, file_size) }
-            .expect("Failed to create consumer2");
-        let capacity = buffer_size_in_items;
-
+        let capacity = BUFFER_CAPACITY;
         for i in 0..(capacity / 2) {
             assert_eq!(producer.try_write((i * 2) as Item), Ok(()));
             assert_eq!(producer2.try_write((i * 2 + 1) as Item), Ok(()));

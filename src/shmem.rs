@@ -81,3 +81,42 @@ pub(crate) unsafe fn unmap_file(addr: NonNull<u8>, _size: usize) {
         })
     };
 }
+
+#[cfg(test)]
+pub(crate) fn create_temp_shmem_file() -> Result<File, Error> {
+    use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp_dir = std::env::temp_dir();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = temp_dir.join(format!("rts-alloc-{n}.tmp"));
+
+    let mut open_options = OpenOptions::new();
+    open_options.read(true).write(true).create_new(true);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+        };
+
+        open_options
+            .attributes(FILE_ATTRIBUTE_TEMPORARY)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+
+    let open_result = open_options.open(&path);
+
+    match open_result {
+        Ok(file) => {
+            #[cfg(unix)]
+            {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(file)
+        }
+        Err(err) => Err(Error::Io(err)),
+    }
+}
