@@ -1,6 +1,7 @@
-#![cfg(unix)]
-
-use crate::{error::Error, shmem::map_file};
+use crate::{
+    error::Error,
+    shmem::{map_file, unmap_file},
+};
 use core::{ptr::NonNull, sync::atomic::AtomicUsize};
 use std::{
     fs::File,
@@ -269,16 +270,9 @@ struct SharedQueue<T: Sized> {
 
 impl<T> Drop for SharedQueue<T> {
     fn drop(&mut self) {
-        // Tests do not mmap so skip unmapping in tests.
-        #[cfg(test)]
-        {
-            return;
-        }
-
-        #[allow(unreachable_code)]
         // SAFETY: header is mmapped and of size `file_size`.
         unsafe {
-            libc::munmap(self.header.as_ptr().cast(), self.file_size);
+            unmap_file(self.header.cast::<u8>(), self.file_size);
         }
     }
 }
@@ -476,30 +470,18 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
 }
 
 #[cfg(test)]
-pub(crate) mod aligned_buffer {
-    #[repr(C, align(64))]
-    pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
-}
-
-#[cfg(test)]
 mod tests {
-    use crate::aligned_buffer::AlignedBuffer;
-
     use super::*;
+    use crate::shmem::create_temp_shmem_file;
     use std::sync::atomic::AtomicU64;
 
-    fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
-        let file_size = buffer.len();
-        let buffer_size_in_items =
-            SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
-                .expect("Invalid buffer size");
-        let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
-        unsafe { SharedQueueHeader::initialize(header, buffer_size_in_items) };
+    fn create_test_queue<T: Sized>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
+        let file = create_temp_shmem_file().unwrap();
+        let producer =
+            unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
+        let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
 
-        (
-            unsafe { Producer::from_header(header, file_size) }.expect("Failed to create producer"),
-            unsafe { Consumer::from_header(header, file_size) }.expect("Failed to create consumer"),
-        )
+        (file, producer, consumer)
     }
 
     #[test]
@@ -508,9 +490,7 @@ mod tests {
         const BUFFER_CAPACITY: usize = 1024;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
 
-        let mut buffer = Box::new(AlignedBuffer([0; BUFFER_SIZE]));
-        let slice = buffer.0.as_mut_slice();
-        let (mut producer, mut consumer) = create_test_queue::<Item>(slice);
+        let (_file, mut producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         assert_eq!(producer.capacity(), BUFFER_CAPACITY);
         assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
