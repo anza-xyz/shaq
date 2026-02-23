@@ -59,12 +59,12 @@ pub(crate) fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
 
     let mmap = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size) };
 
-    unsafe {
-        CloseHandle(mapping);
-    }
-
     if mmap.Value.is_null() {
         return Err(Error::Mmap(std::io::Error::last_os_error()));
+    }
+
+    unsafe {
+        CloseHandle(mapping);
     }
 
     Ok(NonNull::new(mmap.Value.cast()).expect("already checked for null"))
