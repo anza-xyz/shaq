@@ -7,7 +7,7 @@ use common::{
 };
 use shaq::{
     mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
-    Consumer as SpscConsumer, Producer as SpscProducer,
+    spsc::{Consumer as SpscConsumer, Producer as SpscProducer},
 };
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
