@@ -232,7 +232,6 @@ struct SharedQueue<T> {
 
 impl<T> Drop for SharedQueue<T> {
     fn drop(&mut self) {
-        #[allow(unreachable_code)]
         // SAFETY: header is mmapped and of size `file_size`.
         unsafe {
             unmap_file(self.header.cast::<u8>(), self.file_size);
