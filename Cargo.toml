@@ -11,7 +11,7 @@ edition = "2021"
 include = ["src/*.rs", "Cargo.toml"]
 
 [target."cfg(unix)".dependencies]
-libc = { version = "0.2.182" }
+libc = { version = "0.2.180" }
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.59", features = [
