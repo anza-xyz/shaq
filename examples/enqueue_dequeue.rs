@@ -241,12 +241,16 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
     unsafe {
         let _ = MpmcProducer::<Item>::create(&queue_file, QUEUE_SIZE).unwrap();
     }
+    // SAFETY: Queue was created above; joining once and sharing handles is safe.
+    let producer = Arc::new(unsafe { MpmcProducer::<Item>::join(&queue_file) }.unwrap());
+    // SAFETY: Queue was created above; joining once and sharing handles is safe.
+    let consumer = Arc::new(unsafe { MpmcConsumer::<Item>::join(&queue_file) }.unwrap());
 
     let mut handles = Vec::new();
 
     for (idx, core_id) in consumer_cores.into_iter().enumerate() {
         let exit = exit.clone();
-        let file = queue_file.try_clone().unwrap();
+        let consumer = consumer.clone();
         let consumer_reserve_failures = consumer_reserve_failures.clone();
         handles.push(
             std::thread::Builder::new()
@@ -257,8 +261,6 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
                         core_affinity::set_for_current(core_id);
                     }
 
-                    // SAFETY: Queue was created once and this handle joins as a consumer.
-                    let consumer = unsafe { MpmcConsumer::join(&file) }.unwrap();
                     run_mpmc_consumer(consumer, exit, consumer_reserve_failures);
                 })
                 .unwrap(),
@@ -267,7 +269,7 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
 
     for (idx, core_id) in producer_cores.into_iter().enumerate() {
         let exit = exit.clone();
-        let file = queue_file.try_clone().unwrap();
+        let producer = producer.clone();
         let report_prefix = verbose.then(|| format!("Producer {idx}"));
         handles.push(
             std::thread::Builder::new()
@@ -281,8 +283,6 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
                             core_affinity::set_for_current(core_id);
                         }
 
-                        // SAFETY: Queue was created once and this handle joins as a producer.
-                        let producer = unsafe { MpmcProducer::join(&file) }.unwrap();
                         run_mpmc_producer(
                             producer,
                             exit,
@@ -310,7 +310,7 @@ fn run_mpmc(producers: usize, consumers: usize, verbose: bool) {
 }
 
 fn run_mpmc_producer(
-    producer: MpmcProducer<Item>,
+    producer: Arc<MpmcProducer<Item>>,
     exit: Arc<AtomicBool>,
     report_prefix: Option<String>,
     total_items_produced: Arc<AtomicU64>,
@@ -333,7 +333,7 @@ fn run_mpmc_producer(
 }
 
 fn run_mpmc_consumer(
-    consumer: MpmcConsumer<Item>,
+    consumer: Arc<MpmcConsumer<Item>>,
     exit: Arc<AtomicBool>,
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
