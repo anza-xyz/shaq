@@ -65,11 +65,63 @@ impl<T> Producer<T> {
     /// Writes item into the queue or returns it if there is not enough space.
     pub fn try_write(&self, item: T) -> Result<(), T> {
         // SAFETY: On successful reservation the item is written below.
-        let guard = match unsafe { self.reserve() } {
+        let guard = match unsafe { self.reserve_write() } {
             Some(guard) => guard,
             None => return Err(item),
         };
         guard.write(item);
+        Ok(())
+    }
+
+    /// Writes items from a slice into the queue.
+    ///
+    /// Returns `Err()` if there is not enough space.
+    pub fn try_write_slice(&self, items: &[T]) -> bool
+    where
+        T: Copy,
+    {
+        if items.is_empty() {
+            return true;
+        }
+
+        // SAFETY: if successful we write all items below.
+        let mut guard = match unsafe { self.reserve_write_batch(items.len()) } {
+            Some(guard) => guard,
+            None => return false,
+        };
+
+        for (index, item) in items.iter().copied().enumerate() {
+            // SAFETY: index is not out of bounds.
+            unsafe { guard.write(index, item) };
+        }
+        true
+    }
+
+    /// Writes items into the queue or returns the iterator if there is not enough space.
+    ///
+    /// # Safety
+    /// - `items.len()` must exactly match the number of values yielded by `items`.
+    /// - Yielding fewer values will publish uninitialized memory.
+    /// - Yielding more values will drop unwritten items.
+    pub unsafe fn try_write_batch<I>(&self, items: I) -> Result<(), I>
+    where
+        I: ExactSizeIterator<Item = T>,
+    {
+        // SAFETY: if successful we write all items below
+        let mut guard = match unsafe { self.reserve_write_batch(items.len()) } {
+            Some(guard) => guard,
+            None => return Err(items),
+        };
+
+        let mut written = 0;
+        for (index, item) in items.enumerate() {
+            debug_assert!(index < guard.count);
+            // SAFETY: index is not out of bounds
+            unsafe { guard.write(index, item) };
+            written = index + 1;
+        }
+        debug_assert_eq!(written, guard.count);
+
         Ok(())
     }
 
@@ -83,7 +135,7 @@ impl<T> Producer<T> {
     /// # Safety
     /// - The caller must initialize the reserved slot before the guard is dropped.
     #[must_use]
-    pub unsafe fn reserve(&self) -> Option<WriteGuard<'_, T>> {
+    pub unsafe fn reserve_write(&self) -> Option<WriteGuard<'_, T>> {
         self.queue
             .reserve_write()
             .map(|(cell, position)| WriteGuard {
@@ -104,7 +156,7 @@ impl<T> Producer<T> {
     /// # Safety
     /// - The caller must initialize all reserved slots before the batch is dropped.
     #[must_use]
-    pub unsafe fn reserve_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
+    pub unsafe fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
         let start = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             header: self.queue.header,
@@ -173,7 +225,20 @@ impl<T> Consumer<T> {
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
     pub fn try_read(&self) -> Option<T> {
-        self.try_read_ptr().map(ReadGuard::read)
+        self.reserve_read().map(ReadGuard::read)
+    }
+
+    /// Attempts to read values from the queue.
+    /// Returns `None` if there are no values available.
+    pub fn try_read_batch(
+        &self,
+        max_count: usize,
+    ) -> Option<impl ExactSizeIterator<Item = T> + '_> {
+        self.reserve_read_batch(max_count).map(|batch| {
+            (0..batch.count).map(move |index|
+                // SAFETY: index is less than count
+                unsafe { batch.read(index) })
+        })
     }
 
     /// Attempts to reserve a value from the queue, returning a guard.
@@ -183,7 +248,7 @@ impl<T> Consumer<T> {
     /// released in order they were reserved. Holding a [`ReadGuard`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
-    pub fn try_read_ptr(&self) -> Option<ReadGuard<'_, T>> {
+    pub fn reserve_read(&self) -> Option<ReadGuard<'_, T>> {
         self.queue.reserve_read().map(|(cell, position)| ReadGuard {
             header: self.queue.header,
             cell,
@@ -200,7 +265,7 @@ impl<T> Consumer<T> {
     /// released in order they were reserved. Holding a [`ReadBatch`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
-    pub fn try_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T>> {
+    pub fn reserve_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T>> {
         let (start, count) = self.queue.reserve_read_batch(max)?;
         Some(ReadBatch {
             header: self.queue.header,
@@ -531,8 +596,16 @@ pub struct WriteGuard<'a, T> {
 }
 
 impl<'a, T> WriteGuard<'a, T> {
-    pub fn as_mut_ptr(&mut self) -> *mut T {
+    /// Returns a mutable reference to the slot.
+    ///
+    /// # Safety
+    /// - T must be be valid for any bytes.
+    pub unsafe fn as_mut_ref(&mut self) -> &mut T {
         // SAFETY: The cell was reserved for writing.
+        unsafe { self.cell.as_mut() }
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
         self.cell.as_ptr()
     }
 
@@ -571,6 +644,14 @@ impl<'a, T> ReadGuard<'a, T> {
     }
 }
 
+impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
+    /// Returns a shared reference to the reserved slot.
+    fn as_ref(&self) -> &T {
+        // SAFETY: The cell was reserved for reading and is initialized.
+        unsafe { self.cell.as_ref() }
+    }
+}
+
 impl<'a, T> Drop for ReadGuard<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved consumer slot.
@@ -602,7 +683,9 @@ impl<'a, T> WriteBatch<'a, T> {
     /// Returns a mutable reference to the reserved slot.
     ///
     /// # Safety
-    /// The slot is uninitialized; caller must fully initialize `T`.
+    /// - The slot is uninitialized; caller must fully initialize `T`.
+    /// - `index < count`
+    /// - `T` must be valid for any bytes.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut T {
         debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
@@ -610,11 +693,27 @@ impl<'a, T> WriteBatch<'a, T> {
         unsafe { self.buffer.add(position & self.buffer_mask).as_mut() }
     }
 
-    pub fn as_mut_ptr(&mut self, index: usize) -> *mut T {
+    /// Returns a mutable pointer to the reserved slot.
+    ///
+    /// # Safety
+    /// - The slot is uninitialized; caller must fully initialize `T`.
+    /// - `index < count`
+    pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
         debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
+    }
+
+    /// Writes a value into the slot at index.
+    ///
+    /// # Safety
+    /// - `index < count`
+    pub unsafe fn write(&mut self, index: usize, value: T) {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for writing
+        unsafe { self.buffer.add(position & self.buffer_mask).write(value) }
     }
 }
 
@@ -646,11 +745,37 @@ impl<'a, T> ReadBatch<'a, T> {
         self.count == 0
     }
 
-    pub fn as_ptr(&self, index: usize) -> *const T {
+    /// Returns a reference to the reserved slot.
+    ///
+    /// # Safety
+    /// - `index` must be less than `self.len()`
+    pub unsafe fn as_ref(&self, index: usize) -> &T {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for reading and is initialized.
+        unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
+    }
+
+    /// Returns a pointer to the reserved slot.
+    ///
+    /// # Safety
+    /// - `index` must be less than `self.len()`
+    pub unsafe fn as_ptr(&self, index: usize) -> *const T {
         debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
+    }
+
+    /// Read the value at index
+    ///
+    /// # Safety
+    /// - `index` must be less than `self.len()`
+    pub unsafe fn read(&self, index: usize) -> T {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for reading.
+        unsafe { self.buffer.add(position & self.buffer_mask).read() }
     }
 }
 
@@ -702,23 +827,24 @@ mod tests {
     fn test_reserve_and_try_read_ptr() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
-        let mut guard = unsafe { producer.reserve() }.expect("reserve failed");
+        let mut guard = unsafe { producer.reserve_write() }.expect("reserve failed");
         unsafe {
             *guard.as_mut_ptr() = 42;
         }
         drop(guard);
 
-        let guard = consumer.try_read_ptr().expect("try_read_ptr failed");
+        let guard = consumer.reserve_read().expect("try_read_ptr failed");
         unsafe {
             assert_eq!(*guard.as_ptr(), 42);
         }
+        assert_eq!(*guard.as_ref(), 42);
     }
 
     #[test]
     fn test_reserve_batch_and_try_read_batch() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
-        let mut batch = unsafe { producer.reserve_batch(4) }.expect("reserve_batch failed");
+        let mut batch = unsafe { producer.reserve_write_batch(4) }.expect("reserve_batch failed");
         for index in 0..batch.len() {
             unsafe {
                 *batch.as_mut_ptr(index) = index as u64;
@@ -726,11 +852,14 @@ mod tests {
         }
         drop(batch);
 
-        let batch = consumer.try_read_batch(4).expect("try_read_batch failed");
+        let batch = consumer
+            .reserve_read_batch(4)
+            .expect("try_read_batch failed");
         for index in 0..batch.len() {
             unsafe {
                 assert_eq!(*batch.as_ptr(index), index as u64);
             }
+            assert_eq!(unsafe { batch.read(index) }, index as u64);
         }
     }
 
@@ -739,15 +868,15 @@ mod tests {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         unsafe {
-            assert!(producer.reserve_batch(0).is_none());
-            assert!(producer.reserve_batch(BUFFER_CAPACITY + 1).is_none());
+            assert!(producer.reserve_write_batch(0).is_none());
+            assert!(producer.reserve_write_batch(BUFFER_CAPACITY + 1).is_none());
         }
 
         for i in 0..4 {
             assert_eq!(producer.try_write(i as Item), Ok(()));
         }
         let batch = consumer
-            .try_read_batch(5)
+            .reserve_read_batch(5)
             .expect("try_read_batch up-to failed");
         assert_eq!(batch.len(), 4);
         for index in 0..batch.len() {
@@ -756,6 +885,35 @@ mod tests {
                 assert_eq!(*batch.as_ptr(index), index as u64);
             }
         }
+    }
+
+    #[test]
+    fn test_try_write_slice() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        assert!(producer.try_write_slice(&[]));
+
+        let values = [10, 11, 12, 13];
+        assert!(producer.try_write_slice(&values));
+        for value in values {
+            assert_eq!(consumer.try_read(), Some(value));
+        }
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_try_write_batch_unsafe_returns_iterator_when_no_capacity() {
+        let small_size = minimum_file_size::<Item>(4);
+        let (_file, producer, _consumer) = create_test_queue::<Item>(small_size);
+
+        for i in 0..4 {
+            assert_eq!(producer.try_write(i as Item), Ok(()));
+        }
+
+        let err = unsafe { producer.try_write_batch(vec![100, 101].into_iter()) }
+            .expect_err("expected insufficient capacity");
+        let values: Vec<_> = err.collect();
+        assert_eq!(values, vec![100, 101]);
     }
 
     #[test]

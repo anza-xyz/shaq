@@ -318,7 +318,7 @@ fn run_mpmc_producer(
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
         // SAFETY: we write the batch below.
-        let Some(mut batch) = (unsafe { producer.reserve_batch(SYNC_CADENCE) }) else {
+        let Some(mut batch) = (unsafe { producer.reserve_write_batch(SYNC_CADENCE) }) else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -338,7 +338,7 @@ fn run_mpmc_consumer(
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_consumer_loop(exit, move || {
-        let Some(batch) = consumer.try_read_batch(SYNC_CADENCE) else {
+        let Some(batch) = consumer.reserve_read_batch(SYNC_CADENCE) else {
             consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
