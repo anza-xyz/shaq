@@ -8,7 +8,7 @@ use crate::{
 use core::{
     marker::PhantomData,
     ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU16, Ordering},
 };
 use std::fs::File;
 
@@ -477,7 +477,7 @@ struct SharedQueueHeader {
     /// Producers use it to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
     buffer_mask: usize,
-    version: AtomicU8,
+    version: AtomicU16,
 }
 
 impl SharedQueueHeader {
@@ -548,8 +548,12 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.version.load(Ordering::SeqCst) != VERSION {
-                return Err(Error::InvalidVersion);
+            let actual_version = header.version.load(Ordering::SeqCst);
+            if actual_version != VERSION {
+                return Err(Error::InvalidVersion {
+                    expected: VERSION,
+                    actual: actual_version,
+                });
             }
             let buffer_size_in_items = header.buffer_mask.wrapping_add(1);
             if buffer_size_in_items != Self::calculate_buffer_size_in_items::<T>(file_size)? {
