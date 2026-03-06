@@ -1,9 +1,44 @@
 use crate::error::Error;
-use std::{fs::File, ptr::NonNull};
+use std::{fs::File, ptr::NonNull, sync::Arc};
+
+pub(crate) struct MappedRegion {
+    addr: NonNull<u8>,
+    file_size: usize,
+}
+
+impl MappedRegion {
+    pub(crate) fn new(file: &File, size: usize) -> Result<Arc<Self>, Error> {
+        let addr = map_file(file, size)?;
+        Ok(Arc::new(Self {
+            addr,
+            file_size: size,
+        }))
+    }
+
+    pub(crate) fn addr(&self) -> NonNull<u8> {
+        self.addr
+    }
+
+    pub(crate) fn file_size(&self) -> usize {
+        self.file_size
+    }
+}
+
+impl Drop for MappedRegion {
+    fn drop(&mut self) {
+        // SAFETY: addr and file_size were produced by a successful map_file call.
+        unsafe { unmap_file(self.addr, self.file_size) };
+    }
+}
+
+// SAFETY: The mapped memory is shared (MAP_SHARED / file-backed) and access
+// is synchronized by the queue protocol built on top of it.
+unsafe impl Send for MappedRegion {}
+unsafe impl Sync for MappedRegion {}
 
 /// Maps a file into memory.
 #[cfg(unix)]
-pub(crate) fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
+fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
     use std::os::fd::AsRawFd;
 
     let addr = unsafe {
@@ -25,13 +60,13 @@ pub(crate) fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
 
 /// Unmaps a previously mapped file view.
 #[cfg(unix)]
-pub(crate) unsafe fn unmap_file(addr: NonNull<u8>, size: usize) {
+unsafe fn unmap_file(addr: NonNull<u8>, size: usize) {
     let _ = unsafe { libc::munmap(addr.as_ptr().cast(), size) };
 }
 
 /// Maps a file into memory.
 #[cfg(windows)]
-pub(crate) fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
+fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Memory::{
@@ -72,7 +107,7 @@ pub(crate) fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
 
 /// Unmaps a previously mapped file view.
 #[cfg(windows)]
-pub(crate) unsafe fn unmap_file(addr: NonNull<u8>, _size: usize) {
+unsafe fn unmap_file(addr: NonNull<u8>, _size: usize) {
     use windows_sys::Win32::System::Memory::{UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS};
 
     let _ = unsafe {
