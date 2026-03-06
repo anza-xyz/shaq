@@ -6,7 +6,7 @@ use crate::{
 use core::ptr::NonNull;
 use std::{
     fs::File,
-    sync::atomic::{AtomicU16, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 /// Calculates the minimum file size required for a queue with given capacity.
@@ -366,7 +366,7 @@ struct SharedQueueHeader {
     write: CacheAlignedAtomicSize,
     read: CacheAlignedAtomicSize,
     buffer_size: usize,
-    version: AtomicU16,
+    version: AtomicU32,
 }
 
 impl SharedQueueHeader {
