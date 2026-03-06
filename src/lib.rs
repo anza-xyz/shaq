@@ -5,7 +5,7 @@ pub mod mpmc;
 mod shmem;
 pub mod spsc;
 
-pub(crate) const VERSION_MAJOR: u8 = 1;
+pub(crate) const VERSION_MAJOR: u8 = 2;
 pub(crate) const VERSION_PATCH: u8 = 0;
 pub(crate) const VERSION: u16 = (VERSION_MAJOR as u16) << 8 | VERSION_PATCH as u16;
 
