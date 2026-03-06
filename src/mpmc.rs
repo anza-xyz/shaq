@@ -8,7 +8,7 @@ use crate::{
 use core::{
     marker::PhantomData,
     ptr::NonNull,
-    sync::atomic::{AtomicU16, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 use std::fs::File;
 
@@ -477,7 +477,7 @@ struct SharedQueueHeader {
     /// Producers use it to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
     buffer_mask: usize,
-    version: AtomicU16,
+    version: AtomicU32,
 }
 
 impl SharedQueueHeader {
