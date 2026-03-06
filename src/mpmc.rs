@@ -45,13 +45,17 @@ impl<T> Producer<T> {
 
     /// Creates a new Producer that shares the same memory mapping.
     pub fn join_as_producer(&self) -> Result<Self, Error> {
-        // SAFETY: region backs the header allocation; MPMC allows multiple producers.
+        // SAFETY:
+        // - Inherit safety from `&self`.
+        // - MPMC allows multiple producers.
         unsafe { Self::from_header(Arc::clone(&self.queue.region), self.queue.header) }
     }
 
     /// Creates a Consumer that shares the same memory mapping.
     pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
-        // SAFETY: region backs the header allocation; MPMC allows multiple consumers.
+        // SAFETY:
+        // - Inherit safety from `&self`.
+        // - MPMC allows multiple consumers.
         unsafe { Consumer::from_header(Arc::clone(&self.queue.region), self.queue.header) }
     }
 
@@ -217,13 +221,17 @@ impl<T> Consumer<T> {
 
     /// Creates a new Consumer that shares the same memory mapping.
     pub fn join_as_consumer(&self) -> Result<Self, Error> {
-        // SAFETY: region backs the header allocation; MPMC allows multiple consumers.
+        // SAFETY:
+        // - Inherit safety from `&self`.
+        // - MPMC allows multiple consumers.
         unsafe { Self::from_header(Arc::clone(&self.queue.region), self.queue.header) }
     }
 
     /// Creates a Producer that shares the same memory mapping.
     pub fn join_as_producer(&self) -> Result<Producer<T>, Error> {
-        // SAFETY: region backs the header allocation; MPMC allows multiple producers.
+        // SAFETY:
+        // - Inherit safety from `&self`.
+        // - MPMC allows multiple producers.
         unsafe { Producer::from_header(Arc::clone(&self.queue.region), self.queue.header) }
     }
 
