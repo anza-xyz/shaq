@@ -1,16 +1,12 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{
-    error::Error,
-    shmem::{map_file, unmap_file},
-    CacheAlignedAtomicSize, VERSION,
-};
+use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
 use core::{
     marker::PhantomData,
     ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
-use std::fs::File;
+use std::{fs::File, sync::Arc};
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -26,10 +22,10 @@ impl<T> Producer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        let header = SharedQueueHeader::create::<T>(file, file_size)?;
+        let (region, header) = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
-        unsafe { Self::from_header(header, file_size) }
+        unsafe { Self::from_header(region, header) }
     }
 
     /// Joins an existing producer for the shared queue in the provided file.
@@ -41,24 +37,31 @@ impl<T> Producer<T> {
     /// - The same `T` must be used by the [`Consumer`]s that are joined with
     ///   the same file.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
+        let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
-        unsafe { Self::from_header(header, file_size) }
+        unsafe { Self::from_header(region, header) }
+    }
+
+    /// Creates a Consumer that shares the same memory mapping.
+    pub fn join_as_consumer(&self) -> Consumer<T> {
+        Consumer {
+            queue: self.queue.clone(),
+        }
     }
 
     /// # Safety
     /// - `header` must be non-null and properly aligned.
-    /// - allocation at `header` must be of size `file_size` or greater.
+    /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
+        region: Arc<MappedRegion>,
         header: NonNull<SharedQueueHeader>,
-        file_size: usize,
     ) -> Result<Self, Error> {
         Ok(Self {
             // SAFETY:
             // - `header` is non-null and aligned properly.
             // - allocation at `header` is large enough to hold the header and the buffer.
-            queue: unsafe { SharedQueue::from_header(header, file_size) }?,
+            queue: unsafe { SharedQueue::from_header(region, header) }?,
         })
     }
 
@@ -169,6 +172,14 @@ impl<T> Producer<T> {
     }
 }
 
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
 unsafe impl<T> Send for Producer<T> {}
 unsafe impl<T> Sync for Producer<T> {}
 
@@ -186,10 +197,10 @@ impl<T> Consumer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        let header = SharedQueueHeader::create::<T>(file, file_size)?;
+        let (region, header) = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
-        unsafe { Self::from_header(header, file_size) }
+        unsafe { Self::from_header(region, header) }
     }
 
     /// Joins an existing consumer for the shared queue in the provided file.
@@ -201,24 +212,31 @@ impl<T> Consumer<T> {
     /// - The same `T` must be used by the [`Producer`]s that are joined with
     ///   the same file.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
+        let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
-        unsafe { Self::from_header(header, file_size) }
+        unsafe { Self::from_header(region, header) }
+    }
+
+    /// Creates a Producer that shares the same memory mapping.
+    pub fn join_as_producer(&self) -> Producer<T> {
+        Producer {
+            queue: self.queue.clone(),
+        }
     }
 
     /// # Safety
     /// - `header` must be non-null and properly aligned.
-    /// - allocation at `header` must be of size `file_size` or greater.
+    /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
+        region: Arc<MappedRegion>,
         header: NonNull<SharedQueueHeader>,
-        file_size: usize,
     ) -> Result<Self, Error> {
         Ok(Self {
             // SAFETY:
             // - `header` is non-null and aligned properly.
             // - allocation at `header` is large enough to hold the header and the buffer.
-            queue: unsafe { SharedQueue::from_header(header, file_size) }?,
+            queue: unsafe { SharedQueue::from_header(region, header) }?,
         })
     }
 
@@ -278,6 +296,14 @@ impl<T> Consumer<T> {
     }
 }
 
+impl<T> Clone for Consumer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
 unsafe impl<T> Send for Consumer<T> {}
 unsafe impl<T> Sync for Consumer<T> {}
 
@@ -289,19 +315,23 @@ pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
     buffer_offset + capacity * core::mem::size_of::<T>()
 }
 
-#[repr(C)]
 struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
-    file_size: usize,
     buffer_mask: usize,
+
+    // NB: Region must be declared last so it is dropped last ensuring `header` and
+    // `buffer` remain valid for their entire lifetime.
+    region: Arc<MappedRegion>,
 }
 
-impl<T> Drop for SharedQueue<T> {
-    fn drop(&mut self) {
-        // SAFETY: header is mmapped and of size `file_size`.
-        unsafe {
-            unmap_file(self.header.cast::<u8>(), self.file_size);
+impl<T> Clone for SharedQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header,
+            buffer: self.buffer,
+            buffer_mask: self.buffer_mask,
+            region: Arc::clone(&self.region),
         }
     }
 }
@@ -403,21 +433,21 @@ impl<T> SharedQueue<T> {
         }
     }
 
-    /// Creates a new shared queue from a header pointer and file size.
+    /// Creates a new shared queue from a header pointer and region.
     ///
     /// # Safety
+    /// - `region` must back the allocation at `header`.
     /// - `header` must be non-null and properly aligned.
-    /// - allocation at `header` must be of size `file_size`.
     unsafe fn from_header(
+        region: Arc<MappedRegion>,
         header: NonNull<SharedQueueHeader>,
-        file_size: usize,
     ) -> Result<Self, Error> {
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
         if !buffer_size_in_items.is_power_of_two()
             || buffer_size_in_items == 0
-            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)?
+            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.file_size())?
                 != buffer_size_in_items
         {
             return Err(Error::InvalidBufferSize);
@@ -430,7 +460,7 @@ impl<T> SharedQueue<T> {
         Ok(Self {
             header,
             buffer,
-            file_size,
+            region,
             buffer_mask,
         })
     }
@@ -481,18 +511,21 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T: Sized>(file: &File, size: usize) -> Result<NonNull<Self>, Error> {
+    fn create<T: Sized>(
+        file: &File,
+        size: usize,
+    ) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
-        let header = map_file(file, size)?.cast::<Self>();
+        let region = MappedRegion::new(file, size)?;
+        let header = region.addr().cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
-        //         Alignment is guaranteed because `create_and_map_file` will return
-        //         a pointer only if mapping was successful. mmap ensures that the
+        //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
         //         alignment of `SharedQueueHeader`.
         unsafe { Self::initialize(header, buffer_size_in_items) };
-        Ok(header)
+        Ok((region, header))
     }
 
     const fn buffer_offset<T: Sized>() -> usize {
@@ -538,13 +571,13 @@ impl SharedQueueHeader {
         header.version.store(VERSION, Ordering::SeqCst);
     }
 
-    fn join<T: Sized>(file: &File) -> Result<(NonNull<Self>, usize), Error> {
+    fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
-        let header = map_file(file, file_size)?.cast::<Self>();
+        let region = MappedRegion::new(file, file_size)?;
+        let header = region.addr().cast::<Self>();
         {
             // SAFETY: The header is non-null and aligned properly.
-            //         Alignment is guaranteed because `open_and_map_file` will return
-            //         a pointer only if mapping was successful. mmap ensures that the
+            //         Alignment is guaranteed because mmap ensures that the
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
@@ -561,7 +594,7 @@ impl SharedQueueHeader {
             }
         }
 
-        Ok((header, file_size))
+        Ok((region, header))
     }
 
     /// # Safety
@@ -953,5 +986,79 @@ mod tests {
         for (i, value) in values.iter().enumerate() {
             assert_eq!(*value, i as Item);
         }
+    }
+
+    #[test]
+    fn test_clone_producer() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let producer2 = producer.clone();
+
+        producer.try_write(10).unwrap();
+        producer2.try_write(20).unwrap();
+
+        let mut values = Vec::new();
+        while let Some(v) = consumer.try_read() {
+            values.push(v);
+        }
+        values.sort_unstable();
+        assert_eq!(values, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_clone_consumer() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let consumer2 = consumer.clone();
+
+        for i in 0..4 {
+            producer.try_write(i).unwrap();
+        }
+
+        let mut values = Vec::new();
+        loop {
+            let mut progressed = false;
+            if let Some(v) = consumer.try_read() {
+                values.push(v);
+                progressed = true;
+            }
+            if let Some(v) = consumer2.try_read() {
+                values.push(v);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        values.sort_unstable();
+        assert_eq!(values, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_cross_role_joins() {
+        let (_file, producer1, consumer1) = create_test_queue::<Item>(BUFFER_SIZE);
+        let consumer2 = producer1.join_as_consumer();
+        let producer2 = consumer2.join_as_producer();
+
+        // Write two values.
+        producer1.try_write(100).unwrap();
+        producer2.try_write(200).unwrap();
+
+        // Read two values.
+        assert_eq!(consumer2.try_read().unwrap(), 100);
+        assert_eq!(consumer1.try_read().unwrap(), 200);
+    }
+
+    #[test]
+    fn test_drop_original_mapping_stays_alive() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer =
+            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
+        let consumer = producer.join_as_consumer();
+        let producer2 = producer.clone();
+
+        // Drop the original producer — the mapping stays alive via Arc.
+        drop(producer);
+
+        producer2.try_write(42).unwrap();
+        assert_eq!(consumer.try_read(), Some(42));
     }
 }
