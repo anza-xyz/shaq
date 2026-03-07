@@ -43,20 +43,11 @@ impl<T> Producer<T> {
         unsafe { Self::from_header(region, header) }
     }
 
-    /// Creates a new Producer that shares the same memory mapping.
-    pub fn join_as_producer(&self) -> Result<Self, Error> {
-        // SAFETY:
-        // - Inherit safety from `&self`.
-        // - MPMC allows multiple producers.
-        unsafe { Self::from_header(Arc::clone(&self.queue.region), self.queue.header) }
-    }
-
     /// Creates a Consumer that shares the same memory mapping.
-    pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
-        // SAFETY:
-        // - Inherit safety from `&self`.
-        // - MPMC allows multiple consumers.
-        unsafe { Consumer::from_header(Arc::clone(&self.queue.region), self.queue.header) }
+    pub fn join_as_consumer(&self) -> Consumer<T> {
+        Consumer {
+            queue: self.queue.clone(),
+        }
     }
 
     /// # Safety
@@ -181,6 +172,14 @@ impl<T> Producer<T> {
     }
 }
 
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
 unsafe impl<T> Send for Producer<T> {}
 unsafe impl<T> Sync for Producer<T> {}
 
@@ -219,20 +218,11 @@ impl<T> Consumer<T> {
         unsafe { Self::from_header(region, header) }
     }
 
-    /// Creates a new Consumer that shares the same memory mapping.
-    pub fn join_as_consumer(&self) -> Result<Self, Error> {
-        // SAFETY:
-        // - Inherit safety from `&self`.
-        // - MPMC allows multiple consumers.
-        unsafe { Self::from_header(Arc::clone(&self.queue.region), self.queue.header) }
-    }
-
     /// Creates a Producer that shares the same memory mapping.
-    pub fn join_as_producer(&self) -> Result<Producer<T>, Error> {
-        // SAFETY:
-        // - Inherit safety from `&self`.
-        // - MPMC allows multiple producers.
-        unsafe { Producer::from_header(Arc::clone(&self.queue.region), self.queue.header) }
+    pub fn join_as_producer(&self) -> Producer<T> {
+        Producer {
+            queue: self.queue.clone(),
+        }
     }
 
     /// # Safety
@@ -306,6 +296,14 @@ impl<T> Consumer<T> {
     }
 }
 
+impl<T> Clone for Consumer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
 unsafe impl<T> Send for Consumer<T> {}
 unsafe impl<T> Sync for Consumer<T> {}
 
@@ -325,6 +323,17 @@ struct SharedQueue<T> {
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
     region: Arc<MappedRegion>,
+}
+
+impl<T> Clone for SharedQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header,
+            buffer: self.buffer,
+            buffer_mask: self.buffer_mask,
+            region: Arc::clone(&self.region),
+        }
+    }
 }
 
 impl<T> SharedQueue<T> {
@@ -980,9 +989,9 @@ mod tests {
     }
 
     #[test]
-    fn test_join_producer_as_producer() {
+    fn test_clone_producer() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let producer2 = producer.join_as_producer().unwrap();
+        let producer2 = producer.clone();
 
         producer.try_write(10).unwrap();
         producer2.try_write(20).unwrap();
@@ -996,9 +1005,9 @@ mod tests {
     }
 
     #[test]
-    fn test_join_consumer_as_consumer() {
+    fn test_clone_consumer() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let consumer2 = consumer.join_as_consumer().unwrap();
+        let consumer2 = consumer.clone();
 
         for i in 0..4 {
             producer.try_write(i).unwrap();
@@ -1026,8 +1035,8 @@ mod tests {
     #[test]
     fn test_cross_role_joins() {
         let (_file, producer1, consumer1) = create_test_queue::<Item>(BUFFER_SIZE);
-        let consumer2 = producer1.join_as_consumer().expect("join_consumer failed");
-        let producer2 = consumer2.join_as_producer().expect("join_producer failed");
+        let consumer2 = producer1.join_as_consumer();
+        let producer2 = consumer2.join_as_producer();
 
         // Write two values.
         producer1.try_write(100).unwrap();
@@ -1043,10 +1052,8 @@ mod tests {
         let file = create_temp_shmem_file().unwrap();
         let producer =
             unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
-        let consumer = producer.join_as_consumer().expect("join_consumer failed");
-        let producer2 = producer
-            .join_as_producer()
-            .expect("join_from_existing failed");
+        let consumer = producer.join_as_consumer();
+        let producer2 = producer.clone();
 
         // Drop the original producer — the mapping stays alive via Arc.
         drop(producer);
