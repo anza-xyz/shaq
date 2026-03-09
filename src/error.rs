@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidMagic,
     InvalidVersion { expected: u32, actual: u32 },
     InvalidBufferSize,
     Io(std::io::Error),
@@ -13,6 +14,7 @@ impl std::error::Error for Error {}
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidMagic => write!(f, "invalid magic"),
             Self::InvalidVersion { expected, actual } => write!(
                 f,
                 "invalid version; expected={}.{}; found={}.{}",
