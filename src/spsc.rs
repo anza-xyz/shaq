@@ -463,7 +463,7 @@ impl SharedQueueHeader {
                     actual: header.version,
                 });
             }
-            if header.buffer_mask as usize + 1
+            if (header.buffer_mask as usize).wrapping_add(1)
                 != Self::calculate_buffer_size_in_items::<T>(file_size)?
             {
                 return Err(Error::InvalidBufferSize);
