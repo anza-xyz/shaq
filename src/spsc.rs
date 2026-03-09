@@ -1,4 +1,4 @@
-use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, SPSC_MAGIC, VERSION};
+use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
 use core::ptr::NonNull;
 use std::{
     fs::File,
@@ -7,6 +7,8 @@ use std::{
         Arc,
     },
 };
+
+const MAGIC: u64 = 0x7368_6171_7370_7363; // b"shaqspsc"
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
@@ -440,7 +442,7 @@ impl SharedQueueHeader {
         header.read.store(0, Ordering::Release);
         header.buffer_mask = (buffer_size_in_items - 1) as u32;
         header.version = VERSION;
-        header.magic.store(SPSC_MAGIC, Ordering::Release);
+        header.magic.store(MAGIC, Ordering::Release);
     }
 
     fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
@@ -453,7 +455,7 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.magic.load(Ordering::Acquire) != SPSC_MAGIC {
+            if header.magic.load(Ordering::Acquire) != MAGIC {
                 return Err(Error::InvalidMagic);
             }
             if header.version != VERSION {

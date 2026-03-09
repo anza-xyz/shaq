@@ -5,9 +5,6 @@ pub mod mpmc;
 mod shmem;
 pub mod spsc;
 
-pub(crate) const SPSC_MAGIC: u64 = 0x7368_6171_7370_7363; // b"shaqspsc"
-pub(crate) const MPMC_MAGIC: u64 = 0x7368_6171_6d70_6d63; // b"shaqmpmc"
-
 pub(crate) const VERSION_MAJOR: u16 = 2;
 pub(crate) const VERSION_PATCH: u16 = 0;
 pub(crate) const VERSION: u32 = (VERSION_MAJOR as u32) << 16 | VERSION_PATCH as u32;

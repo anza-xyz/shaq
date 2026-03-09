@@ -1,11 +1,13 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, MPMC_MAGIC, VERSION};
+use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
 use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
     sync::{atomic::AtomicU64, Arc},
 };
+
+const MAGIC: u64 = 0x7368_6171_6d70_6d63; // b"shaqmpmc"
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -571,7 +573,7 @@ impl SharedQueueHeader {
         header.consumer_release.store(0, Ordering::Release);
         header.buffer_mask = (buffer_size_in_items - 1) as u32;
         header.version = VERSION;
-        header.magic.store(MPMC_MAGIC, Ordering::Release);
+        header.magic.store(MAGIC, Ordering::Release);
     }
 
     fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
@@ -584,7 +586,7 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.magic.load(Ordering::Acquire) != MPMC_MAGIC {
+            if header.magic.load(Ordering::Acquire) != MAGIC {
                 return Err(Error::InvalidMagic);
             }
             if header.version != VERSION {
