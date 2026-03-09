@@ -1,12 +1,11 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
-use core::{
-    marker::PhantomData,
-    ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, MPMC_MAGIC, VERSION};
+use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
+use std::{
+    fs::File,
+    sync::{atomic::AtomicU64, Arc},
 };
-use std::{fs::File, sync::Arc};
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -443,7 +442,7 @@ impl<T> SharedQueue<T> {
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         let header_ref = unsafe { header.as_ref() };
-        let buffer_mask = header_ref.buffer_mask;
+        let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
         if !buffer_size_in_items.is_power_of_two()
             || buffer_size_in_items == 0
@@ -484,6 +483,11 @@ impl<T> SharedQueue<T> {
 
 #[repr(C)]
 struct SharedQueueHeader {
+    // Cold metadata cacheline.
+    magic: AtomicU64,
+    version: u32,
+    buffer_mask: u32,
+
     /// Producer reservation cursor.
     ///
     /// Producers atomically advance this with CAS to claim slots, but claimed
@@ -506,8 +510,6 @@ struct SharedQueueHeader {
     /// Consumers advance this in-order after dropping/reading claimed slots.
     /// Producers use it to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
-    buffer_mask: usize,
-    version: AtomicU32,
 }
 
 impl SharedQueueHeader {
@@ -567,8 +569,9 @@ impl SharedQueueHeader {
         header.producer_publication.store(0, Ordering::Release);
         header.consumer_reservation.store(0, Ordering::Release);
         header.consumer_release.store(0, Ordering::Release);
-        header.buffer_mask = buffer_size_in_items - 1;
-        header.version.store(VERSION, Ordering::SeqCst);
+        header.buffer_mask = (buffer_size_in_items - 1) as u32;
+        header.version = VERSION;
+        header.magic.store(MPMC_MAGIC, Ordering::Release);
     }
 
     fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
@@ -581,14 +584,16 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            let actual_version = header.version.load(Ordering::SeqCst);
-            if actual_version != VERSION {
+            if header.magic.load(Ordering::Acquire) != MPMC_MAGIC {
+                return Err(Error::InvalidMagic);
+            }
+            if header.version != VERSION {
                 return Err(Error::InvalidVersion {
                     expected: VERSION,
-                    actual: actual_version,
+                    actual: header.version,
                 });
             }
-            let buffer_size_in_items = header.buffer_mask.wrapping_add(1);
+            let buffer_size_in_items = (header.buffer_mask as usize).wrapping_add(1);
             if buffer_size_in_items != Self::calculate_buffer_size_in_items::<T>(file_size)? {
                 return Err(Error::InvalidBufferSize);
             }

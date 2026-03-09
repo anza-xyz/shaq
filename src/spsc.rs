@@ -1,9 +1,9 @@
-use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
+use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, SPSC_MAGIC, VERSION};
 use core::ptr::NonNull;
 use std::{
     fs::File,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
@@ -114,11 +114,9 @@ impl<T: Sized> Producer<T> {
     /// All reserved positions must be fully initialized before calling `commit`.
     /// Pointers should be dropped before calling `commit`.
     pub unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
-        // If write is >= read + buffer_size, the queue is written one iteration
+        // If write is > read + buffer_mask, the queue is written one iteration
         // ahead of the consumer, and we cannot reserve more space.
-        if self.queue.cached_write.wrapping_sub(self.queue.cached_read)
-            >= self.queue.header().buffer_size
-        {
+        if self.queue.cached_write.wrapping_sub(self.queue.cached_read) > self.queue.buffer_mask {
             return None;
         }
 
@@ -294,7 +292,7 @@ impl<T: Sized> SharedQueue<T> {
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         // SAFETY: `header` is non-null and aligned properly.
-        let size = unsafe { header.as_ref().buffer_size };
+        let size = unsafe { header.as_ref().buffer_mask as usize + 1 };
 
         if !size.is_power_of_two()
             || size == 0
@@ -374,10 +372,14 @@ impl<T: Sized> SharedQueue<T> {
 /// Header in shared memory for the queue.
 #[repr(C)]
 struct SharedQueueHeader {
+    // Cold cache line.
+    magic: AtomicU64,
+    version: u32,
+    buffer_mask: u32,
+
+    // Hot cache lines.
     write: CacheAlignedAtomicSize,
     read: CacheAlignedAtomicSize,
-    buffer_size: usize,
-    version: AtomicU32,
 }
 
 impl SharedQueueHeader {
@@ -436,8 +438,9 @@ impl SharedQueueHeader {
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
-        header.buffer_size = buffer_size_in_items;
-        header.version.store(VERSION, Ordering::SeqCst);
+        header.buffer_mask = (buffer_size_in_items - 1) as u32;
+        header.version = VERSION;
+        header.magic.store(SPSC_MAGIC, Ordering::Release);
     }
 
     fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
@@ -450,14 +453,18 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            let actual_version = header.version.load(Ordering::SeqCst);
-            if actual_version != VERSION {
+            if header.magic.load(Ordering::Acquire) != SPSC_MAGIC {
+                return Err(Error::InvalidMagic);
+            }
+            if header.version != VERSION {
                 return Err(Error::InvalidVersion {
                     expected: VERSION,
-                    actual: actual_version,
+                    actual: header.version,
                 });
             }
-            if header.buffer_size != Self::calculate_buffer_size_in_items::<T>(file_size)? {
+            if header.buffer_mask as usize + 1
+                != Self::calculate_buffer_size_in_items::<T>(file_size)?
+            {
                 return Err(Error::InvalidBufferSize);
             }
         }
