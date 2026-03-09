@@ -297,7 +297,6 @@ impl<T: Sized> SharedQueue<T> {
         let size = unsafe { header.as_ref().buffer_mask as usize + 1 };
 
         if !size.is_power_of_two()
-            || size == 0
             || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.file_size())? != size
         {
             return Err(Error::InvalidBufferSize);
