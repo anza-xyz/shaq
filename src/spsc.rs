@@ -294,7 +294,7 @@ impl<T: Sized> SharedQueue<T> {
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         // SAFETY: `header` is non-null and aligned properly.
-        let size = unsafe { header.as_ref().buffer_mask as usize + 1 };
+        let size = unsafe { (header.as_ref().buffer_mask as usize).wrapping_add(1) };
 
         if !size.is_power_of_two()
             || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.file_size())? != size
