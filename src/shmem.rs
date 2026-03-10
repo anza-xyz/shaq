@@ -95,14 +95,18 @@ fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
     let mmap = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size) };
 
     if mmap.Value.is_null() {
-        return Err(Error::Mmap(std::io::Error::last_os_error()));
-    }
+        let err = Error::Mmap(std::io::Error::last_os_error());
 
-    unsafe {
-        CloseHandle(mapping);
-    }
+        unsafe { CloseHandle(mapping) };
 
-    Ok(NonNull::new(mmap.Value.cast()).expect("already checked for null"))
+        Err(err)
+    } else {
+        unsafe {
+            CloseHandle(mapping);
+        }
+
+        Ok(NonNull::new(mmap.Value.cast()).expect("already checked for null"))
+    }
 }
 
 /// Unmaps a previously mapped file view.
