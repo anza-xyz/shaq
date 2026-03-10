@@ -539,6 +539,13 @@ impl SharedQueueHeader {
     }
 
     const fn calculate_buffer_size_in_items<T: Sized>(file_size: usize) -> Result<usize, Error> {
+        const {
+            assert!(
+                core::mem::size_of::<T>() > 0,
+                "zero-sized types are not supported"
+            )
+        }
+
         let buffer_offset = Self::buffer_offset::<T>();
         if file_size < buffer_offset {
             return Err(Error::InvalidBufferSize);
