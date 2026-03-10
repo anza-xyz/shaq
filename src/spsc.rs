@@ -1,4 +1,6 @@
-use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::Error, normalized_capacity, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION,
+};
 use core::ptr::NonNull;
 use std::{
     fs::File,
@@ -15,7 +17,7 @@ const MAGIC: u64 = 0x7368_6171_7370_7363; // b"shaqspsc"
 /// page-size requirements.
 pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
     let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
-    buffer_offset + capacity * core::mem::size_of::<T>()
+    buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
 /// Producer side of the SPSC shared queue.
@@ -611,5 +613,14 @@ mod tests {
         let val = consumer.try_read().expect("read after producer drop");
         assert_eq!(*val, 7);
         consumer.finalize();
+    }
+
+    #[test]
+    fn test_minimum_file_size_rounds_up_capacity() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer = unsafe { Producer::<u64>::create(&file, minimum_file_size::<u64>(3)) }
+            .expect("create failed");
+
+        assert_eq!(producer.capacity(), 4);
     }
 }
