@@ -1,6 +1,8 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{error::Error, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::Error, normalized_capacity, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION,
+};
 use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
@@ -313,7 +315,7 @@ unsafe impl<T> Sync for Consumer<T> {}
 /// page-size requirements.
 pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
     let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
-    buffer_offset + capacity * core::mem::size_of::<T>()
+    buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
 struct SharedQueue<T> {
@@ -963,6 +965,17 @@ mod tests {
             .expect_err("expected insufficient capacity");
         let values: Vec<_> = err.collect();
         assert_eq!(values, vec![100, 101]);
+    }
+
+    #[test]
+    fn test_minimum_file_size_rounds_up_capacity() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer = unsafe { Producer::<u64>::create(&file, minimum_file_size::<u64>(3)) }
+            .expect("create failed");
+        let consumer = unsafe { Consumer::<u64>::join(&file) }.expect("join failed");
+
+        assert_eq!(producer.queue.capacity(), 4);
+        assert_eq!(consumer.queue.capacity(), 4);
     }
 
     #[test]
