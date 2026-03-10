@@ -1,5 +1,8 @@
 use core::sync::atomic::AtomicUsize;
 
+// NB: To simplify casting we only support 64bit or wider systems.
+const _: () = assert!(size_of::<usize>() >= size_of::<u64>());
+
 pub mod error;
 pub mod mpmc;
 mod shmem;

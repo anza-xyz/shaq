@@ -553,6 +553,11 @@ impl SharedQueueHeader {
             }
         }
 
+        // The buffer mask is stored as u32, so the capacity must fit.
+        if buffer_size_in_items > u32::MAX as usize + 1 {
+            return Err(Error::InvalidBufferSize);
+        }
+
         Ok(buffer_size_in_items)
     }
 
@@ -571,7 +576,7 @@ impl SharedQueueHeader {
         header.producer_publication.store(0, Ordering::Release);
         header.consumer_reservation.store(0, Ordering::Release);
         header.consumer_release.store(0, Ordering::Release);
-        header.buffer_mask = (buffer_size_in_items - 1) as u32;
+        header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);
     }
