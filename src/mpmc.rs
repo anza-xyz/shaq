@@ -103,34 +103,6 @@ impl<T> Producer<T> {
         true
     }
 
-    /// Writes items into the queue or returns the iterator if there is not enough space.
-    ///
-    /// # Safety
-    /// - `items.len()` must exactly match the number of values yielded by `items`.
-    /// - Yielding fewer values will publish uninitialized memory.
-    /// - Yielding more values will drop unwritten items.
-    pub unsafe fn try_write_batch<I>(&self, items: I) -> Result<(), I>
-    where
-        I: ExactSizeIterator<Item = T>,
-    {
-        // SAFETY: if successful we write all items below
-        let mut guard = match unsafe { self.reserve_write_batch(items.len()) } {
-            Some(guard) => guard,
-            None => return Err(items),
-        };
-
-        let mut written = 0;
-        for (index, item) in items.enumerate() {
-            debug_assert!(index < guard.count);
-            // SAFETY: index is not out of bounds
-            unsafe { guard.write(index, item) };
-            written = index + 1;
-        }
-        debug_assert_eq!(written, guard.count);
-
-        Ok(())
-    }
-
     /// Reserves a slot for writing.
     /// The slot is committed when the guard is dropped.
     ///
@@ -247,19 +219,6 @@ impl<T> Consumer<T> {
     /// Returns `None` if there are no values available.
     pub fn try_read(&self) -> Option<T> {
         self.reserve_read().map(ReadGuard::read)
-    }
-
-    /// Attempts to read values from the queue.
-    /// Returns `None` if there are no values available.
-    pub fn try_read_batch(
-        &self,
-        max_count: usize,
-    ) -> Option<impl ExactSizeIterator<Item = T> + '_> {
-        self.reserve_read_batch(max_count).map(|batch| {
-            (0..batch.count).map(move |index|
-                // SAFETY: index is less than count
-                unsafe { batch.read(index) })
-        })
     }
 
     /// Attempts to reserve a value from the queue, returning a guard.
@@ -957,21 +916,6 @@ mod tests {
             assert_eq!(consumer.try_read(), Some(value));
         }
         assert_eq!(consumer.try_read(), None);
-    }
-
-    #[test]
-    fn test_try_write_batch_unsafe_returns_iterator_when_no_capacity() {
-        let small_size = minimum_file_size::<Item>(4);
-        let (_file, producer, _consumer) = create_test_queue::<Item>(small_size);
-
-        for i in 0..4 {
-            assert_eq!(producer.try_write(i as Item), Ok(()));
-        }
-
-        let err = unsafe { producer.try_write_batch(vec![100, 101].into_iter()) }
-            .expect_err("expected insufficient capacity");
-        let values: Vec<_> = err.collect();
-        assert_eq!(values, vec![100, 101]);
     }
 
     #[test]
