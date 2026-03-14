@@ -10,7 +10,8 @@ use std::{
     },
 };
 
-const MAGIC: u64 = 0x7368_6171_7370_7363; // b"shaqspsc"
+/// Unique identifier for SPSC queue in shared memory.
+const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for

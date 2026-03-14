@@ -9,7 +9,8 @@ use std::{
     sync::{atomic::AtomicU64, Arc},
 };
 
-const MAGIC: u64 = 0x7368_6171_6d70_6d63; // b"shaqmpmc"
+/// Unique identifier for MPMC queue in shared memory.
+const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
