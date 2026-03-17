@@ -23,4 +23,4 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 core_affinity = "0.8.3"
-ctrlc = "3.5.1"
+ctrlc = "3.5.2"
