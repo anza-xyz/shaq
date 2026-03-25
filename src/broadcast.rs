@@ -254,6 +254,37 @@ impl<T: Copy> Consumer<T> {
         Ok(Some(item))
     }
 
+    /// Attempts to read a value from the queue without copying it.
+    ///
+    /// The returned guard exposes references into shared memory. Producers may
+    /// overwrite that memory concurrently, so the caller must treat all access
+    /// through the guard as unsafe and call [`DirectRead::validate`] before
+    /// trusting any work derived from the referenced value.
+    ///
+    /// # Safety
+    /// Any references obtained from the returned guard may be invalidated by
+    /// concurrent producers before the caller validates the guard. The caller
+    /// must not trust data derived from those references unless
+    /// [`DirectRead::validate`] or [`DirectRead::commit`] succeeds afterwards.
+    pub unsafe fn try_read_direct(&mut self) -> Result<Option<DirectRead<'_, T>>, Overrun> {
+        let start = self.next;
+        let published = self.queue.published();
+        let available = published.wrapping_sub(start);
+        if available == 0 {
+            return Ok(None);
+        }
+        if available > self.queue.capacity() {
+            self.next = published.wrapping_sub(self.queue.capacity());
+            return Err(Overrun);
+        }
+
+        Ok(Some(DirectRead {
+            next: &mut self.next,
+            queue: &self.queue,
+            start,
+        }))
+    }
+
     /// Attempts to read up to `out.len()` values from the queue into `out`.
     ///
     /// On success this returns the initialized prefix of `out` as an immutable
@@ -285,6 +316,47 @@ impl<T: Copy> Consumer<T> {
 
         self.next = start.wrapping_add(count);
         Ok(&out[..count])
+    }
+
+    /// Attempts to read up to `max` values from the queue without copying them.
+    ///
+    /// The returned guard exposes references into shared memory. Producers may
+    /// overwrite that memory concurrently, so the caller must treat all access
+    /// through the guard as unsafe and call [`DirectReadBatch::validate`] before
+    /// trusting any work derived from the referenced values.
+    ///
+    /// # Safety
+    /// Any references obtained from the returned guard may be invalidated by
+    /// concurrent producers before the caller validates the guard. The caller
+    /// must not trust data derived from those references unless
+    /// [`DirectReadBatch::validate`] or [`DirectReadBatch::commit`] succeeds
+    /// afterwards.
+    pub unsafe fn try_read_direct_batch(
+        &mut self,
+        max: usize,
+    ) -> Result<Option<DirectReadBatch<'_, T>>, Overrun> {
+        if max == 0 {
+            return Ok(None);
+        }
+
+        let start = self.next;
+        let published = self.queue.published();
+        let available = published.wrapping_sub(start);
+        if available == 0 {
+            return Ok(None);
+        }
+        if available > self.queue.capacity() {
+            self.next = published.wrapping_sub(self.queue.capacity());
+            return Err(Overrun);
+        }
+
+        let count = available.min(max);
+        Ok(Some(DirectReadBatch {
+            next: &mut self.next,
+            queue: &self.queue,
+            start,
+            count,
+        }))
     }
 
     /// Copies the most recently published retained value.
@@ -455,6 +527,13 @@ impl<T: Copy> SharedQueue<T> {
         unsafe { self.buffer.add(cell_index).as_ptr().read() }
     }
 
+    #[inline]
+    fn ptr_at(&self, position: usize) -> *const T {
+        let cell_index = position & self.buffer_mask;
+        // SAFETY: Mask ensures index is in bounds.
+        unsafe { self.buffer.add(cell_index).as_ptr() }
+    }
+
     fn read_copy_batch(&self, start: usize, out: &mut [T]) {
         if out.is_empty() {
             return;
@@ -478,6 +557,19 @@ impl<T: Copy> SharedQueue<T> {
                 .as_ptr()
                 .copy_to_nonoverlapping(out.as_mut_ptr().add(first), out.len() - first);
         }
+    }
+
+    #[inline]
+    fn validate_window(&self, start: usize, count: usize) -> Result<(), Overrun> {
+        debug_assert!(count <= self.capacity());
+        let published = self.published();
+        if published.wrapping_sub(start) > self.capacity() {
+            return Err(Overrun);
+        }
+        if published.wrapping_sub(start.wrapping_add(count)) > self.capacity() {
+            return Err(Overrun);
+        }
+        Ok(())
     }
 
     /// Creates a new shared queue from a header pointer and region.
@@ -765,6 +857,89 @@ impl<'a, T: Copy> Drop for WriteBatch<'a, T> {
     }
 }
 
+#[must_use]
+pub struct DirectRead<'a, T: Copy> {
+    next: &'a mut usize,
+    queue: &'a SharedQueue<T>,
+    start: usize,
+}
+
+impl<'a, T: Copy> DirectRead<'a, T> {
+    pub fn as_ptr(&self) -> *const T {
+        self.queue.ptr_at(self.start)
+    }
+
+    /// Returns a shared reference into the broadcast ring.
+    ///
+    /// # Safety
+    /// The returned reference points into shared memory that may be overwritten
+    /// by producers at any time. The caller must validate the guard after using
+    /// the reference and discard any derived results if validation fails.
+    pub unsafe fn as_ref(&self) -> &T {
+        // SAFETY: caller upholds the shared-memory lifetime requirements.
+        unsafe { &*self.as_ptr() }
+    }
+
+    pub fn validate(&self) -> Result<(), Overrun> {
+        self.queue.validate_window(self.start, 1)
+    }
+
+    pub fn commit(self) -> Result<(), Overrun> {
+        self.validate()?;
+        *self.next = self.start.wrapping_add(1);
+        Ok(())
+    }
+}
+
+#[must_use]
+pub struct DirectReadBatch<'a, T: Copy> {
+    next: &'a mut usize,
+    queue: &'a SharedQueue<T>,
+    start: usize,
+    count: usize,
+}
+
+impl<'a, T: Copy> DirectReadBatch<'a, T> {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Returns a shared reference into the broadcast ring.
+    ///
+    /// # Safety
+    /// The returned reference points into shared memory that may be overwritten
+    /// by producers at any time. The caller must validate the guard after using
+    /// the reference and discard any derived results if validation fails.
+    /// `index` must be less than [`Self::len`].
+    pub unsafe fn as_ref(&self, index: usize) -> &T {
+        // SAFETY: caller upholds the shared-memory lifetime requirements.
+        unsafe { &*self.as_ptr(index) }
+    }
+
+    /// Returns a pointer into the broadcast ring.
+    ///
+    /// # Safety
+    /// `index` must be less than [`Self::len`].
+    pub unsafe fn as_ptr(&self, index: usize) -> *const T {
+        debug_assert!(index < self.count);
+        self.queue.ptr_at(self.start.wrapping_add(index))
+    }
+
+    pub fn validate(&self) -> Result<(), Overrun> {
+        self.queue.validate_window(self.start, self.count)
+    }
+
+    pub fn commit(self) -> Result<(), Overrun> {
+        self.validate()?;
+        *self.next = self.start.wrapping_add(self.count);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1085,61 @@ mod tests {
 
         assert_eq!(consumer.try_read_latest(), Ok(Some(4)));
         assert_eq!(consumer.try_read(), Ok(None));
+    }
+
+    #[test]
+    fn test_try_read_direct_reads_without_copy() {
+        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        producer.try_write(42);
+
+        let direct = unsafe { consumer.try_read_direct() }.unwrap().unwrap();
+        unsafe {
+            assert_eq!(*direct.as_ref(), 42);
+        }
+        assert_eq!(direct.validate(), Ok(()));
+        assert_eq!(direct.commit(), Ok(()));
+        assert_eq!(consumer.try_read(), Ok(None));
+    }
+
+    #[test]
+    fn test_try_read_direct_batch_reads_without_copy() {
+        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        for i in 0..4 {
+            producer.try_write(i);
+        }
+
+        let direct = unsafe { consumer.try_read_direct_batch(8) }
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.len(), 4);
+        for index in 0..direct.len() {
+            unsafe {
+                assert_eq!(*direct.as_ref(index), index as u64);
+            }
+        }
+        assert_eq!(direct.validate(), Ok(()));
+        assert_eq!(direct.commit(), Ok(()));
+        assert_eq!(consumer.try_read(), Ok(None));
+    }
+
+    #[test]
+    fn test_try_read_direct_detects_overrun_after_access() {
+        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        producer.try_write(1);
+        let direct = unsafe { consumer.try_read_direct() }.unwrap().unwrap();
+        unsafe {
+            let _ = *direct.as_ref();
+        }
+
+        for i in 0..BUFFER_CAPACITY as u64 {
+            producer.try_write(10 + i);
+        }
+
+        assert_eq!(direct.validate(), Err(Overrun));
+        assert_eq!(direct.commit(), Err(Overrun));
     }
 
     #[test]

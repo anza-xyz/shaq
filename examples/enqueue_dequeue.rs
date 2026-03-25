@@ -475,12 +475,28 @@ fn run_broadcast_consumer(
     exit: Arc<AtomicBool>,
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
-    let mut batch = [Item { data: [0; 512] }; SYNC_CADENCE];
-    run_consumer_loop(exit, move || match consumer.try_read_batch(&mut batch) {
-        Ok(_read) => {}
-        Err(Overrun) => {
-            consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
-            consumer.sync_to_oldest();
+    run_consumer_loop(exit, move || {
+        // SAFETY: This benchmark intentionally uses the zero-copy broadcast API
+        // and validates before committing the local cursor advance.
+        match unsafe { consumer.try_read_direct_batch(SYNC_CADENCE) } {
+            Ok(Some(batch)) => {
+                for index in 0..batch.len() {
+                    // SAFETY: The benchmark only touches the item before
+                    // validating and committing the batch.
+                    unsafe {
+                        let _ = batch.as_ref(index).data[0];
+                    }
+                }
+                if batch.commit().is_err() {
+                    consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+                    consumer.sync_to_oldest();
+                }
+            }
+            Ok(None) => {}
+            Err(Overrun) => {
+                consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+                consumer.sync_to_oldest();
+            }
         }
     });
 }
