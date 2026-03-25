@@ -3,8 +3,8 @@
 //! This queue mirrors the producer-side reservation/publication flow of the
 //! MPMC queue, but consumers do not reserve shared slots. Instead each
 //! consumer tracks its own local cursor and copies values out of the ring.
-//! Reads fail with [`Overrun`] if the consumer falls behind and producers wrap
-//! around the ring before the copied values can be validated.
+//! Reads fail with a skipped-item count if the consumer falls behind and
+//! producers wrap around the ring before the copied values can be validated.
 
 use crate::{
     error::Error, normalized_capacity, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION,
@@ -17,17 +17,6 @@ use std::{
 
 /// Unique identifier for broadcast queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Overrun;
-
-impl std::fmt::Display for Overrun {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("consumer overrun")
-    }
-}
-
-impl std::error::Error for Overrun {}
 
 pub struct Producer<T: Copy> {
     queue: SharedQueue<T>,
@@ -215,7 +204,7 @@ impl<T: Copy> Consumer<T> {
 
     /// Repositions the consumer to the oldest item still retained in the ring.
     ///
-    /// This is useful after [`Overrun`] when the consumer wants to resume
+    /// This is useful after an overrun when the consumer wants to resume
     /// ordered reads from the earliest value that has not yet been overwritten.
     pub fn sync_to_oldest(&mut self) {
         self.next = self.queue.oldest_available();
@@ -231,7 +220,7 @@ impl<T: Copy> Consumer<T> {
 
     /// Attempts to read a value from the queue.
     /// Returns `Ok(None)` if there are no values available.
-    pub fn try_read(&mut self) -> Result<Option<T>, Overrun> {
+    pub fn try_read(&mut self) -> Result<Option<T>, usize> {
         let start = self.next;
         let published = self.queue.published();
         let available = published.wrapping_sub(start);
@@ -239,15 +228,17 @@ impl<T: Copy> Consumer<T> {
             return Ok(None);
         }
         if available > self.queue.capacity() {
+            let overrun = self.queue.overrun(start, published);
             self.next = published.wrapping_sub(self.queue.capacity());
-            return Err(Overrun);
+            return Err(overrun);
         }
 
         let item = self.queue.read_copy(start);
         let published_after = self.queue.published();
         if published_after.wrapping_sub(start) > self.queue.capacity() {
+            let overrun = self.queue.overrun(start, published_after);
             self.next = published_after.wrapping_sub(self.queue.capacity());
-            return Err(Overrun);
+            return Err(overrun);
         }
 
         self.next = start.wrapping_add(1);
@@ -266,7 +257,7 @@ impl<T: Copy> Consumer<T> {
     /// concurrent producers before the caller validates the guard. The caller
     /// must not trust data derived from those references unless
     /// [`DirectRead::validate`] or [`DirectRead::commit`] succeeds afterwards.
-    pub unsafe fn try_read_direct(&mut self) -> Result<Option<DirectRead<'_, T>>, Overrun> {
+    pub unsafe fn try_read_direct(&mut self) -> Result<Option<DirectRead<'_, T>>, usize> {
         let start = self.next;
         let published = self.queue.published();
         let available = published.wrapping_sub(start);
@@ -274,8 +265,9 @@ impl<T: Copy> Consumer<T> {
             return Ok(None);
         }
         if available > self.queue.capacity() {
+            let overrun = self.queue.overrun(start, published);
             self.next = published.wrapping_sub(self.queue.capacity());
-            return Err(Overrun);
+            return Err(overrun);
         }
 
         Ok(Some(DirectRead {
@@ -288,9 +280,9 @@ impl<T: Copy> Consumer<T> {
     /// Attempts to read up to `out.len()` values from the queue into `out`.
     ///
     /// On success this returns the initialized prefix of `out` as an immutable
-    /// slice. On [`Overrun`] the caller must treat the contents of `out[..]`
+    /// slice. On overrun the caller must treat the contents of `out[..]`
     /// as invalid.
-    pub fn try_read_batch<'a>(&mut self, out: &'a mut [T]) -> Result<&'a [T], Overrun> {
+    pub fn try_read_batch<'a>(&mut self, out: &'a mut [T]) -> Result<&'a [T], usize> {
         if out.is_empty() {
             return Ok(&out[..0]);
         }
@@ -302,16 +294,18 @@ impl<T: Copy> Consumer<T> {
             return Ok(&out[..0]);
         }
         if available > self.queue.capacity() {
+            let overrun = self.queue.overrun(start, published);
             self.next = published.wrapping_sub(self.queue.capacity());
-            return Err(Overrun);
+            return Err(overrun);
         }
 
         let count = available.min(out.len());
         self.queue.read_copy_batch(start, &mut out[..count]);
         let published_after = self.queue.published();
         if published_after.wrapping_sub(start) > self.queue.capacity() {
+            let overrun = self.queue.overrun(start, published_after);
             self.next = published_after.wrapping_sub(self.queue.capacity());
-            return Err(Overrun);
+            return Err(overrun);
         }
 
         self.next = start.wrapping_add(count);
@@ -334,7 +328,7 @@ impl<T: Copy> Consumer<T> {
     pub unsafe fn try_read_direct_batch(
         &mut self,
         max: usize,
-    ) -> Result<Option<DirectReadBatch<'_, T>>, Overrun> {
+    ) -> Result<Option<DirectReadBatch<'_, T>>, usize> {
         if max == 0 {
             return Ok(None);
         }
@@ -346,8 +340,9 @@ impl<T: Copy> Consumer<T> {
             return Ok(None);
         }
         if available > self.queue.capacity() {
+            let overrun = self.queue.overrun(start, published);
             self.next = published.wrapping_sub(self.queue.capacity());
-            return Err(Overrun);
+            return Err(overrun);
         }
 
         let count = available.min(max);
@@ -360,7 +355,7 @@ impl<T: Copy> Consumer<T> {
     }
 
     /// Copies the most recently published retained value.
-    pub fn try_read_latest(&mut self) -> Result<Option<T>, Overrun> {
+    pub fn try_read_latest(&mut self) -> Result<Option<T>, usize> {
         let published = self.queue.published();
         let oldest = self.queue.oldest_available();
         let retained = published.wrapping_sub(oldest);
@@ -374,7 +369,7 @@ impl<T: Copy> Consumer<T> {
         let published_after = self.queue.published();
         if published_after.wrapping_sub(start) > self.queue.capacity() {
             self.next = published_after;
-            return Err(Overrun);
+            return Err(self.queue.overrun(start, published_after));
         }
 
         self.next = published;
@@ -386,7 +381,7 @@ impl<T: Copy> Consumer<T> {
     /// Values are copied into `out[..count]` in publication order. The consumer
     /// cursor is advanced to the current publication cursor, so subsequent
     /// ordered reads only observe newer values.
-    pub fn try_read_latest_batch<'a>(&mut self, out: &'a mut [T]) -> Result<&'a [T], Overrun> {
+    pub fn try_read_latest_batch<'a>(&mut self, out: &'a mut [T]) -> Result<&'a [T], usize> {
         if out.is_empty() {
             return Ok(&out[..0]);
         }
@@ -405,7 +400,7 @@ impl<T: Copy> Consumer<T> {
         let published_after = self.queue.published();
         if published_after.wrapping_sub(start) > self.queue.capacity() {
             self.next = published_after;
-            return Err(Overrun);
+            return Err(self.queue.overrun(start, published_after));
         }
 
         self.next = published;
@@ -413,7 +408,7 @@ impl<T: Copy> Consumer<T> {
     }
 
     /// Backward-compatible alias for ordered batched reads.
-    pub fn try_read_slice<'a>(&mut self, out: &'a mut [T]) -> Result<&'a [T], Overrun> {
+    pub fn try_read_slice<'a>(&mut self, out: &'a mut [T]) -> Result<&'a [T], usize> {
         self.try_read_batch(out)
     }
 }
@@ -460,6 +455,11 @@ impl<T: Copy> Clone for SharedQueue<T> {
 }
 
 impl<T: Copy> SharedQueue<T> {
+    #[inline]
+    fn overrun(&self, start: usize, published: usize) -> usize {
+        published.wrapping_sub(start).wrapping_sub(self.capacity())
+    }
+
     #[inline]
     fn capacity(&self) -> usize {
         self.buffer_mask.wrapping_add(1)
@@ -560,14 +560,14 @@ impl<T: Copy> SharedQueue<T> {
     }
 
     #[inline]
-    fn validate_window(&self, start: usize, count: usize) -> Result<(), Overrun> {
+    fn validate_window(&self, start: usize, count: usize) -> Result<(), usize> {
         debug_assert!(count <= self.capacity());
         let published = self.published();
         if published.wrapping_sub(start) > self.capacity() {
-            return Err(Overrun);
+            return Err(self.overrun(start, published));
         }
         if published.wrapping_sub(start.wrapping_add(count)) > self.capacity() {
-            return Err(Overrun);
+            return Err(self.overrun(start, published));
         }
         Ok(())
     }
@@ -880,11 +880,11 @@ impl<'a, T: Copy> DirectRead<'a, T> {
         unsafe { &*self.as_ptr() }
     }
 
-    pub fn validate(&self) -> Result<(), Overrun> {
+    pub fn validate(&self) -> Result<(), usize> {
         self.queue.validate_window(self.start, 1)
     }
 
-    pub fn commit(self) -> Result<(), Overrun> {
+    pub fn commit(self) -> Result<(), usize> {
         self.validate()?;
         *self.next = self.start.wrapping_add(1);
         Ok(())
@@ -929,11 +929,11 @@ impl<'a, T: Copy> DirectReadBatch<'a, T> {
         self.queue.ptr_at(self.start.wrapping_add(index))
     }
 
-    pub fn validate(&self) -> Result<(), Overrun> {
+    pub fn validate(&self) -> Result<(), usize> {
         self.queue.validate_window(self.start, self.count)
     }
 
-    pub fn commit(self) -> Result<(), Overrun> {
+    pub fn commit(self) -> Result<(), usize> {
         self.validate()?;
         *self.next = self.start.wrapping_add(self.count);
         Ok(())
@@ -1032,7 +1032,7 @@ mod tests {
             producer.try_write(i);
         }
 
-        assert_eq!(consumer.try_read(), Err(Overrun));
+        assert_eq!(consumer.try_read(), Err(2));
         for expected in 2..(BUFFER_CAPACITY as u64 + 2) {
             assert_eq!(consumer.try_read(), Ok(Some(expected)));
         }
@@ -1138,8 +1138,8 @@ mod tests {
             producer.try_write(10 + i);
         }
 
-        assert_eq!(direct.validate(), Err(Overrun));
-        assert_eq!(direct.commit(), Err(Overrun));
+        assert_eq!(direct.validate(), Err(1));
+        assert_eq!(direct.commit(), Err(1));
     }
 
     #[test]

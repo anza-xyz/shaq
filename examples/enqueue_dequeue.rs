@@ -6,7 +6,7 @@ use common::{
     run_total_throughput_loop, setup_exit_handler, Item, SYNC_CADENCE,
 };
 use shaq::{
-    broadcast::{Consumer as BroadcastConsumer, Overrun, Producer as BroadcastProducer},
+    broadcast::{Consumer as BroadcastConsumer, Producer as BroadcastProducer},
     mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
     spsc::{Consumer as SpscConsumer, Producer as SpscProducer},
 };
@@ -493,7 +493,7 @@ fn run_broadcast_consumer(
                 }
             }
             Ok(None) => {}
-            Err(Overrun) => {
+            Err(_skipped) => {
                 consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                 consumer.sync_to_oldest();
             }
