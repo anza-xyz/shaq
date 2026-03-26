@@ -276,6 +276,21 @@ pub const fn minimum_file_size<T>(capacity: usize) -> usize {
     buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
+/// Calculates the minimum region size required for a queue with given capacity.
+pub const fn minimum_region_size<T>(capacity: usize) -> usize {
+    minimum_file_size::<T>(capacity)
+}
+
+/// Creates a new in-process MPMC queue pair backed by a heap allocation.
+pub fn pair<T>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
+    let region_size = minimum_region_size::<T>(capacity);
+    let region = Region::alloc(region_size)?;
+    let header = SharedQueueHeader::create_in_region::<T>(&region)?;
+    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
+    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    Ok((producer, consumer))
+}
+
 struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
@@ -1049,5 +1064,48 @@ mod tests {
 
         producer2.try_write(42).unwrap();
         assert_eq!(consumer.try_read(), Some(42));
+    }
+
+    #[test]
+    fn test_pair_creates_in_process_queue() {
+        let (producer, consumer) = pair::<u64>(64).expect("pair failed");
+
+        for value in [10, 20, 30, 40] {
+            producer.try_write(value).expect("write failed");
+        }
+
+        for value in [10, 20, 30, 40] {
+            assert_eq!(consumer.try_read(), Some(value));
+        }
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_pair_clone_roles() {
+        let (producer, consumer) = pair::<u64>(64).expect("pair failed");
+        let producer2 = producer.clone();
+        let consumer2 = consumer.clone();
+
+        producer.try_write(1).expect("write failed");
+        producer2.try_write(2).expect("write failed");
+
+        let mut values = Vec::new();
+        loop {
+            let mut progressed = false;
+            if let Some(value) = consumer.try_read() {
+                values.push(value);
+                progressed = true;
+            }
+            if let Some(value) = consumer2.try_read() {
+                values.push(value);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
     }
 }
