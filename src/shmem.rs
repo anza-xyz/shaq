@@ -20,6 +20,24 @@ impl Region {
         }))
     }
 
+    pub(crate) fn alloc(size: usize) -> Result<Arc<Self>, Error> {
+        let layout = std::alloc::Layout::from_size_align(size, MINIMUM_REGION_ALIGNMENT)
+            .map_err(|_| Error::InvalidBufferSize)?;
+        let addr = {
+            // SAFETY: layout is valid and non-zero.
+            let addr = unsafe { std::alloc::alloc_zeroed(layout) };
+            NonNull::new(addr).ok_or(Error::Allocation(layout))?
+        };
+
+        assert_eq!(addr.as_ptr().align_offset(MINIMUM_REGION_ALIGNMENT), 0);
+
+        Ok(Arc::new(Self {
+            addr,
+            size,
+            backing: RegionBacking::Heap(layout),
+        }))
+    }
+
     pub(crate) fn addr(&self) -> NonNull<u8> {
         self.addr
     }
@@ -36,12 +54,17 @@ impl Drop for Region {
                 // SAFETY: addr and size were produced by a successful map_file call.
                 unsafe { unmap_file(self.addr, self.size) };
             }
+            RegionBacking::Heap(layout) => {
+                // SAFETY: addr was allocated with this exact layout in `alloc`.
+                unsafe { std::alloc::dealloc(self.addr.as_ptr(), layout) };
+            }
         }
     }
 }
 
 enum RegionBacking {
     MappedFile,
+    Heap(std::alloc::Layout),
 }
 
 // SAFETY: The mapped memory is shared (MAP_SHARED / file-backed) and access
@@ -60,6 +83,13 @@ fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
 
     Ok(())
 }
+
+#[cfg(not(test))]
+#[allow(dead_code)]
+const _: () = {
+    let _ = Region::alloc;
+    let _ = RegionBacking::Heap;
+};
 
 /// Maps a file into memory.
 #[cfg(unix)]
@@ -203,5 +233,31 @@ mod tests {
                 .align_offset(MINIMUM_REGION_ALIGNMENT),
             0
         );
+    }
+
+    #[test]
+    fn test_alloc_region_is_4096_aligned() {
+        let region = Region::alloc(MINIMUM_REGION_ALIGNMENT * 2).expect("allocation failed");
+        assert_eq!(
+            region
+                .addr()
+                .as_ptr()
+                .align_offset(MINIMUM_REGION_ALIGNMENT),
+            0
+        );
+        assert_eq!(region.size(), MINIMUM_REGION_ALIGNMENT * 2);
+    }
+
+    #[test]
+    fn test_alloc_region_accepts_non_4096_multiple() {
+        let region = Region::alloc(MINIMUM_REGION_ALIGNMENT + 1).expect("allocation failed");
+        assert_eq!(
+            region
+                .addr()
+                .as_ptr()
+                .align_offset(MINIMUM_REGION_ALIGNMENT),
+            0
+        );
+        assert_eq!(region.size(), MINIMUM_REGION_ALIGNMENT + 1);
     }
 }
