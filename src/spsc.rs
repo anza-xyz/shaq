@@ -19,6 +19,21 @@ pub const fn minimum_file_size<T>(capacity: usize) -> usize {
     buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
+/// Calculates the minimum region size required for a queue with given capacity.
+pub const fn minimum_region_size<T>(capacity: usize) -> usize {
+    minimum_file_size::<T>(capacity)
+}
+
+/// Creates a new in-process SPSC queue pair backed by a heap allocation.
+pub fn pair<T>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
+    let region_size = minimum_region_size::<T>(capacity);
+    let region = Region::alloc(region_size)?;
+    let header = SharedQueueHeader::create_in_region::<T>(&region)?;
+    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
+    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    Ok((producer, consumer))
+}
+
 /// Producer side of the SPSC shared queue.
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -642,5 +657,34 @@ mod tests {
             .expect("create failed");
 
         assert_eq!(producer.capacity(), 4);
+    }
+
+    #[test]
+    fn test_pair_creates_in_process_queue() {
+        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+
+        assert_eq!(producer.capacity(), 64);
+        assert_eq!(consumer.capacity(), 64);
+
+        producer.try_write(123).unwrap();
+        producer.commit();
+        consumer.sync();
+        let val = consumer.try_read().expect("read failed");
+        assert_eq!(*val, 123);
+        consumer.finalize();
+    }
+
+    #[test]
+    fn test_pair_join_as_other_role() {
+        let (mut producer, consumer) = pair::<u64>(64).expect("pair failed");
+        drop(consumer);
+        let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
+
+        producer.try_write(55).unwrap();
+        producer.commit();
+        consumer.sync();
+        let val = consumer.try_read().expect("read failed");
+        assert_eq!(*val, 55);
+        consumer.finalize();
     }
 }

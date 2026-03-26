@@ -84,13 +84,6 @@ fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(not(test))]
-#[allow(dead_code)]
-const _: () = {
-    let _ = Region::alloc;
-    let _ = RegionBacking::Heap;
-};
-
 /// Maps a file into memory.
 #[cfg(unix)]
 fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
