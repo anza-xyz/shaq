@@ -3,18 +3,20 @@ use std::{fs::File, ptr::NonNull, sync::Arc};
 
 pub(crate) const MINIMUM_REGION_ALIGNMENT: usize = 4096;
 
-pub(crate) struct MappedRegion {
+pub(crate) struct Region {
     addr: NonNull<u8>,
-    file_size: usize,
+    size: usize,
+    backing: RegionBacking,
 }
 
-impl MappedRegion {
-    pub(crate) fn new(file: &File, size: usize) -> Result<Arc<Self>, Error> {
+impl Region {
+    pub(crate) fn map_file(file: &File, size: usize) -> Result<Arc<Self>, Error> {
         let addr = map_file(file, size)?;
         validate_region_alignment(addr)?;
         Ok(Arc::new(Self {
             addr,
-            file_size: size,
+            size,
+            backing: RegionBacking::MappedFile,
         }))
     }
 
@@ -22,22 +24,30 @@ impl MappedRegion {
         self.addr
     }
 
-    pub(crate) fn file_size(&self) -> usize {
-        self.file_size
+    pub(crate) fn size(&self) -> usize {
+        self.size
     }
 }
 
-impl Drop for MappedRegion {
+impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: addr and file_size were produced by a successful map_file call.
-        unsafe { unmap_file(self.addr, self.file_size) };
+        match self.backing {
+            RegionBacking::MappedFile => {
+                // SAFETY: addr and size were produced by a successful map_file call.
+                unsafe { unmap_file(self.addr, self.size) };
+            }
+        }
     }
+}
+
+enum RegionBacking {
+    MappedFile,
 }
 
 // SAFETY: The mapped memory is shared (MAP_SHARED / file-backed) and access
 // is synchronized by the queue protocol built on top of it.
-unsafe impl Send for MappedRegion {}
-unsafe impl Sync for MappedRegion {}
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
 
 fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
     let actual = addr.as_ptr().align_offset(MINIMUM_REGION_ALIGNMENT);
@@ -180,12 +190,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mapped_region_is_minimum_region_aligned() {
+    fn test_region_is_minimum_region_aligned() {
         let file = create_temp_shmem_file().expect("temp file");
         file.set_len(MINIMUM_REGION_ALIGNMENT as u64)
             .expect("set len");
 
-        let region = MappedRegion::new(&file, MINIMUM_REGION_ALIGNMENT).expect("map file");
+        let region = Region::map_file(&file, MINIMUM_REGION_ALIGNMENT).expect("map file");
         assert_eq!(
             region
                 .addr()

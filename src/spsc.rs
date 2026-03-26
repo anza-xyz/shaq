@@ -1,6 +1,4 @@
-use crate::{
-    error::Error, normalized_capacity, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION,
-};
+use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
 use core::ptr::NonNull;
 use std::{
     fs::File,
@@ -71,7 +69,7 @@ impl<T: Sized> Producer<T> {
     /// - `header` must be non-null and properly aligned.
     /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -200,7 +198,7 @@ impl<T: Sized> Consumer<T> {
     /// - `header` must be non-null and properly aligned.
     /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -283,7 +281,7 @@ struct SharedQueue<T: Sized> {
 
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
-    region: Arc<MappedRegion>,
+    region: Arc<Region>,
 }
 
 impl<T: Sized> SharedQueue<T> {
@@ -293,14 +291,14 @@ impl<T: Sized> SharedQueue<T> {
     /// - `header` must be non-null and properly aligned.
     /// - `region` must back the allocation at `header`.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         // SAFETY: `header` is non-null and aligned properly.
         let size = unsafe { (header.as_ref().buffer_mask as usize).wrapping_add(1) };
 
         if !size.is_power_of_two()
-            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.file_size())? != size
+            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.size())? != size
         {
             return Err(Error::InvalidBufferSize);
         }
@@ -387,21 +385,23 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T: Sized>(
-        file: &File,
-        size: usize,
-    ) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn create<T: Sized>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
-        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
-        let region = MappedRegion::new(file, size)?;
+        let region = Region::map_file(file, size)?;
+        let header = Self::create_in_region::<T>(&region)?;
+        Ok((region, header))
+    }
+
+    fn create_in_region<T: Sized>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
+        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
         let header = region.addr().cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
         //         alignment of `SharedQueueHeader`.
         unsafe { Self::initialize(header, buffer_size_in_items) };
-        Ok((region, header))
+        Ok(header)
     }
 
     const fn buffer_offset<T: Sized>() -> usize {
@@ -466,9 +466,14 @@ impl SharedQueueHeader {
         header.magic.store(MAGIC, Ordering::Release);
     }
 
-    fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn join<T: Sized>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
-        let region = MappedRegion::new(file, file_size)?;
+        let region = Region::map_file(file, file_size)?;
+        let header = Self::join_region::<T>(&region)?;
+        Ok((region, header))
+    }
+
+    fn join_region<T: Sized>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let header = region.addr().cast::<Self>();
         {
             // SAFETY: The header is non-null and aligned properly.
@@ -486,13 +491,13 @@ impl SharedQueueHeader {
                 });
             }
             if (header.buffer_mask as usize).wrapping_add(1)
-                != Self::calculate_buffer_size_in_items::<T>(file_size)?
+                != Self::calculate_buffer_size_in_items::<T>(region.size())?
             {
                 return Err(Error::InvalidBufferSize);
             }
         }
 
-        Ok((region, header))
+        Ok(header)
     }
 }
 
