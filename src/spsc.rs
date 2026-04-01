@@ -405,6 +405,13 @@ impl SharedQueueHeader {
     }
 
     const fn buffer_offset<T: Sized>() -> usize {
+        const {
+            assert!(
+                core::mem::align_of::<T>() <= crate::shmem::MINIMUM_REGION_ALIGNMENT,
+                "types with alignment > MINIMUM_REGION_ALIGNMENT are not supported"
+            )
+        }
+
         (core::mem::size_of::<Self>() + core::mem::align_of::<T>() - 1)
             & !(core::mem::align_of::<T>() - 1)
     }

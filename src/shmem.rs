@@ -1,6 +1,8 @@
 use crate::error::Error;
 use std::{fs::File, ptr::NonNull, sync::Arc};
 
+pub(crate) const MINIMUM_REGION_ALIGNMENT: usize = 4096;
+
 pub(crate) struct MappedRegion {
     addr: NonNull<u8>,
     file_size: usize,
