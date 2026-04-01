@@ -11,6 +11,7 @@ pub(crate) struct MappedRegion {
 impl MappedRegion {
     pub(crate) fn new(file: &File, size: usize) -> Result<Arc<Self>, Error> {
         let addr = map_file(file, size)?;
+        validate_region_alignment(addr)?;
         Ok(Arc::new(Self {
             addr,
             file_size: size,
@@ -37,6 +38,18 @@ impl Drop for MappedRegion {
 // is synchronized by the queue protocol built on top of it.
 unsafe impl Send for MappedRegion {}
 unsafe impl Sync for MappedRegion {}
+
+fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
+    let actual = addr.as_ptr().align_offset(MINIMUM_REGION_ALIGNMENT);
+    if actual != 0 {
+        return Err(Error::InvalidRegionAlignment {
+            minimum: MINIMUM_REGION_ALIGNMENT,
+            actual,
+        });
+    }
+
+    Ok(())
+}
 
 /// Maps a file into memory.
 #[cfg(unix)]
@@ -159,5 +172,26 @@ pub(crate) fn create_temp_shmem_file() -> Result<File, Error> {
             Ok(file)
         }
         Err(err) => Err(Error::Io(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mapped_region_is_minimum_region_aligned() {
+        let file = create_temp_shmem_file().expect("temp file");
+        file.set_len(MINIMUM_REGION_ALIGNMENT as u64)
+            .expect("set len");
+
+        let region = MappedRegion::new(&file, MINIMUM_REGION_ALIGNMENT).expect("map file");
+        assert_eq!(
+            region
+                .addr()
+                .as_ptr()
+                .align_offset(MINIMUM_REGION_ALIGNMENT),
+            0
+        );
     }
 }
