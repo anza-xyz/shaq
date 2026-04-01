@@ -1,8 +1,6 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{
-    error::Error, normalized_capacity, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION,
-};
+use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
 use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
@@ -58,7 +56,7 @@ impl<T> Producer<T> {
     /// - `header` must be non-null and properly aligned.
     /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -205,7 +203,7 @@ impl<T> Consumer<T> {
     /// - `header` must be non-null and properly aligned.
     /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -278,6 +276,28 @@ pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
     buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
+/// Calculates the minimum region size required for a queue with given capacity.
+pub const fn minimum_region_size<T: Sized>(capacity: usize) -> usize {
+    minimum_file_size::<T>(capacity)
+}
+
+/// Creates a new in-process MPMC queue pair backed by a heap allocation.
+///
+/// # Safety
+/// - The queue does not validate `T`.
+/// - If a thread may read, dereference, mutate, or drop a queued value, that
+///   operation must be valid for that value in that thread.
+/// - Values left buffered when the queue is dropped may be leaked instead of
+///   having their destructors run.
+pub unsafe fn pair<T>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
+    let region_size = minimum_region_size::<T>(capacity);
+    let region = Region::alloc(region_size)?;
+    let header = SharedQueueHeader::create_in_region::<T>(&region)?;
+    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
+    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    Ok((producer, consumer))
+}
+
 struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
@@ -285,7 +305,7 @@ struct SharedQueue<T> {
 
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
-    region: Arc<MappedRegion>,
+    region: Arc<Region>,
 }
 
 impl<T> Clone for SharedQueue<T> {
@@ -402,7 +422,7 @@ impl<T> SharedQueue<T> {
     /// - `region` must back the allocation at `header`.
     /// - `header` must be non-null and properly aligned.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         let header_ref = unsafe { header.as_ref() };
@@ -410,7 +430,7 @@ impl<T> SharedQueue<T> {
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
         if !buffer_size_in_items.is_power_of_two()
             || buffer_size_in_items == 0
-            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.file_size())?
+            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.size())?
                 != buffer_size_in_items
         {
             return Err(Error::InvalidBufferSize);
@@ -477,21 +497,23 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T: Sized>(
-        file: &File,
-        size: usize,
-    ) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn create<T: Sized>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
-        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
-        let region = MappedRegion::new(file, size)?;
+        let region = Region::map_file(file, size)?;
+        let header = Self::create_in_region::<T>(&region)?;
+        Ok((region, header))
+    }
+
+    fn create_in_region<T: Sized>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
+        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
         let header = region.addr().cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
         //         alignment of `SharedQueueHeader`.
         unsafe { Self::initialize(header, buffer_size_in_items) };
-        Ok((region, header))
+        Ok(header)
     }
 
     const fn buffer_offset<T: Sized>() -> usize {
@@ -557,9 +579,14 @@ impl SharedQueueHeader {
         header.magic.store(MAGIC, Ordering::Release);
     }
 
-    fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn join<T: Sized>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
-        let region = MappedRegion::new(file, file_size)?;
+        let region = Region::map_file(file, file_size)?;
+        let header = Self::join_region::<T>(&region)?;
+        Ok((region, header))
+    }
+
+    fn join_region<T: Sized>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let header = region.addr().cast::<Self>();
         {
             // SAFETY: The header is non-null and aligned properly.
@@ -577,12 +604,12 @@ impl SharedQueueHeader {
                 });
             }
             let buffer_size_in_items = (header.buffer_mask as usize).wrapping_add(1);
-            if buffer_size_in_items != Self::calculate_buffer_size_in_items::<T>(file_size)? {
+            if buffer_size_in_items != Self::calculate_buffer_size_in_items::<T>(region.size())? {
                 return Err(Error::InvalidBufferSize);
             }
         }
 
-        Ok((region, header))
+        Ok(header)
     }
 
     /// # Safety
@@ -1044,5 +1071,48 @@ mod tests {
 
         producer2.try_write(42).unwrap();
         assert_eq!(consumer.try_read(), Some(42));
+    }
+
+    #[test]
+    fn test_pair_creates_in_process_queue() {
+        let (producer, consumer) = unsafe { pair::<u64>(64) }.expect("pair failed");
+
+        for value in [10, 20, 30, 40] {
+            producer.try_write(value).expect("write failed");
+        }
+
+        for value in [10, 20, 30, 40] {
+            assert_eq!(consumer.try_read(), Some(value));
+        }
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_pair_clone_roles() {
+        let (producer, consumer) = unsafe { pair::<u64>(64) }.expect("pair failed");
+        let producer2 = producer.clone();
+        let consumer2 = consumer.clone();
+
+        producer.try_write(1).expect("write failed");
+        producer2.try_write(2).expect("write failed");
+
+        let mut values = Vec::new();
+        loop {
+            let mut progressed = false;
+            if let Some(value) = consumer.try_read() {
+                values.push(value);
+                progressed = true;
+            }
+            if let Some(value) = consumer2.try_read() {
+                values.push(value);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
     }
 }
