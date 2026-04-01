@@ -5,6 +5,7 @@ pub enum Error {
     InvalidMagic,
     InvalidVersion { expected: u32, actual: u32 },
     InvalidBufferSize,
+    InvalidRegionAlignment { minimum: usize, actual: usize },
     Io(std::io::Error),
     Mmap(std::io::Error),
 }
@@ -24,6 +25,10 @@ impl Display for Error {
                 actual & 0xFFFF,
             ),
             Self::InvalidBufferSize => write!(f, "invalid buffer size"),
+            Self::InvalidRegionAlignment { minimum, actual } => write!(
+                f,
+                "invalid region alignment; minimum={minimum}; actual={actual}"
+            ),
             Self::Io(err) => write!(f, "io; err={err}"),
             Self::Mmap(err) => write!(f, "mmap; err={err}"),
         }
