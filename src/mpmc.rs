@@ -174,9 +174,9 @@ impl<T> Consumer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this file is uniquely created as a
-        // consumer, so initializing the queue header for this mapping happens
-        // exactly once.
+        // SAFETY: caller guarantees this file is uniquely created as a consumer,
+        // meaning no prior `create` call has mapped this file, so the queue
+        // header for this mapping is initialized exactly once.
         let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -522,9 +522,7 @@ impl SharedQueueHeader {
     /// Initializes a shared queue header in `region`.
     ///
     /// # Safety
-    /// - `region` must be uniquely used for queue-header initialization.
-    /// - This function must be called at most once for a given region.
-    /// - `region` must not already contain an initialized queue header.
+    /// - This function must be called at most once for a given `region`.
     unsafe fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
         let header = region.addr().cast::<Self>();
@@ -532,6 +530,8 @@ impl SharedQueueHeader {
         //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
         //         alignment of `SharedQueueHeader`.
+        //         Access is exclusive because the caller guarantees this region
+        //         is initialized at most once.
         unsafe { Self::initialize(header, buffer_size_in_items) };
         Ok(header)
     }
