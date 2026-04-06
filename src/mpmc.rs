@@ -295,13 +295,9 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 
 /// Creates a new in-process MPMC queue pair backed by a heap allocation.
 ///
-/// # Safety
-/// - The queue does not validate `T`.
-/// - If a thread may read, dereference, mutate, or drop a queued value, that
-///   operation must be valid for that value in that thread.
-/// - Values left buffered when the queue is dropped may be leaked instead of
-///   having their destructors run.
-pub unsafe fn pair<T>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
+/// Values left buffered when the queue is dropped may be leaked instead of
+/// having their destructors run.
+pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
     let region_size = minimum_region_size::<T>(capacity);
     let region = Region::alloc(region_size)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
@@ -1102,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_pair_creates_in_process_queue() {
-        let (producer, consumer) = unsafe { pair::<u64>(64) }.expect("pair failed");
+        let (producer, consumer) = pair::<u64>(64).expect("pair failed");
 
         for value in [10, 20, 30, 40] {
             producer.try_write(value).expect("write failed");
@@ -1116,7 +1112,7 @@ mod tests {
 
     #[test]
     fn test_pair_clone_roles() {
-        let (producer, consumer) = unsafe { pair::<u64>(64) }.expect("pair failed");
+        let (producer, consumer) = pair::<u64>(64).expect("pair failed");
         let producer2 = producer.clone();
         let consumer2 = consumer.clone();
 
