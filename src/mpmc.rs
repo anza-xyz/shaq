@@ -24,7 +24,10 @@ impl<T> Producer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        let (region, header) = SharedQueueHeader::create::<T>(file, file_size)?;
+        // SAFETY: caller guarantees this file is uniquely created as a
+        // producer, so initializing the queue header for this mapping happens
+        // exactly once.
+        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(region, header) }
@@ -171,7 +174,10 @@ impl<T> Consumer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        let (region, header) = SharedQueueHeader::create::<T>(file, file_size)?;
+        // SAFETY: caller guarantees this file is uniquely created as a
+        // consumer, so initializing the queue header for this mapping happens
+        // exactly once.
+        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(region, header) }
@@ -497,15 +503,29 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
+    /// Creates and initializes a new shared queue header in `file`.
+    ///
+    /// # Safety
+    /// - The mapping created for `file` must be used to initialize at most one
+    ///   queue header.
+    /// - The returned `region` must not be passed to any other queue-header
+    ///   initialization routine.
+    unsafe fn create<T>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
         let region = Region::map_file(file, size)?;
-        let header = Self::create_in_region::<T>(&region)?;
+        // SAFETY: caller guarantees this mapping is initialized exactly once.
+        let header = unsafe { Self::create_in_region::<T>(&region) }?;
         Ok((region, header))
     }
 
-    fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
+    /// Initializes a shared queue header in `region`.
+    ///
+    /// # Safety
+    /// - `region` must be uniquely used for queue-header initialization.
+    /// - This function must be called at most once for a given region.
+    /// - `region` must not already contain an initialized queue header.
+    unsafe fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
         let header = region.addr().cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
