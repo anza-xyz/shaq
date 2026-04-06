@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use core::sync::atomic::AtomicUsize;
 
 // NB: To simplify casting we only support 64bit or wider systems.
