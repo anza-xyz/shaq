@@ -52,14 +52,19 @@ impl<T> Producer<T> {
     /// the given size.
     ///
     /// # Safety
-    /// - The provided file must be uniquely created as a Producer.
+    /// - The file must be created and initialized exactly once.
+    /// - Initialization may be performed by either a [`Producer`] or a
+    ///   [`Consumer`], but that process or thread must be designated
+    ///   externally as the sole initializer.
+    /// - This queue permits exactly one [`Producer`]. If initialization is
+    ///   performed as a [`Producer`], no other [`Producer`] may join it.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this file is uniquely created as a
-        // producer, so initializing the queue header for this mapping happens
-        // exactly once.
+        // SAFETY: caller guarantees this process or thread is the externally
+        // designated sole initializer, so initializing the queue header for
+        // this mapping happens exactly once.
         let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -69,7 +74,8 @@ impl<T> Producer<T> {
     /// Joins an existing producer for the shared queue in the provided file.
     ///
     /// # Safety
-    /// - The provided file must be uniquely joined as a Producer.
+    /// - This queue permits exactly one [`Producer`]. No other [`Producer`]
+    ///   may have created or joined the same file.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
@@ -184,14 +190,19 @@ impl<T> Consumer<T> {
     /// the given size.
     ///
     /// # Safety
-    /// - The provided file must be uniquely created as a Consumer.
+    /// - The file must be created and initialized exactly once.
+    /// - Initialization may be performed by either a [`Producer`] or a
+    ///   [`Consumer`], but that process or thread must be designated
+    ///   externally as the sole initializer.
+    /// - This queue permits exactly one [`Consumer`]. If initialization is
+    ///   performed as a [`Consumer`], no other [`Consumer`] may join it.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this file is uniquely created as a consumer,
-        // meaning no prior `create` call has mapped this file, so the queue
-        // header for this mapping is initialized exactly once.
+        // SAFETY: caller guarantees this process or thread is the externally
+        // designated sole initializer, so initializing the queue header for
+        // this mapping happens exactly once.
         let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -201,7 +212,8 @@ impl<T> Consumer<T> {
     /// Joins an existing consumer for the shared queue in the provided file.
     ///
     /// # Safety
-    /// - The provided file must be uniquely joined as a Consumer.
+    /// - This queue permits exactly one [`Consumer`]. No other [`Consumer`]
+    ///   may have created or joined the same file.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
