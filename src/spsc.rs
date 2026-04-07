@@ -16,17 +16,17 @@ const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
 /// page-size requirements.
-pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
+pub const fn minimum_file_size<T>(capacity: usize) -> usize {
     let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
     buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
 /// Producer side of the SPSC shared queue.
-pub struct Producer<T: Sized> {
+pub struct Producer<T> {
     queue: SharedQueue<T>,
 }
 
-impl<T: Sized> Producer<T> {
+impl<T> Producer<T> {
     /// Creates a new producer for the shared queue in the provided file with
     /// the given size.
     ///
@@ -148,14 +148,14 @@ impl<T: Sized> Producer<T> {
     }
 }
 
-unsafe impl<T> Send for Producer<T> where T: Sized {}
+unsafe impl<T> Send for Producer<T> {}
 
 /// Consumer side of the SPSC shared queue.
-pub struct Consumer<T: Sized> {
+pub struct Consumer<T> {
     queue: SharedQueue<T>,
 }
 
-impl<T: Sized> Consumer<T> {
+impl<T> Consumer<T> {
     /// Creates a new consumer for the shared queue in the provided file with
     /// the given size.
     ///
@@ -271,9 +271,9 @@ impl<T: Sized> Consumer<T> {
     }
 }
 
-unsafe impl<T> Send for Consumer<T> where T: Sized {}
+unsafe impl<T> Send for Consumer<T> {}
 
-struct SharedQueue<T: Sized> {
+struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
 
@@ -286,7 +286,7 @@ struct SharedQueue<T: Sized> {
     region: Arc<MappedRegion>,
 }
 
-impl<T: Sized> SharedQueue<T> {
+impl<T> SharedQueue<T> {
     /// Creates a new shared queue from a header pointer and region.
     ///
     /// # Safety
@@ -387,10 +387,7 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T: Sized>(
-        file: &File,
-        size: usize,
-    ) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn create<T>(file: &File, size: usize) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
@@ -404,7 +401,7 @@ impl SharedQueueHeader {
         Ok((region, header))
     }
 
-    const fn buffer_offset<T: Sized>() -> usize {
+    const fn buffer_offset<T>() -> usize {
         const {
             assert!(
                 core::mem::align_of::<T>() <= crate::shmem::MINIMUM_REGION_ALIGNMENT,
@@ -416,7 +413,7 @@ impl SharedQueueHeader {
             & !(core::mem::align_of::<T>() - 1)
     }
 
-    const fn calculate_buffer_size_in_items<T: Sized>(file_size: usize) -> Result<usize, Error> {
+    const fn calculate_buffer_size_in_items<T>(file_size: usize) -> Result<usize, Error> {
         const {
             assert!(
                 core::mem::size_of::<T>() > 0,
@@ -466,7 +463,7 @@ impl SharedQueueHeader {
         header.magic.store(MAGIC, Ordering::Release);
     }
 
-    fn join<T: Sized>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn join<T>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
         let region = MappedRegion::new(file, file_size)?;
         let header = region.addr().cast::<Self>();
@@ -502,7 +499,7 @@ mod tests {
     use crate::shmem::create_temp_shmem_file;
     use std::sync::atomic::AtomicU64;
 
-    fn create_test_queue<T: Sized>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
+    fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
         let file = create_temp_shmem_file().unwrap();
         let producer =
             unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
