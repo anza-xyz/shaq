@@ -121,6 +121,7 @@ impl<T> Producer<T> {
                 header: self.queue.header,
                 cell,
                 start: position,
+                capacity: self.queue.capacity(),
                 _marker: PhantomData,
             })
     }
@@ -234,6 +235,7 @@ impl<T> Consumer<T> {
             header: self.queue.header,
             cell,
             start: position,
+            capacity: self.queue.capacity(),
             _marker: PhantomData,
         })
     }
@@ -584,10 +586,24 @@ impl SharedQueueHeader {
 
     /// # Safety
     /// - `start..start+count` must be reserved by this producer.
-    unsafe fn publish_producer_publication(header_ptr: NonNull<Self>, start: usize, count: usize) {
+    unsafe fn publish_producer_publication(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: usize,
+        capacity: usize,
+    ) {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
-        while header.producer_publication.load(Ordering::Acquire) != start {
+        loop {
+            let current = header.producer_publication.load(Ordering::Acquire);
+            if current == start {
+                break;
+            }
+            let distance = start.wrapping_sub(current);
+            assert!(
+                distance <= capacity,
+                "corrupted producer_publication cursor"
+            );
             core::hint::spin_loop();
         }
         header
@@ -597,10 +613,21 @@ impl SharedQueueHeader {
 
     /// # Safety
     /// - `start..start+count` must be reserved by this consumer.
-    unsafe fn publish_consumer_release(header_ptr: NonNull<Self>, start: usize, count: usize) {
+    unsafe fn publish_consumer_release(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: usize,
+        capacity: usize,
+    ) {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
-        while header.consumer_release.load(Ordering::Acquire) != start {
+        loop {
+            let current = header.consumer_release.load(Ordering::Acquire);
+            if current == start {
+                break;
+            }
+            let distance = start.wrapping_sub(current);
+            assert!(distance <= capacity, "corrupted consumer_release cursor");
             core::hint::spin_loop();
         }
         header
@@ -614,6 +641,7 @@ pub struct WriteGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
     start: usize,
+    capacity: usize,
     _marker: PhantomData<&'a mut T>,
 }
 
@@ -641,7 +669,12 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved producer slot.
         unsafe {
-            SharedQueueHeader::publish_producer_publication(self.header, self.start, 1);
+            SharedQueueHeader::publish_producer_publication(
+                self.header,
+                self.start,
+                1,
+                self.capacity,
+            );
         }
     }
 }
@@ -651,6 +684,7 @@ pub struct ReadGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
     start: usize,
+    capacity: usize,
     _marker: PhantomData<&'a T>,
 }
 
@@ -678,7 +712,7 @@ impl<'a, T> Drop for ReadGuard<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved consumer slot.
         unsafe {
-            SharedQueueHeader::publish_consumer_release(self.header, self.start, 1);
+            SharedQueueHeader::publish_consumer_release(self.header, self.start, 1, self.capacity);
         }
     }
 }
@@ -743,7 +777,12 @@ impl<'a, T> Drop for WriteBatch<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This batch owns `count` reserved producer slots.
         unsafe {
-            SharedQueueHeader::publish_producer_publication(self.header, self.start, self.count);
+            SharedQueueHeader::publish_producer_publication(
+                self.header,
+                self.start,
+                self.count,
+                self.buffer_mask.wrapping_add(1),
+            );
         }
     }
 }
@@ -805,7 +844,12 @@ impl<'a, T> Drop for ReadBatch<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This batch owns `count` reserved consumer slots.
         unsafe {
-            SharedQueueHeader::publish_consumer_release(self.header, self.start, self.count);
+            SharedQueueHeader::publish_consumer_release(
+                self.header,
+                self.start,
+                self.count,
+                self.buffer_mask.wrapping_add(1),
+            );
         }
     }
 }
