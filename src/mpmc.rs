@@ -4,6 +4,7 @@ use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomic
 use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
+    num::NonZeroUsize,
     sync::{atomic::AtomicU64, Arc},
 };
 
@@ -299,7 +300,7 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 /// having their destructors run.
 pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
     let region_size = minimum_region_size::<T>(capacity);
-    let region = Region::alloc(region_size)?;
+    let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
     let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;

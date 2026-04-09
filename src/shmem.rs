@@ -1,5 +1,5 @@
 use crate::error::Error;
-use std::{fs::File, ptr::NonNull, sync::Arc};
+use std::{fs::File, num::NonZeroUsize, ptr::NonNull, sync::Arc};
 
 pub(crate) const MINIMUM_REGION_ALIGNMENT: usize = 4096;
 
@@ -20,8 +20,8 @@ impl Region {
         }))
     }
 
-    pub(crate) fn alloc(size: usize) -> Result<Arc<Self>, Error> {
-        let layout = std::alloc::Layout::from_size_align(size, MINIMUM_REGION_ALIGNMENT)
+    pub(crate) fn alloc(size: NonZeroUsize) -> Result<Arc<Self>, Error> {
+        let layout = std::alloc::Layout::from_size_align(size.get(), MINIMUM_REGION_ALIGNMENT)
             .map_err(|_| Error::InvalidBufferSize)?;
         let addr = {
             // SAFETY: layout is valid and non-zero.
@@ -33,7 +33,7 @@ impl Region {
 
         Ok(Arc::new(Self {
             addr,
-            size,
+            size: size.get(),
             backing: RegionBacking::Heap(layout),
         }))
     }
@@ -230,7 +230,8 @@ mod tests {
 
     #[test]
     fn test_alloc_region_is_4096_aligned() {
-        let region = Region::alloc(MINIMUM_REGION_ALIGNMENT * 2).expect("allocation failed");
+        let region = Region::alloc(NonZeroUsize::new(MINIMUM_REGION_ALIGNMENT * 2).unwrap())
+            .expect("allocation failed");
         assert_eq!(
             region
                 .addr()
@@ -243,7 +244,8 @@ mod tests {
 
     #[test]
     fn test_alloc_region_accepts_non_4096_multiple() {
-        let region = Region::alloc(MINIMUM_REGION_ALIGNMENT + 1).expect("allocation failed");
+        let region = Region::alloc(NonZeroUsize::new(MINIMUM_REGION_ALIGNMENT + 1).unwrap())
+            .expect("allocation failed");
         assert_eq!(
             region
                 .addr()
