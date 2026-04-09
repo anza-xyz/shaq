@@ -6,6 +6,7 @@ pub enum Error {
     InvalidVersion { expected: u32, actual: u32 },
     InvalidBufferSize,
     InvalidRegionAlignment { minimum: usize, actual: usize },
+    Allocation(std::alloc::Layout),
     Io(std::io::Error),
     Mmap(std::io::Error),
 }
@@ -28,6 +29,12 @@ impl Display for Error {
             Self::InvalidRegionAlignment { minimum, actual } => write!(
                 f,
                 "invalid region alignment; minimum={minimum}; actual={actual}"
+            ),
+            Self::Allocation(layout) => write!(
+                f,
+                "allocation; size={}; align={}",
+                layout.size(),
+                layout.align()
             ),
             Self::Io(err) => write!(f, "io; err={err}"),
             Self::Mmap(err) => write!(f, "mmap; err={err}"),

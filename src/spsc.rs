@@ -1,9 +1,8 @@
-use crate::{
-    error::Error, normalized_capacity, shmem::MappedRegion, CacheAlignedAtomicSize, VERSION,
-};
+use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
 use core::ptr::NonNull;
 use std::{
     fs::File,
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -21,6 +20,25 @@ pub const fn minimum_file_size<T>(capacity: usize) -> usize {
     buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
 }
 
+/// Calculates the minimum region size required for a queue with given capacity.
+pub const fn minimum_region_size<T>(capacity: usize) -> usize {
+    minimum_file_size::<T>(capacity)
+}
+
+/// Creates a new in-process SPSC queue pair backed by a heap allocation.
+///
+/// Values left buffered when the queue is dropped may be leaked instead of
+/// having their destructors run.
+pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
+    let region_size = minimum_region_size::<T>(capacity);
+    let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
+    // SAFETY: `region` is freshly allocated and used only for this queue.
+    let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
+    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
+    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    Ok((producer, consumer))
+}
+
 /// Producer side of the SPSC shared queue.
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -31,12 +49,20 @@ impl<T> Producer<T> {
     /// the given size.
     ///
     /// # Safety
-    /// - The provided file must be uniquely created as a Producer.
+    /// - The file must be created and initialized exactly once.
+    /// - Initialization may be performed by either a [`Producer`] or a
+    ///   [`Consumer`], but that process or thread must be designated
+    ///   externally as the sole initializer.
+    /// - This queue permits exactly one [`Producer`]. If initialization is
+    ///   performed as a [`Producer`], no other [`Producer`] may join it.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        let (region, header) = SharedQueueHeader::create::<T>(file, file_size)?;
+        // SAFETY: caller guarantees this process or thread is the externally
+        // designated sole initializer, so initializing the queue header for
+        // this mapping happens exactly once.
+        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(region, header) }
@@ -45,7 +71,8 @@ impl<T> Producer<T> {
     /// Joins an existing producer for the shared queue in the provided file.
     ///
     /// # Safety
-    /// - The provided file must be uniquely joined as a Producer.
+    /// - This queue permits exactly one [`Producer`]. No other [`Producer`]
+    ///   may have created or joined the same file.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
@@ -71,7 +98,7 @@ impl<T> Producer<T> {
     /// - `header` must be non-null and properly aligned.
     /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -160,12 +187,20 @@ impl<T> Consumer<T> {
     /// the given size.
     ///
     /// # Safety
-    /// - The provided file must be uniquely created as a Consumer.
+    /// - The file must be created and initialized exactly once.
+    /// - Initialization may be performed by either a [`Producer`] or a
+    ///   [`Consumer`], but that process or thread must be designated
+    ///   externally as the sole initializer.
+    /// - This queue permits exactly one [`Consumer`]. If initialization is
+    ///   performed as a [`Consumer`], no other [`Consumer`] may join it.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        let (region, header) = SharedQueueHeader::create::<T>(file, file_size)?;
+        // SAFETY: caller guarantees this process or thread is the externally
+        // designated sole initializer, so initializing the queue header for
+        // this mapping happens exactly once.
+        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(region, header) }
@@ -174,7 +209,8 @@ impl<T> Consumer<T> {
     /// Joins an existing consumer for the shared queue in the provided file.
     ///
     /// # Safety
-    /// - The provided file must be uniquely joined as a Consumer.
+    /// - This queue permits exactly one [`Consumer`]. No other [`Consumer`]
+    ///   may have created or joined the same file.
     /// - The queue does not validate `T` across processes.
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
@@ -200,7 +236,7 @@ impl<T> Consumer<T> {
     /// - `header` must be non-null and properly aligned.
     /// - allocation backing `region` must be of sufficient size.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -283,7 +319,7 @@ struct SharedQueue<T> {
 
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
-    region: Arc<MappedRegion>,
+    region: Arc<Region>,
 }
 
 impl<T> SharedQueue<T> {
@@ -293,14 +329,14 @@ impl<T> SharedQueue<T> {
     /// - `header` must be non-null and properly aligned.
     /// - `region` must back the allocation at `header`.
     unsafe fn from_header(
-        region: Arc<MappedRegion>,
+        region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Self, Error> {
         // SAFETY: `header` is non-null and aligned properly.
         let size = unsafe { (header.as_ref().buffer_mask as usize).wrapping_add(1) };
 
         if !size.is_power_of_two()
-            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.file_size())? != size
+            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.size())? != size
         {
             return Err(Error::InvalidBufferSize);
         }
@@ -387,18 +423,37 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    fn create<T>(file: &File, size: usize) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    /// Creates and initializes a new shared queue header in `file`.
+    ///
+    /// # Safety
+    /// - The mapping created for `file` must be used to initialize at most one
+    ///   queue header.
+    /// - The returned `region` must not be passed to any other queue-header
+    ///   initialization routine.
+    unsafe fn create<T>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
-        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
-        let region = MappedRegion::new(file, size)?;
+        let region = Region::map_file(file, size)?;
+        // SAFETY: caller guarantees this mapping is initialized exactly once.
+        let header = unsafe { Self::create_in_region::<T>(&region) }?;
+        Ok((region, header))
+    }
+
+    /// Initializes a shared queue header in `region`.
+    ///
+    /// # Safety
+    /// - This function must be called at most once for a given `region`.
+    unsafe fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
+        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
         let header = region.addr().cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
         //         alignment of `SharedQueueHeader`.
+        //         Access is exclusive because the caller guarantees this region
+        //         is initialized at most once.
         unsafe { Self::initialize(header, buffer_size_in_items) };
-        Ok((region, header))
+        Ok(header)
     }
 
     const fn buffer_offset<T>() -> usize {
@@ -463,9 +518,14 @@ impl SharedQueueHeader {
         header.magic.store(MAGIC, Ordering::Release);
     }
 
-    fn join<T>(file: &File) -> Result<(Arc<MappedRegion>, NonNull<Self>), Error> {
+    fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
-        let region = MappedRegion::new(file, file_size)?;
+        let region = Region::map_file(file, file_size)?;
+        let header = Self::join_region::<T>(&region)?;
+        Ok((region, header))
+    }
+
+    fn join_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let header = region.addr().cast::<Self>();
         {
             // SAFETY: The header is non-null and aligned properly.
@@ -483,13 +543,13 @@ impl SharedQueueHeader {
                 });
             }
             if (header.buffer_mask as usize).wrapping_add(1)
-                != Self::calculate_buffer_size_in_items::<T>(file_size)?
+                != Self::calculate_buffer_size_in_items::<T>(region.size())?
             {
                 return Err(Error::InvalidBufferSize);
             }
         }
 
-        Ok((region, header))
+        Ok(header)
     }
 }
 
@@ -634,5 +694,34 @@ mod tests {
             .expect("create failed");
 
         assert_eq!(producer.capacity(), 4);
+    }
+
+    #[test]
+    fn test_pair_creates_in_process_queue() {
+        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+
+        assert_eq!(producer.capacity(), 64);
+        assert_eq!(consumer.capacity(), 64);
+
+        producer.try_write(123).unwrap();
+        producer.commit();
+        consumer.sync();
+        let val = consumer.try_read().expect("read failed");
+        assert_eq!(*val, 123);
+        consumer.finalize();
+    }
+
+    #[test]
+    fn test_pair_join_as_other_role() {
+        let (mut producer, consumer) = pair::<u64>(64).expect("pair failed");
+        drop(consumer);
+        let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
+
+        producer.try_write(55).unwrap();
+        producer.commit();
+        consumer.sync();
+        let val = consumer.try_read().expect("read failed");
+        assert_eq!(*val, 55);
+        consumer.finalize();
     }
 }
