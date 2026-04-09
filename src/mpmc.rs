@@ -304,6 +304,9 @@ impl<T> Consumer<T> {
     /// - This must only be used when joining as the sole consumer process for
     ///   the shared queue.
     /// - Racing with any live consumer process or thread may corrupt the queue.
+    /// - If `T` requires freeing of memory or other resources, this may cause
+    ///   double-free if the previous consumer had processed some items but not
+    ///   released them before crashing.
     pub unsafe fn recover_as_exclusive(&self) {
         // SAFETY: `self.queue.header` points to a valid shared queue header.
         let header = unsafe { self.queue.header.as_ref() };
