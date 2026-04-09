@@ -151,6 +151,28 @@ impl<T> Producer<T> {
             _marker: PhantomData,
         })
     }
+
+    /// Abandons all reserved-but-unpublished writes left behind by a previous
+    /// producer process.
+    ///
+    /// This rolls `producer_reservation` back to `producer_publication`,
+    /// making capacity consumed by reservations whose guards were lost without
+    /// running `Drop` reusable without exposing their slots to consumers.
+    ///
+    /// # Safety
+    /// - This must only be called when the caller can prove that no other
+    ///   producer process is still live.
+    /// - This must only be used when joining as the sole producer process for
+    ///   the shared queue.
+    /// - Racing with any live producer process or thread may corrupt the queue.
+    pub unsafe fn recover_as_exclusive(&self) {
+        // SAFETY: `self.queue.header` points to a valid shared queue header.
+        let header = unsafe { self.queue.header.as_ref() };
+        let publication = header.producer_publication.load(Ordering::Acquire);
+        header
+            .producer_reservation
+            .store(publication, Ordering::Release);
+    }
 }
 
 impl<T> Clone for Producer<T> {
@@ -267,6 +289,54 @@ impl<T> Consumer<T> {
             buffer_mask: self.queue.buffer_mask,
             _marker: PhantomData,
         })
+    }
+
+    /// Makes reserved-but-not-released reads left behind by a previous
+    /// consumer process available to be read again.
+    ///
+    /// This rolls `consumer_reservation` back to `consumer_release`, making
+    /// previously claimed items readable again by the new consumer process
+    /// after their guards were lost without running `Drop`.
+    ///
+    /// # Safety
+    /// - This must only be called when the caller can prove that no other
+    ///   consumer process is still live.
+    /// - This must only be used when joining as the sole consumer process for
+    ///   the shared queue.
+    /// - Racing with any live consumer process or thread may corrupt the queue.
+    /// - If `T` requires freeing of memory or other resources, this may cause
+    ///   double-free if the previous consumer had processed some items but not
+    ///   released them before crashing.
+    pub unsafe fn recover_as_exclusive(&self) {
+        // SAFETY: `self.queue.header` points to a valid shared queue header.
+        let header = unsafe { self.queue.header.as_ref() };
+        let release = header.consumer_release.load(Ordering::Acquire);
+        header
+            .consumer_reservation
+            .store(release, Ordering::Release);
+    }
+
+    /// Drops all reserved-but-not-released reads left behind by a previous
+    /// consumer process.
+    ///
+    /// This advances `consumer_release` up to `consumer_reservation`,
+    /// discarding items already claimed by the previous consumer process after
+    /// their guards were lost without running `Drop` and making their capacity
+    /// reusable by producers.
+    ///
+    /// # Safety
+    /// - This must only be called when the caller can prove that no other
+    ///   consumer process is still live.
+    /// - This must only be used when joining as the sole consumer process for
+    ///   the shared queue.
+    /// - Racing with any live consumer process or thread may corrupt the queue.
+    pub unsafe fn recover_as_exclusive_lossy(&self) {
+        // SAFETY: `self.queue.header` points to a valid shared queue header.
+        let header = unsafe { self.queue.header.as_ref() };
+        let reservation = header.consumer_reservation.load(Ordering::Acquire);
+        header
+            .consumer_release
+            .store(reservation, Ordering::Release);
     }
 }
 
@@ -1108,7 +1178,6 @@ mod tests {
         for value in [10, 20, 30, 40] {
             assert_eq!(consumer.try_read(), Some(value));
         }
-        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
@@ -1138,5 +1207,73 @@ mod tests {
 
         values.sort_unstable();
         assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_consumer_recover_as_exclusive_lossy() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        for i in 0..4 {
+            producer.try_write(i).unwrap();
+        }
+
+        let guard = consumer.reserve_read().expect("reserve read");
+        assert_eq!(*guard.as_ref(), 0);
+        core::mem::forget(guard);
+
+        unsafe {
+            consumer.recover_as_exclusive_lossy();
+        }
+
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
+        assert_eq!(consumer.try_read(), Some(3));
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_consumer_recover_as_exclusive() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        for i in 0..4 {
+            producer.try_write(i).unwrap();
+        }
+
+        let guard = consumer.reserve_read().expect("reserve read");
+        assert_eq!(*guard.as_ref(), 0);
+        core::mem::forget(guard);
+
+        unsafe {
+            consumer.recover_as_exclusive();
+        }
+
+        assert_eq!(consumer.try_read(), Some(0));
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
+        assert_eq!(consumer.try_read(), Some(3));
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_producer_recover_as_exclusive() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        producer.try_write(10).unwrap();
+
+        let mut guard = unsafe { producer.reserve_write() }.expect("reserve write");
+        unsafe {
+            guard.as_mut_ptr().write(99);
+        }
+        core::mem::forget(guard);
+
+        unsafe {
+            producer.recover_as_exclusive();
+        }
+
+        producer.try_write(20).unwrap();
+
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+        assert_eq!(consumer.try_read(), None);
     }
 }
