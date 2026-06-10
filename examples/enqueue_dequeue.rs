@@ -6,12 +6,16 @@ use common::{
     run_total_throughput_loop, setup_exit_handler, Item, SYNC_CADENCE,
 };
 use shaq::{
+    error::WaitError,
     mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
     spsc::{Consumer as SpscConsumer, Producer as SpscProducer},
 };
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 const QUEUE_SIZE: usize = 16 * 1024 * 1024;
@@ -216,13 +220,20 @@ fn run_spsc_consumer(
     exit: Arc<AtomicBool>,
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
+    let wait_timeout = Duration::from_millis(10);
     run_consumer_loop(exit, move || {
-        consumer.sync();
-        for _ in 0..SYNC_CADENCE {
-            let Some(_item) = consumer.try_read() else {
+        match consumer.read_ptr_timeout(wait_timeout) {
+            Ok(_item) => {}
+            Err(WaitError::Timeout) => {
                 consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        for _ in 1..SYNC_CADENCE {
+            if consumer.try_read().is_none() {
                 break;
-            };
+            }
         }
         consumer.finalize();
     });

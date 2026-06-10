@@ -1,4 +1,10 @@
-use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::{Error, WaitError},
+    futex::WaitState,
+    normalized_capacity,
+    shmem::Region,
+    CacheAlignedAtomicSize, VERSION,
+};
 use core::ptr::NonNull;
 use std::{
     fs::File,
@@ -7,10 +13,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 /// Unique identifier for SPSC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
+const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
@@ -162,10 +170,11 @@ impl<T> Producer<T> {
 
     /// Commits the reserved position, making it visible to the consumer.
     pub fn commit(&self) {
-        self.queue
-            .header()
+        let header = self.queue.header();
+        header
             .write
             .store(self.queue.cached_write, Ordering::Release);
+        header.wait_state.wake(1);
     }
 
     /// Synchronize the producer's cached read position with the queue's read
@@ -305,6 +314,35 @@ impl<T> Consumer<T> {
     pub fn sync(&mut self) {
         self.queue.load_write();
     }
+
+    /// Blocks until at least one committed item is readable or `timeout` elapses.
+    pub fn wait_readable_timeout(&mut self, timeout: Duration) -> Result<(), WaitError> {
+        let header = self.queue.header;
+        // SAFETY: `header` points to this consumer's live shared queue header.
+        let wait_state = &unsafe { header.as_ref() }.wait_state;
+        wait_state.wait_for(timeout, CONSUMER_WAIT_SPIN_ATTEMPTS, || {
+            self.queue.load_write();
+            if !self.queue.is_empty() {
+                Some(())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Blocks until a committed item can be reserved for reading or `timeout`
+    /// elapses.
+    ///
+    /// The caller must still process all returned pointers and call
+    /// [`Self::finalize`] to release consumed capacity back to the producer.
+    pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
+        loop {
+            if let Some(ptr) = self.try_read_ptr() {
+                return Ok(ptr);
+            }
+            self.wait_readable_timeout(timeout)?;
+        }
+    }
 }
 
 unsafe impl<T: Send> Send for Consumer<T> {}
@@ -420,6 +458,8 @@ struct SharedQueueHeader {
     // Hot cache lines.
     write: CacheAlignedAtomicSize,
     read: CacheAlignedAtomicSize,
+    /// Wait state used only for consumer wait/wake coordination.
+    wait_state: WaitState,
 }
 
 impl SharedQueueHeader {
@@ -513,6 +553,7 @@ impl SharedQueueHeader {
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
+        header.wait_state.initialize();
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);
@@ -557,7 +598,7 @@ impl SharedQueueHeader {
 mod tests {
     use super::*;
     use crate::shmem::create_temp_shmem_file;
-    use std::sync::atomic::AtomicU64;
+    use std::{sync::atomic::AtomicU64, time::Duration};
 
     fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
         let file = create_temp_shmem_file().unwrap();
@@ -722,6 +763,55 @@ mod tests {
         consumer.sync();
         let val = consumer.try_read().expect("read failed");
         assert_eq!(*val, 55);
+        consumer.finalize();
+    }
+
+    #[test]
+    fn test_read_ptr_timeout_observes_commit() {
+        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+
+        let spot = unsafe { producer.reserve() }.expect("reserve failed");
+        unsafe { spot.write(42) };
+
+        assert!(matches!(
+            consumer.wait_readable_timeout(Duration::ZERO),
+            Err(WaitError::Timeout)
+        ));
+
+        producer.commit();
+
+        let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
+            Ok(ptr) => ptr,
+            Err(WaitError::Timeout) => panic!("read timed out after commit"),
+        };
+        // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
+        assert_eq!(unsafe { *ptr.as_ptr() }, 42);
+        consumer.finalize();
+    }
+
+    #[test]
+    fn test_wait_readable_timeout_cleans_waiter() {
+        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+
+        assert!(matches!(
+            consumer.wait_readable_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+
+        assert!(matches!(
+            consumer.read_ptr_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+
+        producer.try_write(9).unwrap();
+        producer.commit();
+
+        let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
+            Ok(ptr) => ptr,
+            Err(WaitError::Timeout) => panic!("read timed out after commit"),
+        };
+        // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
+        assert_eq!(unsafe { *ptr.as_ptr() }, 9);
         consumer.finalize();
     }
 }

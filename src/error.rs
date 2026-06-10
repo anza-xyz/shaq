@@ -11,7 +11,13 @@ pub enum Error {
     Mmap(std::io::Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitError {
+    Timeout,
+}
+
 impl std::error::Error for Error {}
+impl std::error::Error for WaitError {}
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,6 +48,14 @@ impl Display for Error {
     }
 }
 
+impl Display for WaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "wait timed out"),
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err)
@@ -58,5 +72,10 @@ mod tests {
         let actual: u32 = (3u32 << 16) | 7; // 3.7
         let err = Error::InvalidVersion { expected, actual };
         assert_eq!(err.to_string(), "invalid version; expected=1.0; found=3.7");
+    }
+
+    #[test]
+    fn test_wait_timeout_display() {
+        assert_eq!(WaitError::Timeout.to_string(), "wait timed out");
     }
 }
