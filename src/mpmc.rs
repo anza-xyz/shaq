@@ -1006,19 +1006,35 @@ impl<'a, T> Drop for ReadBatch<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
 
     type Item = u64;
     const BUFFER_CAPACITY: usize = 512;
-    const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
 
-    fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
-        let file = create_temp_shmem_file().unwrap();
+    type CreateQueue<T> = fn(usize) -> (Producer<T>, Consumer<T>);
+
+    fn create_heap_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+        pair(capacity).expect("failed to create heap-backed queue pair")
+    }
+
+    #[cfg(not(miri))]
+    fn create_file_backed_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+        let file = create_temp_shmem_file().expect("failed to create temp file");
+        let file_size = minimum_file_size::<T>(capacity);
         let producer =
-            unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
-        let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
+            unsafe { Producer::create(&file, file_size) }.expect("failed to create producer");
+        let consumer = unsafe { Consumer::join(&file) }.expect("failed to join consumer");
 
-        (file, producer, consumer)
+        (producer, consumer)
+    }
+
+    fn test_queue_creators<T: Send>() -> &'static [CreateQueue<T>] {
+        &[
+            create_heap_test_queue::<T>,
+            #[cfg(not(miri))]
+            create_file_backed_test_queue::<T>,
+        ]
     }
 
     fn expect_wait_ok<T>(result: Result<T, WaitError>) -> T {
@@ -1030,379 +1046,411 @@ mod tests {
 
     #[test]
     fn test_producer_consumer() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let capacity =
-            SharedQueueHeader::calculate_buffer_size_in_items::<Item>(BUFFER_SIZE).unwrap();
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
+            let capacity = BUFFER_CAPACITY;
 
-        for i in 0..capacity {
-            assert_eq!(producer.try_write(i as Item), Ok(()));
-        }
-        assert!(producer.try_write(999).is_err());
+            for i in 0..capacity {
+                assert_eq!(producer.try_write(i as Item), Ok(()));
+            }
+            assert!(producer.try_write(999).is_err());
 
-        for i in 0..capacity {
-            assert_eq!(consumer.try_read(), Some(i as Item));
+            for i in 0..capacity {
+                assert_eq!(consumer.try_read(), Some(i as Item));
+            }
+            assert_eq!(consumer.try_read(), None);
         }
-        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
     fn test_read_timeout_observes_publication() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        assert!(matches!(
-            consumer.read_timeout(Duration::ZERO),
-            Err(WaitError::Timeout)
-        ));
+            assert!(matches!(
+                consumer.read_timeout(Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
 
-        producer.try_write(42).unwrap();
+            producer.try_write(42).unwrap();
 
-        assert_eq!(expect_wait_ok(consumer.read_timeout(Duration::ZERO)), 42);
-        assert_eq!(consumer.try_read(), None);
+            assert_eq!(expect_wait_ok(consumer.read_timeout(Duration::ZERO)), 42);
+            assert_eq!(consumer.try_read(), None);
+        }
     }
 
     #[test]
     fn test_reserve_read_timeout_observes_publication() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        assert!(matches!(
-            consumer.reserve_read_timeout(Duration::ZERO),
-            Err(WaitError::Timeout)
-        ));
+            assert!(matches!(
+                consumer.reserve_read_timeout(Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
 
-        producer.try_write(7).unwrap();
+            producer.try_write(7).unwrap();
 
-        let guard = expect_wait_ok(consumer.reserve_read_timeout(Duration::ZERO));
-        assert_eq!(*guard.as_ref(), 7);
+            let guard = expect_wait_ok(consumer.reserve_read_timeout(Duration::ZERO));
+            assert_eq!(*guard.as_ref(), 7);
+        }
     }
 
     #[test]
     fn test_reserve_read_batch_timeout_observes_publication() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        assert!(matches!(
-            consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
-            Err(WaitError::Timeout)
-        ));
+            assert!(matches!(
+                consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
 
-        assert!(producer.try_write_slice(&[1, 2, 3]));
+            assert!(producer.try_write_slice(&[1, 2, 3]));
 
-        let batch = expect_wait_ok(
-            consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
-        );
-        assert_eq!(batch.len(), 3);
-        for (index, expected) in [1, 2, 3].into_iter().enumerate() {
-            assert_eq!(unsafe { batch.read(index) }, expected);
+            let batch = expect_wait_ok(
+                consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
+            );
+            assert_eq!(batch.len(), 3);
+            for (index, expected) in [1, 2, 3].into_iter().enumerate() {
+                assert_eq!(unsafe { batch.read(index) }, expected);
+            }
         }
     }
 
     #[test]
     fn test_reserve_and_try_read_ptr() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        let mut guard = unsafe { producer.reserve_write() }.expect("reserve failed");
-        unsafe {
-            *guard.as_mut_ptr() = 42;
-        }
-        drop(guard);
+            let mut guard = unsafe { producer.reserve_write() }.expect("reserve failed");
+            unsafe {
+                *guard.as_mut_ptr() = 42;
+            }
+            drop(guard);
 
-        let guard = consumer.reserve_read().expect("try_read_ptr failed");
-        unsafe {
-            assert_eq!(*guard.as_ptr(), 42);
+            let guard = consumer.reserve_read().expect("try_read_ptr failed");
+            unsafe {
+                assert_eq!(*guard.as_ptr(), 42);
+            }
+            assert_eq!(*guard.as_ref(), 42);
         }
-        assert_eq!(*guard.as_ref(), 42);
     }
 
     #[test]
     fn test_reserve_batch_and_try_read_batch() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        let batch_size = NonZeroUsize::new(4).unwrap();
-        let mut batch =
-            unsafe { producer.reserve_write_batch(batch_size) }.expect("reserve_batch failed");
-        for index in 0..batch.len() {
-            unsafe {
-                *batch.as_mut_ptr(index) = index as u64;
+            let batch_size = NonZeroUsize::new(4).unwrap();
+            let mut batch =
+                unsafe { producer.reserve_write_batch(batch_size) }.expect("reserve_batch failed");
+            for index in 0..batch.len() {
+                unsafe {
+                    *batch.as_mut_ptr(index) = index as u64;
+                }
             }
-        }
-        drop(batch);
+            drop(batch);
 
-        let batch = consumer
-            .reserve_read_batch(batch_size)
-            .expect("try_read_batch failed");
-        for index in 0..batch.len() {
-            unsafe {
-                assert_eq!(*batch.as_ptr(index), index as u64);
+            let batch = consumer
+                .reserve_read_batch(batch_size)
+                .expect("try_read_batch failed");
+            for index in 0..batch.len() {
+                unsafe {
+                    assert_eq!(*batch.as_ptr(index), index as u64);
+                }
+                assert_eq!(unsafe { batch.read(index) }, index as u64);
             }
-            assert_eq!(unsafe { batch.read(index) }, index as u64);
         }
     }
 
     #[test]
     fn test_batch_write_exact_read_upto_max() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        unsafe {
-            assert!(producer
-                .reserve_write_batch(NonZeroUsize::new(BUFFER_CAPACITY + 1).unwrap())
-                .is_none());
-        }
-
-        for i in 0..4 {
-            assert_eq!(producer.try_write(i as Item), Ok(()));
-        }
-        let batch = consumer
-            .reserve_read_batch(NonZeroUsize::new(5).unwrap())
-            .expect("try_read_batch up-to failed");
-        assert_eq!(batch.len(), 4);
-        for index in 0..batch.len() {
-            // SAFETY: `batch` has exactly 4 readable items.
             unsafe {
-                assert_eq!(*batch.as_ptr(index), index as u64);
+                assert!(producer
+                    .reserve_write_batch(NonZeroUsize::new(BUFFER_CAPACITY + 1).unwrap())
+                    .is_none());
+            }
+
+            for i in 0..4 {
+                assert_eq!(producer.try_write(i as Item), Ok(()));
+            }
+            let batch = consumer
+                .reserve_read_batch(NonZeroUsize::new(5).unwrap())
+                .expect("try_read_batch up-to failed");
+            assert_eq!(batch.len(), 4);
+            for index in 0..batch.len() {
+                // SAFETY: `batch` has exactly 4 readable items.
+                unsafe {
+                    assert_eq!(*batch.as_ptr(index), index as u64);
+                }
             }
         }
     }
 
     #[test]
     fn test_try_write_slice() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        assert!(producer.try_write_slice(&[]));
+            assert!(producer.try_write_slice(&[]));
 
-        let values = [10, 11, 12, 13];
-        assert!(producer.try_write_slice(&values));
-        for value in values {
-            assert_eq!(consumer.try_read(), Some(value));
+            let values = [10, 11, 12, 13];
+            assert!(producer.try_write_slice(&values));
+            for value in values {
+                assert_eq!(consumer.try_read(), Some(value));
+            }
+            assert_eq!(consumer.try_read(), None);
         }
-        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
-    fn test_minimum_file_size_rounds_up_capacity() {
-        let file = create_temp_shmem_file().unwrap();
-        let producer = unsafe { Producer::<u64>::create(&file, minimum_file_size::<u64>(3)) }
-            .expect("create failed");
-        let consumer = unsafe { Consumer::<u64>::join(&file) }.expect("join failed");
+    fn test_capacity_rounds_up() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (producer, consumer) = create_queue(3);
 
-        assert_eq!(producer.queue.capacity(), 4);
-        assert_eq!(consumer.queue.capacity(), 4);
+            assert_eq!(producer.queue.capacity(), 4);
+            assert_eq!(consumer.queue.capacity(), 4);
+        }
     }
 
     #[test]
     fn test_multiple_producers_consumers() {
-        let (file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let producer2 = unsafe { Producer::join(&file) }.expect("Failed to create producer2");
-        let consumer2 = unsafe { Consumer::join(&file) }.expect("Failed to create consumer2");
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
+            let producer2 = producer.clone();
+            let consumer2 = consumer.clone();
 
-        let capacity = BUFFER_CAPACITY;
-        for i in 0..(capacity / 2) {
-            assert_eq!(producer.try_write((i * 2) as Item), Ok(()));
-            assert_eq!(producer2.try_write((i * 2 + 1) as Item), Ok(()));
-        }
+            let capacity = BUFFER_CAPACITY;
+            for i in 0..(capacity / 2) {
+                assert_eq!(producer.try_write((i * 2) as Item), Ok(()));
+                assert_eq!(producer2.try_write((i * 2 + 1) as Item), Ok(()));
+            }
 
-        let mut values = Vec::with_capacity(capacity);
-        while values.len() < capacity {
-            let mut progressed = false;
-            if let Some(value) = consumer.try_read() {
-                values.push(value);
-                progressed = true;
+            let mut values = Vec::with_capacity(capacity);
+            while values.len() < capacity {
+                let mut progressed = false;
+                if let Some(value) = consumer.try_read() {
+                    values.push(value);
+                    progressed = true;
+                }
+                if let Some(value) = consumer2.try_read() {
+                    values.push(value);
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
             }
-            if let Some(value) = consumer2.try_read() {
-                values.push(value);
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-        }
 
-        assert_eq!(values.len(), capacity);
-        values.sort_unstable();
-        for (i, value) in values.iter().enumerate() {
-            assert_eq!(*value, i as Item);
+            assert_eq!(values.len(), capacity);
+            values.sort_unstable();
+            for (i, value) in values.iter().enumerate() {
+                assert_eq!(*value, i as Item);
+            }
         }
     }
 
     #[test]
     fn test_clone_producer() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let producer2 = producer.clone();
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
+            let producer2 = producer.clone();
 
-        producer.try_write(10).unwrap();
-        producer2.try_write(20).unwrap();
+            producer.try_write(10).unwrap();
+            producer2.try_write(20).unwrap();
 
-        let mut values = Vec::new();
-        while let Some(v) = consumer.try_read() {
-            values.push(v);
+            let mut values = Vec::new();
+            while let Some(v) = consumer.try_read() {
+                values.push(v);
+            }
+            values.sort_unstable();
+            assert_eq!(values, vec![10, 20]);
         }
-        values.sort_unstable();
-        assert_eq!(values, vec![10, 20]);
     }
 
     #[test]
     fn test_clone_consumer() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let consumer2 = consumer.clone();
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
+            let consumer2 = consumer.clone();
 
-        for i in 0..4 {
-            producer.try_write(i).unwrap();
-        }
+            for i in 0..4 {
+                producer.try_write(i).unwrap();
+            }
 
-        let mut values = Vec::new();
-        loop {
-            let mut progressed = false;
-            if let Some(v) = consumer.try_read() {
-                values.push(v);
-                progressed = true;
+            let mut values = Vec::new();
+            loop {
+                let mut progressed = false;
+                if let Some(v) = consumer.try_read() {
+                    values.push(v);
+                    progressed = true;
+                }
+                if let Some(v) = consumer2.try_read() {
+                    values.push(v);
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
             }
-            if let Some(v) = consumer2.try_read() {
-                values.push(v);
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
+            values.sort_unstable();
+            assert_eq!(values, vec![0, 1, 2, 3]);
         }
-        values.sort_unstable();
-        assert_eq!(values, vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn test_cross_role_joins() {
-        let (_file, producer1, consumer1) = create_test_queue::<Item>(BUFFER_SIZE);
-        let consumer2 = producer1.join_as_consumer();
-        let producer2 = consumer2.join_as_producer();
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer1, consumer1) = create_queue(BUFFER_CAPACITY);
+            let consumer2 = producer1.join_as_consumer();
+            let producer2 = consumer2.join_as_producer();
 
-        // Write two values.
-        producer1.try_write(100).unwrap();
-        producer2.try_write(200).unwrap();
+            // Write two values.
+            producer1.try_write(100).unwrap();
+            producer2.try_write(200).unwrap();
 
-        // Read two values.
-        assert_eq!(consumer2.try_read().unwrap(), 100);
-        assert_eq!(consumer1.try_read().unwrap(), 200);
+            // Read two values.
+            assert_eq!(consumer2.try_read().unwrap(), 100);
+            assert_eq!(consumer1.try_read().unwrap(), 200);
+        }
     }
 
     #[test]
-    fn test_drop_original_mapping_stays_alive() {
-        let file = create_temp_shmem_file().unwrap();
-        let producer =
-            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
-        let consumer = producer.join_as_consumer();
-        let producer2 = producer.clone();
+    fn test_drop_original_region_stays_alive() {
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, _consumer) = create_queue(BUFFER_CAPACITY);
+            let consumer = producer.join_as_consumer();
+            let producer2 = producer.clone();
 
-        // Drop the original producer — the mapping stays alive via Arc.
-        drop(producer);
+            // Drop the original producer; the shared region stays alive via Arc.
+            drop(producer);
 
-        producer2.try_write(42).unwrap();
-        assert_eq!(consumer.try_read(), Some(42));
+            producer2.try_write(42).unwrap();
+            assert_eq!(consumer.try_read(), Some(42));
+        }
     }
 
     #[test]
     fn test_pair_creates_in_process_queue() {
-        let (producer, consumer) = pair::<u64>(64).expect("pair failed");
+        for create_queue in test_queue_creators::<u64>() {
+            let (producer, consumer) = create_queue(64);
 
-        for value in [10, 20, 30, 40] {
-            producer.try_write(value).expect("write failed");
-        }
+            for value in [10, 20, 30, 40] {
+                producer.try_write(value).expect("write failed");
+            }
 
-        for value in [10, 20, 30, 40] {
-            assert_eq!(consumer.try_read(), Some(value));
+            for value in [10, 20, 30, 40] {
+                assert_eq!(consumer.try_read(), Some(value));
+            }
         }
     }
 
     #[test]
     fn test_pair_clone_roles() {
-        let (producer, consumer) = pair::<u64>(64).expect("pair failed");
-        let producer2 = producer.clone();
-        let consumer2 = consumer.clone();
+        for create_queue in test_queue_creators::<u64>() {
+            let (producer, consumer) = create_queue(64);
+            let producer2 = producer.clone();
+            let consumer2 = consumer.clone();
 
-        producer.try_write(1).expect("write failed");
-        producer2.try_write(2).expect("write failed");
+            producer.try_write(1).expect("write failed");
+            producer2.try_write(2).expect("write failed");
 
-        let mut values = Vec::new();
-        loop {
-            let mut progressed = false;
-            if let Some(value) = consumer.try_read() {
-                values.push(value);
-                progressed = true;
+            let mut values = Vec::new();
+            loop {
+                let mut progressed = false;
+                if let Some(value) = consumer.try_read() {
+                    values.push(value);
+                    progressed = true;
+                }
+                if let Some(value) = consumer2.try_read() {
+                    values.push(value);
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
             }
-            if let Some(value) = consumer2.try_read() {
-                values.push(value);
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
+
+            values.sort_unstable();
+            assert_eq!(values, vec![1, 2]);
         }
-
-        values.sort_unstable();
-        assert_eq!(values, vec![1, 2]);
     }
 
     #[test]
     fn test_consumer_recover_as_exclusive_lossy() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        for i in 0..4 {
-            producer.try_write(i).unwrap();
+            for i in 0..4 {
+                producer.try_write(i).unwrap();
+            }
+
+            let guard = consumer.reserve_read().expect("reserve read");
+            assert_eq!(*guard.as_ref(), 0);
+            core::mem::forget(guard);
+
+            unsafe {
+                consumer.recover_as_exclusive_lossy();
+            }
+
+            assert_eq!(consumer.try_read(), Some(1));
+            assert_eq!(consumer.try_read(), Some(2));
+            assert_eq!(consumer.try_read(), Some(3));
+            assert_eq!(consumer.try_read(), None);
         }
-
-        let guard = consumer.reserve_read().expect("reserve read");
-        assert_eq!(*guard.as_ref(), 0);
-        core::mem::forget(guard);
-
-        unsafe {
-            consumer.recover_as_exclusive_lossy();
-        }
-
-        assert_eq!(consumer.try_read(), Some(1));
-        assert_eq!(consumer.try_read(), Some(2));
-        assert_eq!(consumer.try_read(), Some(3));
-        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
     fn test_consumer_recover_as_exclusive() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        for i in 0..4 {
-            producer.try_write(i).unwrap();
+            for i in 0..4 {
+                producer.try_write(i).unwrap();
+            }
+
+            let guard = consumer.reserve_read().expect("reserve read");
+            assert_eq!(*guard.as_ref(), 0);
+            core::mem::forget(guard);
+
+            unsafe {
+                consumer.recover_as_exclusive();
+            }
+
+            assert_eq!(consumer.try_read(), Some(0));
+            assert_eq!(consumer.try_read(), Some(1));
+            assert_eq!(consumer.try_read(), Some(2));
+            assert_eq!(consumer.try_read(), Some(3));
+            assert_eq!(consumer.try_read(), None);
         }
-
-        let guard = consumer.reserve_read().expect("reserve read");
-        assert_eq!(*guard.as_ref(), 0);
-        core::mem::forget(guard);
-
-        unsafe {
-            consumer.recover_as_exclusive();
-        }
-
-        assert_eq!(consumer.try_read(), Some(0));
-        assert_eq!(consumer.try_read(), Some(1));
-        assert_eq!(consumer.try_read(), Some(2));
-        assert_eq!(consumer.try_read(), Some(3));
-        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
     fn test_producer_recover_as_exclusive() {
-        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-        producer.try_write(10).unwrap();
+            producer.try_write(10).unwrap();
 
-        let mut guard = unsafe { producer.reserve_write() }.expect("reserve write");
-        unsafe {
-            guard.as_mut_ptr().write(99);
+            let mut guard = unsafe { producer.reserve_write() }.expect("reserve write");
+            unsafe {
+                guard.as_mut_ptr().write(99);
+            }
+            core::mem::forget(guard);
+
+            unsafe {
+                producer.recover_as_exclusive();
+            }
+
+            producer.try_write(20).unwrap();
+
+            assert_eq!(consumer.try_read(), Some(10));
+            assert_eq!(consumer.try_read(), Some(20));
+            assert_eq!(consumer.try_read(), None);
         }
-        core::mem::forget(guard);
-
-        unsafe {
-            producer.recover_as_exclusive();
-        }
-
-        producer.try_write(20).unwrap();
-
-        assert_eq!(consumer.try_read(), Some(10));
-        assert_eq!(consumer.try_read(), Some(20));
-        assert_eq!(consumer.try_read(), None);
     }
 }

@@ -169,15 +169,16 @@ unsafe fn unmap_file(addr: NonNull<u8>, _size: usize) {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 pub(crate) fn create_temp_shmem_file() -> Result<File, Error> {
     use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temp_dir = std::env::temp_dir();
+
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = temp_dir.join(format!("rts-alloc-{n}.tmp"));
+    let file_name = format!("shaq-{}-{n}.tmp", std::process::id());
+    let path = std::env::temp_dir().join(file_name);
 
     let mut open_options = OpenOptions::new();
     open_options.read(true).write(true).create_new(true);
@@ -194,27 +195,25 @@ pub(crate) fn create_temp_shmem_file() -> Result<File, Error> {
             .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
     }
 
-    let open_result = open_options.open(&path);
+    let file = open_options.open(&path)?;
 
-    match open_result {
-        Ok(file) => {
-            #[cfg(unix)]
-            {
-                std::fs::remove_file(&path)?;
-            }
-            Ok(file)
-        }
-        Err(err) => Err(Error::Io(err)),
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&path)?;
     }
+
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(not(miri))]
     #[test]
     fn test_region_is_minimum_region_aligned() {
         let file = create_temp_shmem_file().expect("temp file");
+
         file.set_len(MINIMUM_REGION_ALIGNMENT as u64)
             .expect("set len");
 

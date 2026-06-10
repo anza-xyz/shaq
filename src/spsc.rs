@@ -614,236 +614,259 @@ impl SharedQueueHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
     use std::{sync::atomic::AtomicU64, time::Duration};
 
-    fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
-        let file = create_temp_shmem_file().unwrap();
-        let producer =
-            unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
-        let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
+    type CreateQueue<T> = fn(usize) -> (Producer<T>, Consumer<T>);
 
-        (file, producer, consumer)
+    fn create_heap_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+        pair(capacity).expect("failed to create heap-backed queue pair")
+    }
+
+    #[cfg(not(miri))]
+    fn create_file_backed_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+        let file = create_temp_shmem_file().expect("failed to create temp file");
+        let file_size = minimum_file_size::<T>(capacity);
+        let producer =
+            unsafe { Producer::create(&file, file_size) }.expect("failed to create producer");
+        let consumer = unsafe { Consumer::join(&file) }.expect("failed to join consumer");
+
+        (producer, consumer)
+    }
+
+    fn test_queue_creators<T: Send>() -> &'static [CreateQueue<T>] {
+        &[
+            create_heap_test_queue::<T>,
+            #[cfg(not(miri))]
+            create_file_backed_test_queue::<T>,
+        ]
     }
 
     #[test]
     fn test_producer_consumer() {
         type Item = AtomicU64;
         const BUFFER_CAPACITY: usize = 1024;
-        const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
+        for create_queue in test_queue_creators::<Item>() {
+            let (mut producer, mut consumer) = create_queue(BUFFER_CAPACITY);
 
-        let (_file, mut producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+            assert_eq!(producer.capacity(), BUFFER_CAPACITY);
+            assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
 
-        assert_eq!(producer.capacity(), BUFFER_CAPACITY);
-        assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
-
-        unsafe {
-            producer
-                .reserve()
-                .expect("Failed to reserve")
-                .as_ref()
-                .store(42, Ordering::Release);
-            assert!(consumer.try_read().is_none()); // not committed yet
-            producer.commit();
-            assert!(consumer.try_read().is_none()); // consumer has not synced yet
-            consumer.sync();
-            let item = consumer.try_read().expect("Failed to read item");
-            assert_eq!(item.load(Ordering::Acquire), 42);
-            assert!(consumer.try_read().is_none()); // no more items to read
-            consumer.finalize();
-            producer.sync();
-
-            // Ensure we can push up to the capacity.
-            for _ in 0..BUFFER_CAPACITY {
-                let spot = producer.reserve().expect("Failed to reserve");
-                spot.as_ref().store(1, Ordering::Release);
-            }
-            assert!(producer.reserve().is_none()); // buffer is full, we cannot reserve more
-            producer.commit();
-            consumer.sync();
-            for _ in 0..BUFFER_CAPACITY {
+            unsafe {
+                producer
+                    .reserve()
+                    .expect("Failed to reserve")
+                    .as_ref()
+                    .store(42, Ordering::Release);
+                assert!(consumer.try_read().is_none()); // not committed yet
+                producer.commit();
+                assert!(consumer.try_read().is_none()); // consumer has not synced yet
+                consumer.sync();
                 let item = consumer.try_read().expect("Failed to read item");
-                assert_eq!(item.load(Ordering::Acquire), 1);
-            }
-            assert!(consumer.try_read().is_none()); // no more items to read
-            consumer.finalize();
-            producer.sync();
+                assert_eq!(item.load(Ordering::Acquire), 42);
+                assert!(consumer.try_read().is_none()); // no more items to read
+                consumer.finalize();
+                producer.sync();
 
-            // Ensure we can reserve again after finalizing/sync.
-            let spot = producer
-                .reserve()
-                .expect("Failed to reserve after finalize");
-            spot.as_ref().store(2, Ordering::Release);
-            producer.commit();
-            consumer.sync();
-            let item = consumer
-                .try_read()
-                .expect("Failed to read item after finalize");
-            assert_eq!(item.load(Ordering::Acquire), 2);
-            consumer.finalize();
+                // Ensure we can push up to the capacity.
+                for _ in 0..BUFFER_CAPACITY {
+                    let spot = producer.reserve().expect("Failed to reserve");
+                    spot.as_ref().store(1, Ordering::Release);
+                }
+                assert!(producer.reserve().is_none()); // buffer is full, we cannot reserve more
+                producer.commit();
+                consumer.sync();
+                for _ in 0..BUFFER_CAPACITY {
+                    let item = consumer.try_read().expect("Failed to read item");
+                    assert_eq!(item.load(Ordering::Acquire), 1);
+                }
+                assert!(consumer.try_read().is_none()); // no more items to read
+                consumer.finalize();
+                producer.sync();
+
+                // Ensure we can reserve again after finalizing/sync.
+                let spot = producer
+                    .reserve()
+                    .expect("Failed to reserve after finalize");
+                spot.as_ref().store(2, Ordering::Release);
+                producer.commit();
+                consumer.sync();
+                let item = consumer
+                    .try_read()
+                    .expect("Failed to read item after finalize");
+                assert_eq!(item.load(Ordering::Acquire), 2);
+                consumer.finalize();
+            }
         }
     }
 
     #[test]
     fn test_join_producer_as_consumer() {
         const BUFFER_CAPACITY: usize = 64;
-        const BUFFER_SIZE: usize = minimum_file_size::<u64>(BUFFER_CAPACITY);
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, consumer) = create_queue(BUFFER_CAPACITY);
+            drop(consumer);
+            // SAFETY: this is the unique consumer for this queue.
+            let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
 
-        let file = create_temp_shmem_file().unwrap();
-        let mut producer =
-            unsafe { Producer::<u64>::create(&file, BUFFER_SIZE) }.expect("create failed");
-        // SAFETY: this is the unique consumer for this queue.
-        let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
-
-        producer.try_write(42).unwrap();
-        producer.commit();
-        consumer.sync();
-        let val = consumer.try_read().expect("read failed");
-        assert_eq!(*val, 42);
-        consumer.finalize();
+            producer.try_write(42).unwrap();
+            producer.commit();
+            consumer.sync();
+            let val = consumer.try_read().expect("read failed");
+            assert_eq!(*val, 42);
+            consumer.finalize();
+        }
     }
 
     #[test]
     fn test_join_consumer_as_producer() {
         const BUFFER_CAPACITY: usize = 64;
-        const BUFFER_SIZE: usize = minimum_file_size::<u64>(BUFFER_CAPACITY);
+        for create_queue in test_queue_creators::<u64>() {
+            let (producer, mut consumer) = create_queue(BUFFER_CAPACITY);
+            drop(producer);
+            // SAFETY: this is the unique producer for this queue.
+            let mut producer = unsafe { consumer.join_as_producer() }.expect("join failed");
 
-        let file = create_temp_shmem_file().unwrap();
-        let mut consumer =
-            unsafe { Consumer::<u64>::create(&file, BUFFER_SIZE) }.expect("create failed");
-        // SAFETY: this is the unique producer for this queue.
-        let mut producer = unsafe { consumer.join_as_producer() }.expect("join failed");
-
-        producer.try_write(99).unwrap();
-        producer.commit();
-        consumer.sync();
-        let val = consumer.try_read().expect("read failed");
-        assert_eq!(*val, 99);
-        consumer.finalize();
+            producer.try_write(99).unwrap();
+            producer.commit();
+            consumer.sync();
+            let val = consumer.try_read().expect("read failed");
+            assert_eq!(*val, 99);
+            consumer.finalize();
+        }
     }
 
     #[test]
     fn test_drop_order_independent() {
         const BUFFER_CAPACITY: usize = 64;
-        const BUFFER_SIZE: usize = minimum_file_size::<u64>(BUFFER_CAPACITY);
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, consumer) = create_queue(BUFFER_CAPACITY);
+            drop(consumer);
+            // SAFETY: this is the unique consumer for this queue.
+            let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
 
-        let file = create_temp_shmem_file().unwrap();
-        let mut producer =
-            unsafe { Producer::<u64>::create(&file, BUFFER_SIZE) }.expect("create failed");
-        // SAFETY: this is the unique consumer for this queue.
-        let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
+            // Write a message then drop.
+            producer.try_write(7).unwrap();
+            producer.commit();
+            drop(producer);
 
-        // Write a message then drop.
-        producer.try_write(7).unwrap();
-        producer.commit();
-        drop(producer);
-
-        // Can still read the message from the shared consumer
-        consumer.sync();
-        let val = consumer.try_read().expect("read after producer drop");
-        assert_eq!(*val, 7);
-        consumer.finalize();
+            // Can still read the message from the shared consumer
+            consumer.sync();
+            let val = consumer.try_read().expect("read after producer drop");
+            assert_eq!(*val, 7);
+            consumer.finalize();
+        }
     }
 
     #[test]
-    fn test_minimum_file_size_rounds_up_capacity() {
-        let file = create_temp_shmem_file().unwrap();
-        let producer = unsafe { Producer::<u64>::create(&file, minimum_file_size::<u64>(3)) }
-            .expect("create failed");
-
-        assert_eq!(producer.capacity(), 4);
+    fn test_capacity_rounds_up() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (producer, _consumer) = create_queue(3);
+            assert_eq!(producer.capacity(), 4);
+        }
     }
 
     #[test]
     fn test_pair_creates_in_process_queue() {
-        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(64);
 
-        assert_eq!(producer.capacity(), 64);
-        assert_eq!(consumer.capacity(), 64);
+            assert_eq!(producer.capacity(), 64);
+            assert_eq!(consumer.capacity(), 64);
 
-        producer.try_write(123).unwrap();
-        producer.commit();
-        consumer.sync();
-        let val = consumer.try_read().expect("read failed");
-        assert_eq!(*val, 123);
-        consumer.finalize();
+            producer.try_write(123).unwrap();
+            producer.commit();
+            consumer.sync();
+            let val = consumer.try_read().expect("read failed");
+            assert_eq!(*val, 123);
+            consumer.finalize();
+        }
     }
 
     #[test]
     fn test_pair_join_as_other_role() {
-        let (mut producer, consumer) = pair::<u64>(64).expect("pair failed");
-        drop(consumer);
-        let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, consumer) = create_queue(64);
+            drop(consumer);
+            let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
 
-        producer.try_write(55).unwrap();
-        producer.commit();
-        consumer.sync();
-        let val = consumer.try_read().expect("read failed");
-        assert_eq!(*val, 55);
-        consumer.finalize();
+            producer.try_write(55).unwrap();
+            producer.commit();
+            consumer.sync();
+            let val = consumer.try_read().expect("read failed");
+            assert_eq!(*val, 55);
+            consumer.finalize();
+        }
     }
 
     #[test]
     fn test_read_ptr_timeout_observes_commit() {
-        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(64);
 
-        let spot = unsafe { producer.reserve() }.expect("reserve failed");
-        unsafe { spot.write(42) };
+            let spot = unsafe { producer.reserve() }.expect("reserve failed");
+            unsafe { spot.write(42) };
 
-        assert!(matches!(
-            consumer.wait_readable_timeout(Duration::ZERO),
-            Err(WaitError::Timeout)
-        ));
+            assert!(matches!(
+                consumer.wait_readable_timeout(Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
 
-        producer.commit();
+            producer.commit();
 
-        let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
-            Ok(ptr) => ptr,
-            Err(WaitError::Timeout) => panic!("read timed out after commit"),
-        };
-        // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
-        assert_eq!(unsafe { *ptr.as_ptr() }, 42);
-        consumer.finalize();
+            let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
+                Ok(ptr) => ptr,
+                Err(WaitError::Timeout) => panic!("read timed out after commit"),
+            };
+            // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
+            assert_eq!(unsafe { *ptr.as_ptr() }, 42);
+            consumer.finalize();
+        }
     }
 
     #[test]
     fn test_wait_readable_max_timeout_does_not_panic() {
-        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(64);
 
-        producer.try_write(1).unwrap();
-        producer.commit();
+            producer.try_write(1).unwrap();
+            producer.commit();
 
-        // `Duration::MAX` overflows `Instant`; the deadline must saturate
-        // instead of panicking. Data is already committed so this returns
-        // immediately.
-        consumer
-            .wait_readable_timeout(Duration::MAX)
-            .expect("wait failed");
+            // `Duration::MAX` overflows `Instant`; the deadline must saturate
+            // instead of panicking. Data is already committed so this returns
+            // immediately.
+            consumer
+                .wait_readable_timeout(Duration::MAX)
+                .expect("wait failed");
+        }
     }
 
     #[test]
     fn test_wait_readable_timeout_cleans_waiter() {
-        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(64);
 
-        assert!(matches!(
-            consumer.wait_readable_timeout(Duration::from_millis(1)),
-            Err(WaitError::Timeout)
-        ));
+            assert!(matches!(
+                consumer.wait_readable_timeout(Duration::from_millis(1)),
+                Err(WaitError::Timeout)
+            ));
 
-        assert!(matches!(
-            consumer.read_ptr_timeout(Duration::from_millis(1)),
-            Err(WaitError::Timeout)
-        ));
+            assert!(matches!(
+                consumer.read_ptr_timeout(Duration::from_millis(1)),
+                Err(WaitError::Timeout)
+            ));
 
-        producer.try_write(9).unwrap();
-        producer.commit();
+            producer.try_write(9).unwrap();
+            producer.commit();
 
-        let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
-            Ok(ptr) => ptr,
-            Err(WaitError::Timeout) => panic!("read timed out after commit"),
-        };
-        // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
-        assert_eq!(unsafe { *ptr.as_ptr() }, 9);
-        consumer.finalize();
+            let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
+                Ok(ptr) => ptr,
+                Err(WaitError::Timeout) => panic!("read timed out after commit"),
+            };
+            // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
+            assert_eq!(unsafe { *ptr.as_ptr() }, 9);
+            consumer.finalize();
+        }
     }
 }
