@@ -348,10 +348,15 @@ fn run_mpmc_consumer(
     exit: Arc<AtomicBool>,
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
+    let wait_timeout = Duration::from_millis(10);
     run_consumer_loop(exit, move || {
-        let Some(batch) = consumer.reserve_read_batch(SYNC_CADENCE) else {
-            consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
-            return;
+        let batch = match consumer.reserve_read_batch_timeout(SYNC_CADENCE, wait_timeout) {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return,
+            Err(WaitError::Timeout) => {
+                consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
         let _ = batch.len();
     });
