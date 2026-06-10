@@ -2,6 +2,8 @@ use crate::{error::WaitError, CacheAlignedAtomicU32};
 use core::{hint::spin_loop, sync::atomic::Ordering};
 use std::time::{Duration, Instant};
 
+type SequenceNumber = u32;
+
 fn deadline_from_timeout(timeout: Duration) -> Instant {
     Instant::now()
         .checked_add(timeout)
@@ -70,7 +72,7 @@ impl WaitState {
         }
     }
 
-    fn register(&self) -> u32 {
+    fn register(&self) -> SequenceNumber {
         self.waiters.fetch_add(1, Ordering::AcqRel);
         self.sequence.load(Ordering::Acquire)
     }
@@ -79,7 +81,7 @@ impl WaitState {
         self.waiters.fetch_sub(1, Ordering::AcqRel);
     }
 
-    fn wait(&self, expected: u32, deadline: Instant) -> Result<(), WaitError> {
+    fn wait(&self, expected: SequenceNumber, deadline: Instant) -> Result<(), WaitError> {
         // Avoid entering the platform wait backend if a wake already advanced
         // the sequence after the caller's post-registration recheck.
         if self.sequence.load(Ordering::Acquire) != expected {
@@ -108,7 +110,7 @@ const MAX_WAKE_COUNT: u32 = i32::MAX as u32;
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::remaining_until;
+    use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
     use core::sync::atomic::AtomicU32;
     use std::time::{Duration, Instant};
@@ -119,7 +121,7 @@ mod imp {
     /// return success for ordinary wakes and for spurious wakes.
     pub(super) fn wait(
         futex: &AtomicU32,
-        expected: u32,
+        expected: SequenceNumber,
         deadline: Instant,
     ) -> Result<(), WaitError> {
         loop {
@@ -198,7 +200,7 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use super::remaining_until;
+    use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
     use core::{
         hint::spin_loop,
@@ -211,7 +213,7 @@ mod imp {
     /// `Ok(())` means the caller should recheck its own condition.
     pub(super) fn wait(
         futex: &AtomicU32,
-        expected: u32,
+        expected: SequenceNumber,
         deadline: Instant,
     ) -> Result<(), WaitError> {
         loop {
