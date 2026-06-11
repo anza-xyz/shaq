@@ -171,10 +171,13 @@ impl<T> Producer<T> {
     /// Commits the reserved position, making it visible to the consumer.
     pub fn commit(&self) {
         let header = self.queue.header();
+        // SeqCst publication followed by the SeqCst waiters load inside
+        // `wake` forms the producer half of the lost-wake-free protocol; see
+        // the `futex` module docs. Release is not sufficient here.
         header
             .write
-            .store(self.queue.cached_write, Ordering::Release);
-        header.wait_state.wake(1);
+            .store(self.queue.cached_write, Ordering::SeqCst);
+        header.wait_state.wake(&header.write, 1);
     }
 
     /// Synchronize the producer's cached read position with the queue's read
@@ -319,15 +322,17 @@ impl<T> Consumer<T> {
     pub fn wait_readable_timeout(&mut self, timeout: Duration) -> Result<(), WaitError> {
         let header = self.queue.header;
         // SAFETY: `header` points to this consumer's live shared queue header.
-        let wait_state = &unsafe { header.as_ref() }.wait_state;
-        wait_state.wait_for(timeout, CONSUMER_WAIT_SPIN_ATTEMPTS, || {
-            self.queue.load_write();
-            if !self.queue.is_empty() {
-                Some(())
-            } else {
-                None
-            }
-        })
+        let header = unsafe { header.as_ref() };
+        header
+            .wait_state
+            .wait_for(&header.write, timeout, CONSUMER_WAIT_SPIN_ATTEMPTS, || {
+                self.queue.load_write();
+                if !self.queue.is_empty() {
+                    Some(())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Blocks until a committed item can be reserved for reading or `timeout`

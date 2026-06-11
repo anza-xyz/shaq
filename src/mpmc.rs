@@ -336,9 +336,12 @@ impl<T> Consumer<T> {
         // SAFETY: `self.queue.header` points to this consumer's live shared
         // queue header.
         let header = unsafe { self.queue.header.as_ref() };
-        header
-            .wait_state
-            .wait_for(timeout, CONSUMER_WAIT_SPIN_ATTEMPTS, check)
+        header.wait_state.wait_for(
+            &header.producer_publication,
+            timeout,
+            CONSUMER_WAIT_SPIN_ATTEMPTS,
+            check,
+        )
     }
 
     /// Makes reserved-but-not-released reads left behind by a previous
@@ -767,10 +770,13 @@ impl SharedQueueHeader {
         while header.producer_publication.load(Ordering::Acquire) != start {
             core::hint::spin_loop();
         }
+        // SeqCst publication followed by the SeqCst waiters load inside
+        // `wake` forms the producer half of the lost-wake-free protocol; see
+        // the `futex` module docs. Release is not sufficient here.
         header
             .producer_publication
-            .store(start.wrapping_add(count), Ordering::Release);
-        header.wait_state.wake(count);
+            .store(start.wrapping_add(count), Ordering::SeqCst);
+        header.wait_state.wake(&header.producer_publication, count);
     }
 
     /// # Safety
