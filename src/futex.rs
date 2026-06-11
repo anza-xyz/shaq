@@ -56,10 +56,9 @@ use std::time::{Duration, Instant};
 /// Snapshot of a queue's 64-bit publication cursor.
 type SequenceNumber = usize;
 
-fn deadline_from_timeout(timeout: Duration) -> Instant {
-    Instant::now()
-        .checked_add(timeout)
-        .expect("timeout duration overflowed Instant")
+/// `None` when the timeout overflows `Instant`: the wait is unbounded.
+fn deadline_from_timeout(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
 }
 
 fn remaining_until(deadline: Instant) -> Result<Duration, WaitError> {
@@ -87,7 +86,8 @@ impl WaitState {
     /// `cursor` is the queue's publication cursor used as the futex word
     /// while sleeping; an advance of `cursor` must imply that `check` can
     /// observe new data. `spin_attempts` controls how many extra checks run
-    /// before registering as a waiter and entering the platform wait backend.
+    /// before registering as a waiter and entering the platform wait backend;
+    /// spinning happens only before the first sleep.
     pub(crate) fn wait_for<T>(
         &self,
         cursor: &AtomicUsize,
@@ -96,18 +96,21 @@ impl WaitState {
         mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, WaitError> {
         let deadline = deadline_from_timeout(timeout);
-        loop {
+
+        if let Some(value) = check() {
+            return Ok(value);
+        }
+
+        // Spin only before the first sleep; once this thread has blocked it
+        // is on the slow path and goes straight back to waiting.
+        for _ in 0..spin_attempts {
+            spin_loop();
             if let Some(value) = check() {
                 return Ok(value);
             }
+        }
 
-            for _ in 0..spin_attempts {
-                spin_loop();
-                if let Some(value) = check() {
-                    return Ok(value);
-                }
-            }
-
+        loop {
             let snapshot = self.register(cursor);
             // Recheck after registering because a producer can publish after
             // the unregistered check and before this thread starts waiting.
@@ -119,10 +122,14 @@ impl WaitState {
 
             // Platform waits can return after a matching wake or a spurious
             // wake, so success only means the caller's condition should be
-            // checked again at the top of the loop.
+            // checked again.
             let wait_result = Self::wait(cursor, snapshot, deadline);
             self.unregister();
             wait_result?;
+
+            if let Some(value) = check() {
+                return Ok(value);
+            }
         }
     }
 
@@ -142,7 +149,7 @@ impl WaitState {
     fn wait(
         cursor: &AtomicUsize,
         expected: SequenceNumber,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<(), WaitError> {
         // Avoid entering the platform wait backend if a publication already
         // advanced the cursor after the caller's post-registration recheck.
@@ -205,19 +212,24 @@ mod imp {
     pub(super) fn wait(
         cursor: &AtomicUsize,
         expected: SequenceNumber,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<(), WaitError> {
         let expected = expected as u32;
         loop {
-            let remaining = remaining_until(deadline)?;
-
-            let timeout_storage = duration_to_timespec(remaining);
-            let timeout_ptr = &timeout_storage as *const libc::timespec;
+            // A null timeout makes `FUTEX_WAIT` block indefinitely.
+            let timeout_storage = match deadline {
+                Some(deadline) => Some(duration_to_timespec(remaining_until(deadline)?)),
+                None => None,
+            };
+            let timeout_ptr = timeout_storage
+                .as_ref()
+                .map_or(core::ptr::null(), |timeout| timeout as *const libc::timespec);
 
             // SAFETY:
             // - `futex_word(cursor)` is a valid, 4-byte aligned pointer into a
             //   live 64-bit atomic; the kernel only reads 32 bits through it.
-            // - `timeout_ptr` points to a live `timespec`.
+            // - `timeout_ptr` is null (block indefinitely) or points to a
+            //   live `timespec`.
             // - `FUTEX_WAIT` only blocks if the value still equals `expected`.
             // - No `FUTEX_PRIVATE_FLAG`: the cursor lives in cross-process
             //   shared memory.
@@ -276,9 +288,16 @@ mod imp {
     /// timeout format expected by futex.
     #[inline]
     const fn duration_to_timespec(duration: Duration) -> libc::timespec {
-        debug_assert!(duration.as_secs() <= libc::time_t::MAX as u64);
+        // Clamp instead of casting: a wrapped-negative `tv_sec` would make
+        // the kernel reject the timespec with EINVAL.
+        let secs = duration.as_secs();
+        let tv_sec = if secs > libc::time_t::MAX as u64 {
+            libc::time_t::MAX
+        } else {
+            secs as libc::time_t
+        };
         libc::timespec {
-            tv_sec: duration.as_secs() as libc::time_t,
+            tv_sec,
             tv_nsec: duration.subsec_nanos() as libc::c_long,
         }
     }
@@ -293,28 +312,28 @@ mod imp {
 mod imp {
     use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
-    use core::{
-        hint::spin_loop,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    /// Busy-waits until `cursor` no longer equals `expected` or timeout elapses.
+    /// Polls until `cursor` no longer equals `expected` or timeout elapses,
+    /// yielding the thread between checks.
     ///
     /// `Ok(())` means the caller should recheck its own condition.
     pub(super) fn wait(
         cursor: &AtomicUsize,
         expected: SequenceNumber,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<(), WaitError> {
         loop {
             if cursor.load(Ordering::SeqCst) != expected {
                 return Ok(());
             }
 
-            remaining_until(deadline)?;
+            if let Some(deadline) = deadline {
+                remaining_until(deadline)?;
+            }
 
-            spin_loop();
+            std::thread::yield_now();
         }
     }
 

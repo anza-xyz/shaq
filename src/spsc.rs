@@ -795,6 +795,21 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_readable_max_timeout_does_not_panic() {
+        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+
+        producer.try_write(1).unwrap();
+        producer.commit();
+
+        // `Duration::MAX` overflows `Instant`; the deadline must saturate
+        // instead of panicking. Data is already committed so this returns
+        // immediately.
+        consumer
+            .wait_readable_timeout(Duration::MAX)
+            .expect("wait failed");
+    }
+
+    #[test]
     fn test_wait_readable_timeout_cleans_waiter() {
         let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
 
