@@ -17,7 +17,6 @@ use std::{
 
 /// Unique identifier for MPMC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
-const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -336,12 +335,9 @@ impl<T> Consumer<T> {
         // SAFETY: `self.queue.header` points to this consumer's live shared
         // queue header.
         let header = unsafe { self.queue.header.as_ref() };
-        header.waiters.wait_for(
-            &header.producer_publication,
-            timeout,
-            CONSUMER_WAIT_SPIN_ATTEMPTS,
-            check,
-        )
+        header
+            .waiters
+            .wait_for(&header.producer_publication, timeout, check)
     }
 
     /// Makes reserved-but-not-released reads left behind by a previous

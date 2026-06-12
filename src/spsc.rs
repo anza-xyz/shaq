@@ -18,7 +18,6 @@ use std::{
 
 /// Unique identifier for SPSC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
-const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
@@ -323,16 +322,14 @@ impl<T> Consumer<T> {
         let header = self.queue.header;
         // SAFETY: `header` points to this consumer's live shared queue header.
         let header = unsafe { header.as_ref() };
-        header
-            .waiters
-            .wait_for(&header.write, timeout, CONSUMER_WAIT_SPIN_ATTEMPTS, || {
-                self.queue.load_write();
-                if !self.queue.is_empty() {
-                    Some(())
-                } else {
-                    None
-                }
-            })
+        header.waiters.wait_for(&header.write, timeout, || {
+            self.queue.load_write();
+            if !self.queue.is_empty() {
+                Some(())
+            } else {
+                None
+            }
+        })
     }
 
     /// Blocks until a committed item can be reserved for reading or `timeout`
@@ -341,12 +338,13 @@ impl<T> Consumer<T> {
     /// The caller must still process all returned pointers and call
     /// [`Self::finalize`] to release consumed capacity back to the producer.
     pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
-        loop {
-            if let Some(ptr) = self.try_read_ptr() {
-                return Ok(ptr);
-            }
-            self.wait_readable_timeout(timeout)?;
-        }
+        let header = self.queue.header;
+        // SAFETY: `header` points to this consumer's live shared queue header.
+        let header = unsafe { header.as_ref() };
+        header.waiters.wait_for(&header.write, timeout, || {
+            self.queue.load_write();
+            self.try_read_ptr()
+        })
     }
 }
 

@@ -64,14 +64,11 @@ impl Waiters {
     ///
     /// `cursor` is the queue's publication cursor used as the futex word
     /// while sleeping; an advance of `cursor` must imply that `check` can
-    /// observe new data. `spin_attempts` controls how many extra checks run
-    /// before registering as a waiter and entering the platform wait backend;
-    /// spinning happens only before the first sleep.
+    /// observe new data.
     pub(crate) fn wait_for<T>(
         &self,
         cursor: &AtomicUsize,
         timeout: Duration,
-        spin_attempts: usize,
         mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, WaitError> {
         let deadline = deadline_from_timeout(timeout);
@@ -82,7 +79,7 @@ impl Waiters {
 
         // Spin only before the first sleep; once this thread has blocked it
         // is on the slow path and goes straight back to waiting.
-        for _ in 0..spin_attempts {
+        for _ in 0..SPIN_ATTEMPTS {
             spin_loop();
             if let Some(value) = check() {
                 return Ok(value);
@@ -167,6 +164,10 @@ impl Waiters {
 }
 
 const MAX_WAKE_COUNT: usize = i32::MAX as usize;
+
+/// Extra `check` attempts before a waiter's first sleep in
+/// [`Waiters::wait_for`].
+const SPIN_ATTEMPTS: usize = 2048;
 
 #[cfg(target_os = "linux")]
 mod imp {
