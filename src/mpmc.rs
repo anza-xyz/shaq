@@ -2,7 +2,7 @@
 
 use crate::{
     error::{Error, WaitError},
-    futex::WaitState,
+    futex::Waiters,
     normalized_capacity,
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
@@ -336,7 +336,7 @@ impl<T> Consumer<T> {
         // SAFETY: `self.queue.header` points to this consumer's live shared
         // queue header.
         let header = unsafe { self.queue.header.as_ref() };
-        header.wait_state.wait_for(
+        header.waiters.wait_for(
             &header.producer_publication,
             timeout,
             CONSUMER_WAIT_SPIN_ATTEMPTS,
@@ -627,8 +627,8 @@ struct SharedQueueHeader {
     /// Consumers advance this in-order after dropping/reading claimed slots.
     /// Producers use it to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
-    /// Wait state used for consumer wait/wake coordination.
-    wait_state: WaitState,
+    /// Consumer wait/wake coordination.
+    waiters: Waiters,
 }
 
 impl SharedQueueHeader {
@@ -723,7 +723,7 @@ impl SharedQueueHeader {
         header.producer_publication.store(0, Ordering::Release);
         header.consumer_reservation.store(0, Ordering::Release);
         header.consumer_release.store(0, Ordering::Release);
-        header.wait_state.initialize();
+        header.waiters.initialize();
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);
@@ -776,7 +776,7 @@ impl SharedQueueHeader {
         header
             .producer_publication
             .store(start.wrapping_add(count), Ordering::Release);
-        header.wait_state.wake(&header.producer_publication, count);
+        header.waiters.wake(&header.producer_publication, count);
     }
 
     /// # Safety

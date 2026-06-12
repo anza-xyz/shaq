@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, WaitError},
-    futex::WaitState,
+    futex::Waiters,
     normalized_capacity,
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
@@ -177,7 +177,7 @@ impl<T> Producer<T> {
         header
             .write
             .store(self.queue.cached_write, Ordering::Release);
-        header.wait_state.wake(&header.write, 1);
+        header.waiters.wake(&header.write, 1);
     }
 
     /// Synchronize the producer's cached read position with the queue's read
@@ -324,7 +324,7 @@ impl<T> Consumer<T> {
         // SAFETY: `header` points to this consumer's live shared queue header.
         let header = unsafe { header.as_ref() };
         header
-            .wait_state
+            .waiters
             .wait_for(&header.write, timeout, CONSUMER_WAIT_SPIN_ATTEMPTS, || {
                 self.queue.load_write();
                 if !self.queue.is_empty() {
@@ -463,8 +463,8 @@ struct SharedQueueHeader {
     // Hot cache lines.
     write: CacheAlignedAtomicSize,
     read: CacheAlignedAtomicSize,
-    /// Wait state used only for consumer wait/wake coordination.
-    wait_state: WaitState,
+    /// Consumer wait/wake coordination.
+    waiters: Waiters,
 }
 
 impl SharedQueueHeader {
@@ -558,7 +558,7 @@ impl SharedQueueHeader {
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
-        header.wait_state.initialize();
+        header.waiters.initialize();
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);

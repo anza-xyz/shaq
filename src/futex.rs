@@ -5,7 +5,7 @@
 //!
 //! # Why no wake is lost
 //!
-//! The producer publishes the cursor (Release), then in [`WaitState::wake`]
+//! The producer publishes the cursor (Release), then in [`Waiters::wake`]
 //! issues a SeqCst fence and loads `waiters`, skipping the wake syscall if
 //! it is zero. A waiter increments `waiters`, issues a SeqCst fence (in
 //! `register`), then rechecks for data before sleeping. SeqCst fences are
@@ -25,7 +25,7 @@
 //! multiple of 2^32 between snapshot and compare the wait oversleeps; that
 //! is bounded by the timeout and astronomically unlikely.
 
-use crate::{error::WaitError, CacheAlignedAtomicU32};
+use crate::{error::WaitError, CacheAlignedAtomicSize};
 use core::{
     hint::spin_loop,
     sync::atomic::{fence, AtomicUsize, Ordering},
@@ -48,14 +48,14 @@ fn remaining_until(deadline: Instant) -> Result<Duration, WaitError> {
 }
 
 #[repr(C)]
-pub(crate) struct WaitState {
+pub(crate) struct Waiters {
     /// Approximate count of waiters registered against the queue's
     /// publication cursor.
-    waiters: CacheAlignedAtomicU32,
+    waiters: CacheAlignedAtomicSize,
 }
 
-impl WaitState {
-    /// Initializes this wait state inside a newly created shared-memory header.
+impl Waiters {
+    /// Initializes the waiter count inside a newly created shared-memory header.
     pub(crate) fn initialize(&self) {
         self.waiters.store(0, Ordering::Release);
     }
@@ -161,12 +161,12 @@ impl WaitState {
             return;
         }
 
-        let count = waiters.min(count.min(MAX_WAKE_COUNT as usize) as u32);
+        let count = waiters.min(count).min(MAX_WAKE_COUNT) as u32;
         imp::wake(cursor, count);
     }
 }
 
-const MAX_WAKE_COUNT: u32 = i32::MAX as u32;
+const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 
 #[cfg(target_os = "linux")]
 mod imp {

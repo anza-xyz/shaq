@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use core::sync::atomic::{AtomicU32, AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 
 // NB: To simplify casting we only support 64bit or wider systems.
 const _: () = assert!(size_of::<usize>() >= size_of::<u64>());
@@ -32,21 +32,6 @@ struct CacheAlignedAtomicSize {
 
 impl core::ops::Deref for CacheAlignedAtomicSize {
     type Target = AtomicUsize;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// `AtomicU32` with 64-byte alignment for wait state.
-#[derive(Default)]
-#[repr(C, align(64))]
-struct CacheAlignedAtomicU32 {
-    inner: AtomicU32,
-}
-
-impl core::ops::Deref for CacheAlignedAtomicU32 {
-    type Target = AtomicU32;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
