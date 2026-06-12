@@ -1,55 +1,34 @@
 //! Futex-backed waiting for the shared-memory queues.
 //!
-//! The futex word is the queue's own 64-bit publication cursor (the write
-//! cursor for spsc, the producer publication cursor for mpmc) rather than a
-//! dedicated sequence word. Every publish advances the cursor
-//! unconditionally, so there is no conditional "bump the sequence only if
-//! waiters are registered" step that a racing waiter could miss.
+//! The futex word is the queue's own 64-bit publication cursor: every publish
+//! advances it, so there is no separate sequence word a waiter could miss.
 //!
-//! # Lost-wake freedom
+//! # Why no wake is lost
 //!
-//! The producer and consumer run a Dekker-style store/load protocol, which is
-//! only correct if all four accesses participate in the SeqCst total order:
+//! The producer publishes the cursor (Release), then in [`WaitState::wake`]
+//! issues a SeqCst fence and loads `waiters`, skipping the wake syscall if
+//! it is zero. A waiter increments `waiters`, issues a SeqCst fence (in
+//! `register`), then rechecks for data before sleeping. SeqCst fences are
+//! totally ordered, and a load after the later fence must see a store made
+//! before the earlier one. So either the producer's load sees the waiter
+//! and wakes it, or the waiter's recheck sees the publication (or
+//! `FUTEX_WAIT` bounces with `EAGAIN`) and it never sleeps. Without the
+//! fences both loads can be stale and a wake can be lost.
 //!
-//! - Producer (at each visibility point): publish the cursor with a SeqCst
-//!   store (P1), then load `waiters` with SeqCst (P2); wake if non-zero.
-//! - Consumer (in [`WaitState::wait_for`]): increment `waiters` with a SeqCst
-//!   RMW (C1), then snapshot the cursor with a SeqCst load and recheck the
-//!   condition (C2); sleep only if the condition still fails.
+//! # The futex word
 //!
-//! In the SeqCst total order, either C1 precedes P2 — then P2 observes
-//! `waiters >= 1` and the producer issues a wake — or P2 precedes C1, hence
-//! P1 precedes C2, and C2 must observe the published cursor (a SeqCst load
-//! ordered after a SeqCst store to the same location cannot read an older
-//! value): the consumer's recheck sees the publication and never sleeps, or
-//! `FUTEX_WAIT`'s in-kernel compare fails with `EAGAIN`. At least one arm
-//! always holds, so the lost-wake cycle (producer skips the wake *and* the
-//! consumer sleeps past the publication) is impossible. Acquire/Release is
-//! not enough here: it permits both P2 and C2 to read stale values
-//! (StoreLoad reordering), which is exactly the lost-wake interleaving.
-//!
-//! # Mixed-width access to the cursor
-//!
-//! All userspace accesses to the cursor are full-width 64-bit atomics; only
-//! the kernel's `FUTEX_WAIT` compare reads 32 bits. The futex address is the
-//! low half of the cursor — the half that changes on every publication — at
-//! byte offset 0 on little-endian targets and 4 on big-endian targets. It is
-//! 4-byte aligned either way, and an aligned 4-byte read cannot tear against
-//! aligned 64-bit atomic writes. Never materialize an `&AtomicU32` into the
-//! cursor in Rust code — only a raw pointer passed to the syscall.
-//!
-//! ABA caveat: if the cursor advances by an exact multiple of 2^32 between
-//! the consumer's snapshot and the kernel's compare, the wait sleeps despite
-//! progress. This is bounded by the caller's timeout and astronomically
-//! unlikely in practice.
-//!
-//! The futex syscalls deliberately do not use `FUTEX_PRIVATE_FLAG`: the
-//! queues live in shared memory mapped by multiple processes.
+//! Userspace accesses the cursor only as a 64-bit atomic; the kernel's
+//! 32-bit `FUTEX_WAIT` compare reads its low half (byte offset 0 on
+//! little-endian, 4 on big-endian), which is 4-byte aligned and cannot tear.
+//! Never materialize an `&AtomicU32` into the cursor in Rust code — only a
+//! raw pointer passed to the syscall. If the cursor advances by an exact
+//! multiple of 2^32 between snapshot and compare the wait oversleeps; that
+//! is bounded by the timeout and astronomically unlikely.
 
 use crate::{error::WaitError, CacheAlignedAtomicU32};
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -113,8 +92,9 @@ impl WaitState {
         loop {
             let snapshot = self.register(cursor);
             // Recheck after registering because a producer can publish after
-            // the unregistered check and before this thread starts waiting.
-            // This is C2 in the module-level ordering argument.
+            // the unregistered check and before this thread starts waiting;
+            // the fence in `register` makes this recheck reliable (see
+            // module docs).
             if let Some(value) = check() {
                 self.unregister();
                 return Ok(value);
@@ -135,11 +115,13 @@ impl WaitState {
 
     /// Registers this thread as a waiter and snapshots the cursor.
     ///
-    /// The SeqCst RMW (C1) followed by the SeqCst cursor load are the
-    /// consumer half of the module-level ordering argument.
+    /// Increment-then-fence is the waiter half of the lost-wake protocol
+    /// (see module docs); the caller must recheck for data after this call,
+    /// before sleeping.
     fn register(&self, cursor: &AtomicUsize) -> SequenceNumber {
-        self.waiters.fetch_add(1, Ordering::SeqCst);
-        cursor.load(Ordering::SeqCst)
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        cursor.load(Ordering::Acquire)
     }
 
     fn unregister(&self) {
@@ -153,7 +135,7 @@ impl WaitState {
     ) -> Result<(), WaitError> {
         // Avoid entering the platform wait backend if a publication already
         // advanced the cursor after the caller's post-registration recheck.
-        if cursor.load(Ordering::SeqCst) != expected {
+        if cursor.load(Ordering::Acquire) != expected {
             return Ok(());
         }
 
@@ -162,16 +144,19 @@ impl WaitState {
 
     /// Wakes up to `count` waiters registered against `cursor`.
     ///
-    /// Callers must publish `cursor` with a SeqCst (full-barrier) operation
-    /// before calling this (P1 in the module-level ordering argument). The
-    /// publication itself must be unconditional — only the wake syscall is
-    /// elided when no waiter is registered.
+    /// Callers must publish `cursor` with (at least) a Release store before
+    /// calling this; the fence here pairs that store with a registering
+    /// waiter (see module docs). The publication itself must be
+    /// unconditional — only the wake syscall is elided when no waiter is
+    /// registered.
     pub(crate) fn wake(&self, cursor: &AtomicUsize, count: usize) {
         debug_assert!(count > 0);
 
-        // P2 in the module-level ordering argument. A plain load keeps the
-        // hot publish path free of RMWs on a line consumers rarely write.
-        let waiters = self.waiters.load(Ordering::SeqCst);
+        // Fence-then-load is the producer half of the lost-wake protocol.
+        // A plain load keeps the hot publish path free of RMWs on a line
+        // consumers rarely write.
+        fence(Ordering::SeqCst);
+        let waiters = self.waiters.load(Ordering::Relaxed);
         if waiters == 0 {
             return;
         }
@@ -223,7 +208,9 @@ mod imp {
             };
             let timeout_ptr = timeout_storage
                 .as_ref()
-                .map_or(core::ptr::null(), |timeout| timeout as *const libc::timespec);
+                .map_or(core::ptr::null(), |timeout| {
+                    timeout as *const libc::timespec
+                });
 
             // SAFETY:
             // - `futex_word(cursor)` is a valid, 4-byte aligned pointer into a
@@ -325,7 +312,7 @@ mod imp {
         deadline: Option<Instant>,
     ) -> Result<(), WaitError> {
         loop {
-            if cursor.load(Ordering::SeqCst) != expected {
+            if cursor.load(Ordering::Acquire) != expected {
                 return Ok(());
             }
 

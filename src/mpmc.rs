@@ -770,12 +770,12 @@ impl SharedQueueHeader {
         while header.producer_publication.load(Ordering::Acquire) != start {
             core::hint::spin_loop();
         }
-        // SeqCst publication followed by the SeqCst waiters load inside
-        // `wake` forms the producer half of the lost-wake-free protocol; see
-        // the `futex` module docs. Release is not sufficient here.
+        // Release publication; `wake` supplies the fence that pairs it with
+        // a registering waiter and must be called unconditionally; see the
+        // `futex` module docs.
         header
             .producer_publication
-            .store(start.wrapping_add(count), Ordering::SeqCst);
+            .store(start.wrapping_add(count), Ordering::Release);
         header.wait_state.wake(&header.producer_publication, count);
     }
 

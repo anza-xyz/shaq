@@ -171,12 +171,12 @@ impl<T> Producer<T> {
     /// Commits the reserved position, making it visible to the consumer.
     pub fn commit(&self) {
         let header = self.queue.header();
-        // SeqCst publication followed by the SeqCst waiters load inside
-        // `wake` forms the producer half of the lost-wake-free protocol; see
-        // the `futex` module docs. Release is not sufficient here.
+        // Release publication; `wake` supplies the fence that pairs it with
+        // a registering waiter and must be called unconditionally; see the
+        // `futex` module docs.
         header
             .write
-            .store(self.queue.cached_write, Ordering::SeqCst);
+            .store(self.queue.cached_write, Ordering::Release);
         header.wait_state.wake(&header.write, 1);
     }
 
