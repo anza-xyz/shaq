@@ -71,11 +71,13 @@ impl Waiters {
         timeout: Duration,
         mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, WaitError> {
-        let deadline = deadline_from_timeout(timeout);
-
         if let Some(value) = check() {
             return Ok(value);
         }
+
+        // Taken only after the first check so an immediately satisfied call
+        // never reads the clock; the timeout still bounds the spin below.
+        let deadline = deadline_from_timeout(timeout);
 
         // Spin only before the first sleep; once this thread has blocked it
         // is on the slow path and goes straight back to waiting.
