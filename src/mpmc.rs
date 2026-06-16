@@ -94,17 +94,17 @@ impl<T> Producer<T> {
 
     /// Writes items from a slice into the queue.
     ///
-    /// Returns `Err()` if there is not enough space.
+    /// Returns `false` if there is not enough space.
     pub fn try_write_slice(&self, items: &[T]) -> bool
     where
         T: Copy,
     {
-        if items.is_empty() {
+        let Some(len) = NonZeroUsize::new(items.len()) else {
             return true;
-        }
+        };
 
         // SAFETY: if successful we write all items below.
-        let mut guard = match unsafe { self.reserve_write_batch(items.len()) } {
+        let mut guard = match unsafe { self.reserve_write_batch(len) } {
             Some(guard) => guard,
             None => return false,
         };
@@ -147,7 +147,7 @@ impl<T> Producer<T> {
     /// # Safety
     /// - The caller must initialize all reserved slots before the batch is dropped.
     #[must_use]
-    pub unsafe fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
+    pub unsafe fn reserve_write_batch(&self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
         let start = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             header: self.queue.header,
@@ -298,7 +298,7 @@ impl<T> Consumer<T> {
     /// released in order they were reserved. Holding a [`ReadBatch`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
-    pub fn reserve_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T>> {
+    pub fn reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         let (start, count) = self.queue.reserve_read_batch(max)?;
         Some(ReadBatch {
             header: self.queue.header,
@@ -313,16 +313,13 @@ impl<T> Consumer<T> {
     /// Attempts to reserve up to `max` values from the queue, waiting up to
     /// `timeout` for a producer to publish data.
     ///
-    /// Returns `Ok(None)` immediately when `max == 0`.
+    /// Returns `Err(WaitError::Timeout)` if no values are available before the
+    /// timeout elapses.
     pub fn reserve_read_batch_timeout(
         &self,
-        max: usize,
+        max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<Option<ReadBatch<'_, T>>, WaitError> {
-        if max == 0 {
-            return Ok(None);
-        }
-
         self.wait_for_read(timeout, || self.reserve_read_batch(max))
             .map(Some)
     }
@@ -448,6 +445,8 @@ impl<T> Clone for SharedQueue<T> {
     }
 }
 
+const NON_ZERO_USIZE_ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
 impl<T> SharedQueue<T> {
     #[inline]
     fn capacity(&self) -> usize {
@@ -455,7 +454,7 @@ impl<T> SharedQueue<T> {
     }
 
     fn reserve_write(&self) -> Option<(NonNull<T>, usize)> {
-        let position = self.reserve_write_batch(1)?;
+        let position = self.reserve_write_batch(NON_ZERO_USIZE_ONE)?;
         let cell_index = position & self.buffer_mask;
         // SAFETY: Mask ensures index is in bounds.
         let cell = unsafe { self.buffer.add(cell_index) };
@@ -463,20 +462,16 @@ impl<T> SharedQueue<T> {
     }
 
     fn reserve_read(&self) -> Option<(NonNull<T>, usize)> {
-        let (position, _) = self.reserve_read_batch(1)?;
+        let (position, _) = self.reserve_read_batch(NON_ZERO_USIZE_ONE)?;
         let cell_index = position & self.buffer_mask;
         // SAFETY: Mask ensures index is in bounds.
         let cell = unsafe { self.buffer.add(cell_index) };
         Some((cell, position))
     }
 
-    fn reserve_write_batch(&self, count: usize) -> Option<usize> {
-        if count == 0 {
-            return None;
-        }
-
+    fn reserve_write_batch(&self, count: NonZeroUsize) -> Option<usize> {
         let capacity = self.capacity();
-        if count > capacity {
+        if count.get() > capacity {
             return None;
         }
 
@@ -487,11 +482,11 @@ impl<T> SharedQueue<T> {
         loop {
             let consumer_release = header.consumer_release.load(Ordering::Acquire);
             let used = producer_reservation.wrapping_sub(consumer_release);
-            let limit = capacity - count;
+            let limit = capacity.wrapping_sub(count.get());
             if used > limit {
                 return None;
             }
-            let new_reservation = producer_reservation.wrapping_add(count);
+            let new_reservation = producer_reservation.wrapping_add(count.get());
             match header.producer_reservation.compare_exchange_weak(
                 producer_reservation,
                 new_reservation,
@@ -508,13 +503,9 @@ impl<T> SharedQueue<T> {
         }
     }
 
-    fn reserve_read_batch(&self, max: usize) -> Option<(usize, usize)> {
-        if max == 0 {
-            return None;
-        }
-
+    fn reserve_read_batch(&self, max: NonZeroUsize) -> Option<(usize, NonZeroUsize)> {
         let capacity = self.capacity();
-        let max = max.min(capacity);
+        let max = max.get().min(capacity);
 
         // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
         let header = unsafe { self.header.as_ref() };
@@ -536,7 +527,10 @@ impl<T> SharedQueue<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some((consumer_reservation, count));
+                    // SAFETY: unwrap is safe here because count is guaranteed to be non-zero:
+                    //         `max` is non-zero by type.
+                    //         `available` is checked to be non-zero.
+                    return Some((consumer_reservation, NonZeroUsize::new(count).unwrap()));
                 }
                 Err(current) => {
                     consumer_reservation = current;
@@ -760,7 +754,11 @@ impl SharedQueueHeader {
 
     /// # Safety
     /// - `start..start+count` must be reserved by this producer.
-    unsafe fn publish_producer_publication(header_ptr: NonNull<Self>, start: usize, count: usize) {
+    unsafe fn publish_producer_publication(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: NonZeroUsize,
+    ) {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.producer_publication.load(Ordering::Acquire) != start {
@@ -771,13 +769,19 @@ impl SharedQueueHeader {
         // `futex` module docs.
         header
             .producer_publication
-            .store(start.wrapping_add(count), Ordering::Release);
-        header.waiters.wake(&header.producer_publication, count);
+            .store(start.wrapping_add(count.get()), Ordering::Release);
+        header
+            .waiters
+            .wake(&header.producer_publication, count.get());
     }
 
     /// # Safety
     /// - `start..start+count` must be reserved by this consumer.
-    unsafe fn publish_consumer_release(header_ptr: NonNull<Self>, start: usize, count: usize) {
+    unsafe fn publish_consumer_release(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: NonZeroUsize,
+    ) {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.consumer_release.load(Ordering::Acquire) != start {
@@ -785,7 +789,7 @@ impl SharedQueueHeader {
         }
         header
             .consumer_release
-            .store(start.wrapping_add(count), Ordering::Release);
+            .store(start.wrapping_add(count.get()), Ordering::Release);
     }
 }
 
@@ -821,7 +825,11 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved producer slot.
         unsafe {
-            SharedQueueHeader::publish_producer_publication(self.header, self.start, 1);
+            SharedQueueHeader::publish_producer_publication(
+                self.header,
+                self.start,
+                NON_ZERO_USIZE_ONE,
+            );
         }
     }
 }
@@ -858,7 +866,11 @@ impl<'a, T> Drop for ReadGuard<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved consumer slot.
         unsafe {
-            SharedQueueHeader::publish_consumer_release(self.header, self.start, 1);
+            SharedQueueHeader::publish_consumer_release(
+                self.header,
+                self.start,
+                NON_ZERO_USIZE_ONE,
+            );
         }
     }
 }
@@ -868,18 +880,19 @@ pub struct WriteBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
     start: usize,
-    count: usize,
+    count: NonZeroUsize,
     buffer_mask: usize,
     _marker: PhantomData<&'a mut T>,
 }
 
 impl<'a, T> WriteBatch<'a, T> {
     pub fn len(&self) -> usize {
-        self.count
+        self.count.get()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        // count is guaranteed to be non-zero by the type, so this batch can never be empty.
+        false
     }
 
     /// Returns a mutable reference to the reserved slot.
@@ -889,7 +902,7 @@ impl<'a, T> WriteBatch<'a, T> {
     /// - `index < count`
     /// - `T` must be valid for any bytes.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut T {
-        debug_assert!(index < self.count);
+        debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_mut() }
@@ -901,7 +914,7 @@ impl<'a, T> WriteBatch<'a, T> {
     /// - The slot is uninitialized; caller must fully initialize `T`.
     /// - `index < count`
     pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
-        debug_assert!(index < self.count);
+        debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
@@ -912,7 +925,7 @@ impl<'a, T> WriteBatch<'a, T> {
     /// # Safety
     /// - `index < count`
     pub unsafe fn write(&mut self, index: usize, value: T) {
-        debug_assert!(index < self.count);
+        debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing
         unsafe { self.buffer.add(position & self.buffer_mask).write(value) }
@@ -933,18 +946,19 @@ pub struct ReadBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
     start: usize,
-    count: usize,
+    count: NonZeroUsize,
     buffer_mask: usize,
     _marker: PhantomData<&'a T>,
 }
 
 impl<'a, T> ReadBatch<'a, T> {
     pub fn len(&self) -> usize {
-        self.count
+        self.count.get()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        // count is guaranteed to be non-zero by the type, so this batch can never be empty.
+        false
     }
 
     /// Returns a reference to the reserved slot.
@@ -952,7 +966,7 @@ impl<'a, T> ReadBatch<'a, T> {
     /// # Safety
     /// - `index` must be less than `self.len()`
     pub unsafe fn as_ref(&self, index: usize) -> &T {
-        debug_assert!(index < self.count);
+        debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading and is initialized.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
@@ -963,7 +977,7 @@ impl<'a, T> ReadBatch<'a, T> {
     /// # Safety
     /// - `index` must be less than `self.len()`
     pub unsafe fn as_ptr(&self, index: usize) -> *const T {
-        debug_assert!(index < self.count);
+        debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
@@ -974,7 +988,7 @@ impl<'a, T> ReadBatch<'a, T> {
     /// # Safety
     /// - `index` must be less than `self.len()`
     pub unsafe fn read(&self, index: usize) -> T {
-        debug_assert!(index < self.count);
+        debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
         unsafe { self.buffer.add(position & self.buffer_mask).read() }
@@ -1067,17 +1081,15 @@ mod tests {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         assert!(matches!(
-            consumer.reserve_read_batch_timeout(4, Duration::ZERO),
+            consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
             Err(WaitError::Timeout)
-        ));
-        assert!(matches!(
-            consumer.reserve_read_batch_timeout(0, Duration::ZERO),
-            Ok(None)
         ));
 
         assert!(producer.try_write_slice(&[1, 2, 3]));
 
-        let batch = match expect_wait_ok(consumer.reserve_read_batch_timeout(4, Duration::ZERO)) {
+        let batch = match expect_wait_ok(
+            consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
+        ) {
             Some(batch) => batch,
             None => panic!("batch should be returned"),
         };
@@ -1108,7 +1120,9 @@ mod tests {
     fn test_reserve_batch_and_try_read_batch() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
-        let mut batch = unsafe { producer.reserve_write_batch(4) }.expect("reserve_batch failed");
+        let batch_size = NonZeroUsize::new(4).unwrap();
+        let mut batch =
+            unsafe { producer.reserve_write_batch(batch_size) }.expect("reserve_batch failed");
         for index in 0..batch.len() {
             unsafe {
                 *batch.as_mut_ptr(index) = index as u64;
@@ -1117,7 +1131,7 @@ mod tests {
         drop(batch);
 
         let batch = consumer
-            .reserve_read_batch(4)
+            .reserve_read_batch(batch_size)
             .expect("try_read_batch failed");
         for index in 0..batch.len() {
             unsafe {
@@ -1132,15 +1146,16 @@ mod tests {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         unsafe {
-            assert!(producer.reserve_write_batch(0).is_none());
-            assert!(producer.reserve_write_batch(BUFFER_CAPACITY + 1).is_none());
+            assert!(producer
+                .reserve_write_batch(NonZeroUsize::new(BUFFER_CAPACITY + 1).unwrap())
+                .is_none());
         }
 
         for i in 0..4 {
             assert_eq!(producer.try_write(i as Item), Ok(()));
         }
         let batch = consumer
-            .reserve_read_batch(5)
+            .reserve_read_batch(NonZeroUsize::new(5).unwrap())
             .expect("try_read_batch up-to failed");
         assert_eq!(batch.len(), 4);
         for index in 0..batch.len() {

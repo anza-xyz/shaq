@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -13,7 +14,7 @@ pub struct Item {
 }
 
 // Synchronize/Batch size cadence.
-pub const SYNC_CADENCE: usize = 1024;
+pub const SYNC_CADENCE: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 pub fn setup_exit_handler() -> Arc<AtomicBool> {
     let exit = Arc::new(AtomicBool::new(false));

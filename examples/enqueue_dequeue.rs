@@ -197,7 +197,7 @@ fn run_spsc_producer(
         move || {
             producer.sync();
             let mut produced = 0;
-            for _ in 0..SYNC_CADENCE {
+            for _ in 0..SYNC_CADENCE.get() {
                 // SAFETY: reserve() yields a valid write slot.
                 let Some(mut spot) = (unsafe { producer.reserve() }) else {
                     producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
@@ -230,7 +230,7 @@ fn run_spsc_consumer(
             }
         }
 
-        for _ in 1..SYNC_CADENCE {
+        for _ in 1..SYNC_CADENCE.get() {
             if consumer.try_read().is_none() {
                 break;
             }
