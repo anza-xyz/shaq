@@ -319,9 +319,8 @@ impl<T> Consumer<T> {
         &self,
         max: NonZeroUsize,
         timeout: Duration,
-    ) -> Result<Option<ReadBatch<'_, T>>, WaitError> {
+    ) -> Result<ReadBatch<'_, T>, WaitError> {
         self.wait_for_read(timeout, || self.reserve_read_batch(max))
-            .map(Some)
     }
 
     fn wait_for_read<R>(
@@ -1087,12 +1086,9 @@ mod tests {
 
         assert!(producer.try_write_slice(&[1, 2, 3]));
 
-        let batch = match expect_wait_ok(
+        let batch = expect_wait_ok(
             consumer.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
-        ) {
-            Some(batch) => batch,
-            None => panic!("batch should be returned"),
-        };
+        );
         assert_eq!(batch.len(), 3);
         for (index, expected) in [1, 2, 3].into_iter().enumerate() {
             assert_eq!(unsafe { batch.read(index) }, expected);

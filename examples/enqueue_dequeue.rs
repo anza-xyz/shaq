@@ -351,8 +351,7 @@ fn run_mpmc_consumer(
     let wait_timeout = Duration::from_millis(10);
     run_consumer_loop(exit, move || {
         let batch = match consumer.reserve_read_batch_timeout(SYNC_CADENCE, wait_timeout) {
-            Ok(Some(batch)) => batch,
-            Ok(None) => return,
+            Ok(batch) => batch,
             Err(WaitError::Timeout) => {
                 consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                 return;
