@@ -335,6 +335,20 @@ impl<T> Consumer<T> {
     /// Blocks until a committed item can be reserved for reading or `timeout`
     /// elapses.
     ///
+    /// The caller must still call [`Self::finalize`] to release consumed
+    /// capacity back to the producer.
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<&T, WaitError> {
+        // SAFETY: `read_ptr_timeout` returns a pointer to properly aligned
+        //         location for `T`.
+        //         IF producer properly wrote items, or T is POD, it is
+        //         safe to convert to reference here.
+        self.read_ptr_timeout(timeout)
+            .map(|p| unsafe { p.as_ref() })
+    }
+
+    /// Blocks until a committed item can be reserved for reading or `timeout`
+    /// elapses.
+    ///
     /// The caller must still process all returned pointers and call
     /// [`Self::finalize`] to release consumed capacity back to the producer.
     pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
