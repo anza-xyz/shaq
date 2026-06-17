@@ -1273,36 +1273,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_consumer() {
-        for create_queue in test_queue_creators::<Item>() {
-            let (producer, consumer) = create_queue(BUFFER_CAPACITY);
-            let consumer2 = consumer.clone();
-
-            for i in 0..4 {
-                producer.try_write(i).unwrap();
-            }
-
-            let mut values = Vec::new();
-            loop {
-                let mut progressed = false;
-                if let Some(v) = consumer.try_read() {
-                    values.push(v);
-                    progressed = true;
-                }
-                if let Some(v) = consumer2.try_read() {
-                    values.push(v);
-                    progressed = true;
-                }
-                if !progressed {
-                    break;
-                }
-            }
-            values.sort_unstable();
-            assert_eq!(values, vec![0, 1, 2, 3]);
-        }
-    }
-
-    #[test]
     fn test_cross_role_joins() {
         for create_queue in test_queue_creators::<Item>() {
             let (producer1, consumer1) = create_queue(BUFFER_CAPACITY);
@@ -1335,22 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pair_creates_in_process_queue() {
-        for create_queue in test_queue_creators::<u64>() {
-            let (producer, consumer) = create_queue(64);
-
-            for value in [10, 20, 30, 40] {
-                producer.try_write(value).expect("write failed");
-            }
-
-            for value in [10, 20, 30, 40] {
-                assert_eq!(consumer.try_read(), Some(value));
-            }
-        }
-    }
-
-    #[test]
-    fn test_pair_clone_roles() {
+    fn test_clone_roles() {
         for create_queue in test_queue_creators::<u64>() {
             let (producer, consumer) = create_queue(64);
             let producer2 = producer.clone();

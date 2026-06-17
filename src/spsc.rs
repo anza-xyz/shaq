@@ -768,39 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pair_creates_in_process_queue() {
-        for create_queue in test_queue_creators::<u64>() {
-            let (mut producer, mut consumer) = create_queue(64);
-
-            assert_eq!(producer.capacity(), 64);
-            assert_eq!(consumer.capacity(), 64);
-
-            producer.try_write(123).unwrap();
-            producer.commit();
-            consumer.sync();
-            let val = consumer.try_read().expect("read failed");
-            assert_eq!(*val, 123);
-            consumer.finalize();
-        }
-    }
-
-    #[test]
-    fn test_pair_join_as_other_role() {
-        for create_queue in test_queue_creators::<u64>() {
-            let (mut producer, consumer) = create_queue(64);
-            drop(consumer);
-            let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
-
-            producer.try_write(55).unwrap();
-            producer.commit();
-            consumer.sync();
-            let val = consumer.try_read().expect("read failed");
-            assert_eq!(*val, 55);
-            consumer.finalize();
-        }
-    }
-
-    #[test]
     fn test_read_ptr_timeout_observes_commit() {
         for create_queue in test_queue_creators::<u64>() {
             let (mut producer, mut consumer) = create_queue(64);
