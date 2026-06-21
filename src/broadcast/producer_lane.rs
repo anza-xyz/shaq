@@ -262,12 +262,15 @@ impl<T> ProducerLane<T> {
         Some(start)
     }
 
-    /// Publishes the `count` sequences reserved at `start`, making them visible
-    /// to consumers. Call in reservation order, after the cells are written.
-    pub(crate) fn publish(&mut self, start: usize, count: NonZeroUsize) {
+    /// Publishes the next `count` reserved sequences, making them visible to
+    /// consumers. Call after the cells are written. A lane has a single producer,
+    /// so the publication cursor only advances here and always sits at the start
+    /// of the just-reserved batch; advancing it by `count` publishes exactly that
+    /// batch.
+    pub(crate) fn publish(&mut self, count: NonZeroUsize) {
         self.header()
             .producer_publication
-            .store(start.wrapping_add(count.get()), Ordering::Release);
+            .fetch_add(count.get(), Ordering::Release);
     }
 
     /// Joins consumer `consumer_index` to this lane and returns the sequence it
@@ -380,7 +383,7 @@ mod tests {
         };
         // SAFETY: the cell is reserved and not yet published.
         unsafe { lane.payload_ptr(start).as_ptr().write(value) };
-        lane.publish(start, one);
+        lane.publish(one);
         true
     }
 
@@ -424,7 +427,7 @@ mod tests {
         // Reserved but not yet visible.
         assert_eq!(lane.reserved(), 3);
         assert_eq!(lane.published(), 0);
-        lane.publish(start, count);
+        lane.publish(count);
         assert_eq!(lane.published(), 3);
         for offset in 0..3usize {
             assert_eq!(read(&lane, offset), offset as u64 + 1);
