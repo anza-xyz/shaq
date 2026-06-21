@@ -9,6 +9,8 @@ pub enum Error {
     Allocation(std::alloc::Layout),
     Io(std::io::Error),
     Mmap(std::io::Error),
+    ProducerSlotsExhausted,
+    ConsumerSlotsExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,8 @@ impl Display for Error {
             ),
             Self::Io(err) => write!(f, "io; err={err}"),
             Self::Mmap(err) => write!(f, "mmap; err={err}"),
+            Self::ProducerSlotsExhausted => write!(f, "producer slots exhausted"),
+            Self::ConsumerSlotsExhausted => write!(f, "consumer slots exhausted"),
         }
     }
 }

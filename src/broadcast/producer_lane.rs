@@ -1,5 +1,5 @@
-// The broadcast handles that drive these lanes (Producer/Consumer) land in later
-// commits, so much of this API has no non-test callers yet.
+// Some of this lane API is only used by the broadcast's consumer side, so it has
+// no non-test callers here; dead-code warnings are silenced.
 #![allow(dead_code)]
 
 use core::marker::PhantomData;
@@ -85,6 +85,23 @@ impl<T> ProducerLane<T> {
     pub(crate) fn block_size(capacity: u32, consumer_slots: usize) -> usize {
         ring_offset::<T>(consumer_slots)
             .wrapping_add((capacity as usize).wrapping_mul(size_of::<T>()))
+    }
+
+    /// Required alignment of a lane block: the `LaneHeader`'s alignment.
+    ///
+    /// The block starts with the `LaneHeader`; the trailing `[T]` ring is aligned
+    /// by its offset within the block (`ring_offset` is a multiple of
+    /// `align_of::<T>()`), so the block itself only needs the header's alignment —
+    /// as long as `T`'s alignment divides it, which holds for any normal payload
+    /// (alignment ≤ 64). Asserted so an over-aligned `T` is a clear compile error.
+    pub(crate) const fn block_align() -> usize {
+        const {
+            assert!(
+                align_of::<T>() <= align_of::<LaneHeader>(),
+                "payload alignment exceeds the lane header alignment",
+            );
+        }
+        align_of::<LaneHeader>()
     }
 
     /// Initializes a lane block: ownership/cursors zeroed, every consumer slot
