@@ -1,12 +1,22 @@
-//! Multi-producer / multi-consumer broadcast queue.
+//! Multi-producer / multi-consumer broadcast queue in shared memory.
 //!
-//! Each producer owns a [`producer_lane::ProducerLane`]; every consumer reads
-//! every lane. This module wires the shared region (header + global consumer
-//! ownership + producer-lane blocks) and the [`Producer`] handle.
-
-// Some of this (e.g. the global consumer-ownership table, used by the consumer
-// side) has no non-test callers, so dead-code warnings are silenced.
-#![allow(dead_code)]
+//! Each producer owns its own ring (a `ProducerLane`); every consumer reads
+//! every lane, so each published item reaches all consumers. Backpressure is
+//! lossless — a producer cannot overwrite a cell until every consumer has read
+//! it.
+//!
+//! [`Producer`] writes via by-value [`Producer::try_write`], an in-place
+//! [`WriteGuard`], or a [`WriteBatch`]; [`Consumer`] reads via
+//! [`Consumer::try_read`], a [`ReadGuard`], or a [`ReadBatch`], with blocking
+//! `*_timeout` variants that park on the queue's futex when idle. A consumer
+//! joins at the current frontier, or with the `*_from_backlog` variants up to one
+//! ring behind it to also read data published before it joined. After a crash, a
+//! lane or consumer index can be taken over with `recover` (resuming where the
+//! dead owner was) or returned to the pool with `force_release`.
+//!
+//! The region is a fixed header (magic/version, the global consumer-ownership
+//! table, and the blocked-consumer wake counter) followed by one lane block per
+//! producer.
 
 mod producer_lane;
 

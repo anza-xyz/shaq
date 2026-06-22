@@ -1,6 +1,7 @@
-// Some of this lane API is only used by the broadcast's consumer side, so it has
-// no non-test callers here; dead-code warnings are silenced.
-#![allow(dead_code)]
+//! One producer's lane: a self-contained shared-memory block holding the lane's
+//! ownership state, its reserve/publication cursors, the per-consumer reserve
+//! limits, and the ring of payloads. See [`ProducerLane`]. (The blocked-consumer
+//! wake state is global, in the queue header, not per-lane.)
 
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
