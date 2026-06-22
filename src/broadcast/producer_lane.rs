@@ -65,18 +65,18 @@ const fn consumers_offset() -> usize {
 }
 
 #[inline]
-fn ring_offset<T>(consumer_slots: usize) -> usize {
+fn ring_offset<T>(consumer_slots: usize) -> Option<usize> {
     consumers_offset()
-        .wrapping_add(consumer_slots.wrapping_mul(size_of::<CacheAlignedAtomicSize>()))
-        .next_multiple_of(align_of::<T>())
+        .checked_add(consumer_slots.checked_mul(size_of::<CacheAlignedAtomicSize>())?)?
+        .checked_next_multiple_of(align_of::<T>())
 }
 
 impl<T> ProducerLane<T> {
     /// Bytes needed for one lane block of `capacity` payload cells and
     /// `consumer_slots` consumer slots.
-    pub(crate) fn block_size(capacity: u32, consumer_slots: usize) -> usize {
-        ring_offset::<T>(consumer_slots)
-            .wrapping_add((capacity as usize).wrapping_mul(size_of::<T>()))
+    pub(crate) fn block_size(capacity: u32, consumer_slots: usize) -> Option<usize> {
+        ring_offset::<T>(consumer_slots)?
+            .checked_add((capacity as usize).checked_mul(size_of::<T>())?)
     }
 
     /// Required alignment of a lane block: the `LaneHeader`'s alignment.
@@ -147,7 +147,7 @@ impl<T> ProducerLane<T> {
             mask: (capacity as usize).wrapping_sub(1),
             consumer_slots,
             consumers_offset: consumers_offset(),
-            ring_offset: ring_offset::<T>(consumer_slots),
+            ring_offset: ring_offset::<T>(consumer_slots).expect("validated lane layout"),
             _marker: PhantomData,
         }
     }
@@ -299,20 +299,20 @@ impl<T> ProducerLane<T> {
     /// global consumer-ownership state, so this slot has a single writer (the
     /// owning consumer): no CAS is needed — a release store publishes the limit.
     ///
-    /// The start is normally the lane's **current reservation**: the freshest
-    /// sequence the producer has not yet written, so its cell cannot already be
-    /// overwritten and there is a full ring of margin before the producer could
-    /// lap it. With `from_backlog`, the start is instead up to one ring behind the
-    /// reservation (the oldest still-available item, floored at the first
-    /// sequence), so a consumer on a slow queue can read data published before it
-    /// joined. If the producer has already lapped that point, the handshake below
-    /// fast-forwards to the frontier — you cannot read cells already being recycled.
+    /// The start is normally the lane's **current publication**: the next value
+    /// to become visible after this join. With `from_backlog`, the start is
+    /// instead up to one ring behind the publication (the oldest published item
+    /// still guaranteed to be in the ring, floored at the first sequence), so a
+    /// consumer on a slow queue can read data published before it joined. If the
+    /// producer has already lapped that point, the handshake below fast-forwards
+    /// to the reservation frontier — you cannot read cells already being
+    /// recycled.
     ///
     /// The slot stores the **reserve limit** `start + capacity` (see the type
-    /// docs). Reading the reservation and publishing the limit are not atomic,
+    /// docs). Reading the publication and publishing the limit are not atomic,
     /// so the producer can lap the start cell in the gap; the limit pins the
-    /// producer once visible, so re-reading the reservation detects such a lap
-    /// and fast-forwards to the now-pinned frontier.
+    /// producer once visible, so reading the reservation detects such a lap and
+    /// fast-forwards to the now-pinned frontier.
     ///
     /// That lap detection is a StoreLoad handshake against the producer's
     /// `reserve`: a `SeqCst` fence here (between publishing the limit and
@@ -329,13 +329,13 @@ impl<T> ProducerLane<T> {
         let slot = self.consumer_limit(consumer_index);
 
         let start = {
-            let reserved = self.reserved();
+            let published = self.published();
             if from_backlog {
                 // Up to one ring behind the frontier (floored at the first
                 // sequence): the oldest item still guaranteed to be in the ring.
-                reserved.saturating_sub(capacity)
+                published.saturating_sub(capacity)
             } else {
-                reserved
+                published
             }
         };
         let limit = start.wrapping_add(capacity);
@@ -410,7 +410,7 @@ mod tests {
         capacity: u32,
         consumer_slots: usize,
     ) -> (std::sync::Arc<Region>, ProducerLane<Payload>) {
-        let size = ProducerLane::<Payload>::block_size(capacity, consumer_slots);
+        let size = ProducerLane::<Payload>::block_size(capacity, consumer_slots).unwrap();
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).unwrap();
         // SAFETY: freshly allocated block, initialized once.
         unsafe { ProducerLane::<Payload>::init(region.addr(), consumer_slots) };
@@ -534,14 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn join_starts_at_current_reservation() {
+    fn join_starts_at_current_publication() {
         let (_region, mut lane) = lane(8, 1);
         assert!(lane.try_acquire());
-        // Publish 3 with no consumer (free overwrite), advancing the reservation.
+        // Publish 3 with no consumer (free overwrite), advancing the publication.
         for value in 0..3u64 {
             assert!(publish_value(&mut lane, value));
         }
-        // A consumer joining now starts at the reservation, not 0.
+        // A consumer joining now starts at the publication, not 0.
         assert_eq!(lane.join_consumer(0, false), 3);
     }
 

@@ -42,7 +42,7 @@ use std::time::Duration;
 use crate::error::{Error, WaitError};
 use crate::futex::{Waiters, SPIN_ATTEMPTS};
 use crate::shmem::Region;
-use crate::{normalized_capacity, CacheAlignedAtomicSize, VERSION};
+use crate::{CacheAlignedAtomicSize, VERSION};
 
 use producer_lane::ProducerLane;
 
@@ -92,8 +92,11 @@ struct Layout {
 
 impl Layout {
     fn new<T>(config: &BroadcastConfig) -> Option<Self> {
-        let capacity = normalized_capacity(config.capacity);
-        if capacity == 0 || capacity > u32::MAX as usize {
+        if config.capacity == 0 {
+            return None;
+        }
+        let capacity = config.capacity.checked_next_power_of_two()?;
+        if capacity > u32::MAX as usize {
             return None;
         }
         // `consumer_slots == 0` is allowed: producers then run free (no consumer
@@ -116,8 +119,8 @@ impl Layout {
         let producer_blocks_offset = consumer_state_offset
             .checked_add(consumer_state_bytes)?
             .checked_next_multiple_of(block_align)?;
-        let block_stride = ProducerLane::<T>::block_size(capacity, config.consumer_slots)
-            .next_multiple_of(block_align);
+        let block_stride = ProducerLane::<T>::block_size(capacity, config.consumer_slots)?
+            .checked_next_multiple_of(block_align)?;
         let producer_blocks_bytes = block_stride.checked_mul(config.producer_slots)?;
         let total = producer_blocks_offset.checked_add(producer_blocks_bytes)?;
 
@@ -140,8 +143,8 @@ impl Layout {
             producer_slots: header.producer_slots as usize,
             consumer_slots: header.consumer_slots as usize,
         };
-        // `capacity` is already a power of two; `normalized_capacity` is a no-op,
-        // so the recomputed layout must match the stored capacity exactly.
+        // `capacity` is already a power of two, so the recomputed layout must
+        // match the stored capacity exactly.
         let layout = Layout::new::<T>(&config).ok_or(Error::InvalidBufferSize)?;
         if layout.capacity as usize != capacity || region_size < layout.total {
             return Err(Error::InvalidBufferSize);
@@ -518,7 +521,7 @@ impl<T> Producer<T> {
     }
 
     /// Joins the same queue as a consumer (sharing the mapping). The consumer
-    /// starts at each lane's current reservation, so it only observes items
+    /// starts at each lane's current publication, so it only observes items
     /// published after it joins.
     pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
         Consumer::from_queue(self.queue.clone(), false)
@@ -853,11 +856,10 @@ impl<T> Consumer<T> {
         let mut lane = self.scan_start_lane;
         for _ in 0..producer_slots {
             let next = self.next_by_lane[lane];
-            if self.lanes[lane].published().wrapping_sub(next) > 0 {
+            // Cursor wrap is not supported - simple comparison works here.
+            if self.lanes[lane].published() > next {
                 return Some((lane, next));
             }
-            // `lane < producer_slots`, so the wrap is a conditional subtract, not
-            // a division.
             lane = lane.wrapping_add(1);
             if lane == producer_slots {
                 lane = 0;
@@ -1269,6 +1271,26 @@ mod tests {
     }
 
     #[test]
+    fn layout_rejects_oversized_capacity_without_panicking() {
+        let config = BroadcastConfig {
+            capacity: usize::MAX,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        assert!(Layout::new::<Payload>(&config).is_none());
+    }
+
+    #[test]
+    fn layout_rejects_zero_capacity() {
+        let config = BroadcastConfig {
+            capacity: 0,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        assert!(Layout::new::<Payload>(&config).is_none());
+    }
+
+    #[test]
     fn every_consumer_observes_every_item_in_order() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
@@ -1461,13 +1483,37 @@ mod tests {
             for value in 0..3u64 {
                 assert!(p.try_write(value).is_ok());
             }
-            // Joins at the current reservation (3), so it sees only later items.
+            // Joins at the current publication (3), so it sees only later items.
             let mut c = p.join_as_consumer().unwrap();
             assert!(p.try_write(99).is_ok());
             // SAFETY: `Payload` is `u64`.
             assert_eq!(unsafe { c.try_read() }, Some(99));
             assert_eq!(unsafe { c.try_read() }, None);
         }
+    }
+
+    #[test]
+    fn consumer_joining_during_unpublished_reservation_waits_for_publication() {
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        let queue = recovery_queue(&config);
+        let mut producer = Producer::from_queue(queue.clone()).unwrap();
+
+        // SAFETY: the reserved slot is initialized before the guard is dropped.
+        let mut guard = unsafe { producer.reserve_write() }.unwrap();
+        let mut consumer = Consumer::from_queue(queue.clone(), false).unwrap();
+
+        assert!(consumer.reserve_read().is_none());
+        // SAFETY: `Payload` is `u64`, valid POD-like bytes.
+        unsafe { *guard.as_mut_ref() = 42 };
+        drop(guard);
+
+        // SAFETY: `Payload` is `u64`, valid POD-like bytes.
+        assert_eq!(unsafe { consumer.try_read() }, Some(42));
+        assert_eq!(unsafe { consumer.try_read() }, None);
     }
 
     #[test]
