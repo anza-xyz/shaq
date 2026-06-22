@@ -14,6 +14,16 @@
 //! lane or consumer index can be taken over with `recover` (resuming where the
 //! dead owner was) or returned to the pool with `force_release`.
 //!
+//! Payloads are treated as shared-memory bytes, not as ordinary Rust-owned
+//! values. In practice `T` should be POD-like: no process-local pointers, no
+//! references whose provenance matters in another process, no destructor that
+//! must run, and safe to duplicate by raw reads. This is stricter than a normal
+//! queue because every broadcast consumer can read the same cell.
+//!
+//! Recovery is an externally serialized operation. Do not race recovery or
+//! force-release with other recovery operations, with joins/drops for the same
+//! queue, or with a still-live owner of the index/lane being recovered.
+//!
 //! The region is a fixed header (magic/version, the global consumer-ownership
 //! table, and the blocked-consumer wake counter) followed by one lane block per
 //! producer.
@@ -424,7 +434,9 @@ impl<T> Producer<T> {
     /// - `file` must be initialized as a broadcast queue exactly once (by the
     ///   designated initializer), and not resized while any handle is joined.
     /// - All producers/consumers for `file` must use the same `T`; queued values
-    ///   must be valid to read/overwrite as shared-memory bytes in each process.
+    ///   must be POD-like shared-memory bytes: valid in every process that reads
+    ///   them, safe to overwrite without running a destructor, and safe for every
+    ///   consumer to duplicate by raw reads.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
         let queue = unsafe { SharedQueue::create(file, &config) }?;
@@ -463,6 +475,9 @@ impl<T> Producer<T> {
     /// - All of [`Self::join`]'s requirements, plus: the producer that owned
     ///   `index` must be dead and no other live handle may use that lane — two
     ///   producers on one lane corrupts it.
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::join(file) }?;
@@ -485,6 +500,8 @@ impl<T> Producer<T> {
     /// # Safety
     /// - As [`Self::join`], plus: the producer that owned `index` must be dead and
     ///   no other live handle may use that lane.
+    /// - Force-release must be serialized externally, with the same restrictions
+    ///   as [`Self::recover`].
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::<T>::join(file) }?;
@@ -517,7 +534,9 @@ impl<T> Producer<T> {
     /// Publishes one value, or returns it on backpressure (the slowest consumer
     /// has not freed the cell that publishing would overwrite).
     pub fn try_write(&mut self, value: T) -> Result<(), T> {
-        match self.reserve_write() {
+        // SAFETY: on successful reservation, `value` is written before the guard
+        // is dropped and publishes the cell.
+        match unsafe { self.reserve_write() } {
             Some(guard) => {
                 guard.write(value);
                 Ok(())
@@ -526,11 +545,38 @@ impl<T> Producer<T> {
         }
     }
 
+    /// Writes items from a slice into this producer's lane.
+    ///
+    /// Returns `false` if there is not enough space.
+    pub fn try_write_slice(&mut self, items: &[T]) -> bool
+    where
+        T: Copy,
+    {
+        let Some(len) = NonZeroUsize::new(items.len()) else {
+            return true;
+        };
+
+        // SAFETY: if reservation succeeds, every reserved cell is written below.
+        let mut batch = match unsafe { self.reserve_write_batch(len) } {
+            Some(batch) => batch,
+            None => return false,
+        };
+
+        for (index, item) in items.iter().copied().enumerate() {
+            // SAFETY: `index` comes from enumerating exactly `len` items.
+            unsafe { batch.write(index, item) };
+        }
+        true
+    }
+
     /// Reserves a single cell for an in-place write, or `None` on backpressure.
-    /// The cell becomes visible when the returned guard is dropped; the caller
-    /// must write it first.
+    /// The cell becomes visible when the returned guard is dropped.
+    ///
+    /// # Safety
+    /// - The caller must initialize the reserved cell before the guard is
+    ///   dropped.
     #[must_use]
-    pub fn reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
+    pub unsafe fn reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
         let start = self.lane.reserve(NonZeroUsize::MIN)?;
         Some(WriteGuard {
             producer: self,
@@ -539,10 +585,13 @@ impl<T> Producer<T> {
     }
 
     /// Reserves `count` consecutive cells for in-place writes, or `None` on
-    /// backpressure. The cells become visible when the returned batch is dropped;
-    /// the caller must write all of them first.
+    /// backpressure. The cells become visible when the returned batch is dropped.
+    ///
+    /// # Safety
+    /// - The caller must initialize every reserved cell before the batch is
+    ///   dropped.
     #[must_use]
-    pub fn reserve_write_batch(&mut self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
+    pub unsafe fn reserve_write_batch(&mut self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
         let start = self.lane.reserve(count)?;
         Some(WriteBatch {
             producer: self,
@@ -672,7 +721,8 @@ impl<T> Consumer<T> {
     ///
     /// # Safety
     /// - Same as [`Producer::create`]: `file` initialized as a queue exactly once
-    ///   (the consumer may be the initializer), same `T` across all handles.
+    ///   (the consumer may be the initializer), same POD-like `T` across all
+    ///   handles.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
         let queue = unsafe { SharedQueue::create(file, &config) }?;
@@ -739,6 +789,9 @@ impl<T> Consumer<T> {
     /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
     ///   `index` must be dead and no other live handle may use it — two consumers
     ///   sharing an index corrupts each other's cursor.
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::join(file) }?;
@@ -777,6 +830,8 @@ impl<T> Consumer<T> {
     /// # Safety
     /// - As [`Self::join`], plus: the consumer that owned `index` must be dead and
     ///   no other live handle may use it.
+    /// - Force-release must be serialized externally, with the same restrictions
+    ///   as [`Self::recover`].
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::<T>::join(file) }?;
@@ -1123,9 +1178,9 @@ mod tests {
             });
             let mut c = p.join_as_consumer().unwrap();
             {
-                let mut batch = p
-                    .reserve_write_batch(NonZeroUsize::new(3).unwrap())
-                    .unwrap();
+                // SAFETY: every reserved slot is initialized below.
+                let mut batch =
+                    unsafe { p.reserve_write_batch(NonZeroUsize::new(3).unwrap()) }.unwrap();
                 assert_eq!(batch.len(), 3);
                 for index in 0..3usize {
                     // SAFETY: index < len.
@@ -1136,6 +1191,26 @@ mod tests {
                 // SAFETY: `Payload` is `u64`, valid for any bytes.
                 assert_eq!(unsafe { c.try_read() }, Some(value));
             }
+        }
+    }
+
+    #[test]
+    fn try_write_slice_publishes_all_items() {
+        for create in producer_creators() {
+            let mut p = create(BroadcastConfig {
+                capacity: 8,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let mut c = p.join_as_consumer().unwrap();
+            assert!(p.try_write_slice(&[]));
+            assert!(p.try_write_slice(&[1, 2, 3]));
+
+            for value in 1..=3u64 {
+                // SAFETY: `Payload` is `u64`, valid POD-like bytes.
+                assert_eq!(unsafe { c.try_read() }, Some(value));
+            }
+            assert_eq!(unsafe { c.try_read() }, None);
         }
     }
 
@@ -1294,12 +1369,14 @@ mod tests {
 
             // A single write guard publishes its cell when dropped.
             {
-                let mut guard = p.reserve_write().unwrap();
+                // SAFETY: the reserved slot is initialized before `guard` is dropped.
+                let mut guard = unsafe { p.reserve_write() }.unwrap();
                 // SAFETY: `Payload` is `u64`, valid for any bytes.
                 unsafe { *guard.as_mut_ref() = 42 };
             }
             // `write` consumes the guard and publishes on drop too.
-            p.reserve_write().unwrap().write(43);
+            // SAFETY: `write` initializes the reserved slot before publishing.
+            unsafe { p.reserve_write() }.unwrap().write(43);
 
             // SAFETY: `Payload` is `u64`; `read` copies out, committing on drop.
             assert_eq!(unsafe { c.reserve_read().unwrap().read() }, 42);
