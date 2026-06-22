@@ -1,7 +1,6 @@
 //! One producer's lane: a self-contained shared-memory block holding the lane's
 //! ownership state, its reserve/publication cursors, the per-consumer reserve
-//! limits, and the ring of payloads. See [`ProducerLane`]. (The blocked-consumer
-//! wake state is global, in the queue header, not per-lane.)
+//! limits, and the ring of payloads. See [`ProducerLane`].
 
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -34,31 +33,23 @@ struct LaneHeader {
     producer_publication: CacheAlignedAtomicSize,
 }
 
-/// A single producer's lane, viewed over one shared-memory block.
+/// A single producer's lane.
 ///
-/// The block holds everything for the lane: ownership state, the
-/// reserve/publication cursors, one consumer slot per consumer (its read
-/// progress, doubling as its hazard), and the ring of `T`. The owning producer
-/// mutates the ring and cursors (`&mut self`); consumers read published payloads
-/// and publish their own progress (`&self`).
+/// The lane holds: ownership state, the reserve/publication cursors, one
+/// consumer slot per consumer (its read progress, doubling as its hazard),
+/// and the ring of `T`. The owning producer mutates the ring and cursors
+/// (`&mut self`); consumers read published payloads and publish their own
+/// progress (`&self`).
 ///
 /// ## Consumer slot = reserve limit (`next_to_read + capacity`)
 ///
 /// A consumer slot does **not** store the consumer's raw read cursor. It stores
 /// that consumer's **reserve limit**: `next_to_read + capacity`, i.e. the lowest
-/// sequence the producer may NOT yet reserve on this consumer's behalf — writing
-/// it would recycle the ring cell still holding `next_to_read`. An unowned slot
-/// holds [`UNCLAIMED`].
-///
-/// Storing the limit (rather than the raw cursor and adding `capacity` at the
-/// gate) makes the producer's backpressure check a plain
-/// `reserve_end > min(limits)`: no `+ capacity` in the hot path, and the
-/// `UNCLAIMED` sentinel needs no saturation because it already sits at the top
-/// of the `min`. The `+ capacity` is paid once, off the hot path, whenever a
-/// consumer advances its cursor.
+/// sequence the producer may NOT yet reserve to avoid overwriting an active read.
+/// An unowned slot holds [`UNCLAIMED`].
 ///
 /// Block layout: `LaneHeader`, then `[CacheAlignedAtomicSize; consumer_slots]`
-/// limits (one per cache line), then `[T; capacity]` (capacity is a power of two).
+/// limits (one per cache line), then `[T; capacity]`.
 pub(crate) struct ProducerLane<T> {
     block: NonNull<u8>,
     mask: usize, // capacity - 1
@@ -294,14 +285,7 @@ impl<T> ProducerLane<T> {
     }
 
     /// Publishes the next `count` reserved sequences, making them visible to
-    /// consumers. Call after the cells are written. A lane has a single producer,
-    /// so the publication cursor only advances here and always sits at the start
-    /// of the just-reserved batch; advancing it by `count` publishes exactly that
-    /// batch.
-    ///
-    /// Release-orders the ring writes before the publication a consumer reads
-    /// with Acquire. Waking blocked consumers is the queue's job (the wake state
-    /// is global, not per-lane), done after this returns.
+    /// consumers. Call after the cells are written.
     pub(crate) fn publish(&mut self, count: NonZeroUsize) {
         self.header()
             .producer_publication

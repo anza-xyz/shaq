@@ -38,8 +38,6 @@ use producer_lane::ProducerLane;
 
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 
-/// Consumer-index ownership states for the global `consumer_state` table, read
-/// and written by the consumer side.
 const CONSUMER_FREE: u64 = 0;
 const CONSUMER_ACTIVE: u64 = 1;
 
@@ -143,7 +141,6 @@ impl Layout {
 }
 
 /// A handle onto the shared region: the header plus the section base pointers.
-/// Cloneable — every producer/consumer shares one mapping.
 struct SharedQueue<T> {
     region: Arc<Region>,
     header: NonNull<SharedQueueHeader>,
