@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, WaitError},
-    futex::Waiters,
+    futex::{Waiters, SPIN_ATTEMPTS},
     normalized_capacity,
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
@@ -322,14 +322,16 @@ impl<T> Consumer<T> {
         let header = self.queue.header;
         // SAFETY: `header` points to this consumer's live shared queue header.
         let header = unsafe { header.as_ref() };
-        header.waiters.wait_for(&header.write, timeout, || {
-            self.queue.load_write();
-            if !self.queue.is_empty() {
-                Some(())
-            } else {
-                None
-            }
-        })
+        header
+            .waiters
+            .wait_for(&header.write, SPIN_ATTEMPTS, timeout, || {
+                self.queue.load_write();
+                if !self.queue.is_empty() {
+                    Some(())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Blocks until a committed item can be reserved for reading or `timeout`
@@ -355,10 +357,12 @@ impl<T> Consumer<T> {
         let header = self.queue.header;
         // SAFETY: `header` points to this consumer's live shared queue header.
         let header = unsafe { header.as_ref() };
-        header.waiters.wait_for(&header.write, timeout, || {
-            self.queue.load_write();
-            self.try_read_ptr()
-        })
+        header
+            .waiters
+            .wait_for(&header.write, SPIN_ATTEMPTS, timeout, || {
+                self.queue.load_write();
+                self.try_read_ptr()
+            })
     }
 }
 

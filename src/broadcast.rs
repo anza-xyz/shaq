@@ -17,10 +17,12 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::error::Error;
+use crate::error::{Error, WaitError};
+use crate::futex::{Waiters, SPIN_ATTEMPTS};
 use crate::shmem::Region;
-use crate::{normalized_capacity, VERSION};
+use crate::{normalized_capacity, CacheAlignedAtomicSize, VERSION};
 
 use producer_lane::ProducerLane;
 
@@ -42,8 +44,8 @@ pub struct BroadcastConfig {
 }
 
 /// Shared header at the start of the region. The producer-lane cursors and the
-/// per-consumer reserve limits live in the lane blocks; only consumer-index
-/// ownership is global (the `consumer_state` table after this header).
+/// per-consumer reserve limits live in the lane blocks; consumer-index ownership
+/// and the blocked-consumer wake state are global.
 #[repr(C)]
 struct SharedQueueHeader {
     magic: AtomicU64,
@@ -51,6 +53,11 @@ struct SharedQueueHeader {
     capacity: u32, // per-lane ring capacity (power of two)
     producer_slots: u32,
     consumer_slots: u32,
+    /// Count of consumers blocked waiting for any lane to publish.
+    waiters: Waiters,
+    /// Futex word for blocked consumers: bumped only when a publish wakes one
+    /// (the lane cursors carry the data; this only breaks a racing wait).
+    wake_seq: CacheAlignedAtomicSize,
 }
 
 /// Byte offsets and sizes of the region's sections (a construction-time helper;
@@ -186,6 +193,9 @@ impl<T> SharedQueue<T> {
         header.capacity = layout.capacity;
         header.producer_slots = layout.producer_slots as u32;
         header.consumer_slots = layout.consumer_slots as u32;
+        // Global wake state: no waiters, wake counter at zero.
+        header.waiters.initialize();
+        header.wake_seq.store(0, Ordering::Release);
 
         // Global consumer-ownership table: every index free.
         // SAFETY: the layout reserves `consumer_slots` AtomicU64s here.
@@ -267,6 +277,37 @@ impl<T> SharedQueue<T> {
     #[inline]
     fn consumer_slots(&self) -> usize {
         self.consumer_slots
+    }
+
+    #[inline]
+    fn header(&self) -> &SharedQueueHeader {
+        // SAFETY: the header sits at the region base and outlives this handle.
+        unsafe { self.header.as_ref() }
+    }
+
+    /// Bumps the wake counter and wakes blocked consumers, if any. Called after
+    /// a publish (the lane cursor is already advanced); a no-op on the hot path
+    /// when nothing is blocked.
+    fn wake(&self) {
+        let header = self.header();
+        header.waiters.bump_and_wake(&header.wake_seq);
+    }
+
+    /// Blocks until `check` succeeds or `timeout` elapses, sleeping on the global
+    /// wake counter (a publish on any lane bumps it). `check` reads the lane
+    /// cursors, which carry the actual data.
+    fn wait_for<R>(
+        &self,
+        timeout: Duration,
+        check: impl FnMut() -> Option<R>,
+    ) -> Result<R, WaitError> {
+        // `check` scans every lane, so scale the per-check baseline down by the
+        // lane count to keep total spin work comparable to a single-cursor queue.
+        let spins = (SPIN_ATTEMPTS / self.producer_slots).max(1);
+        let header = self.header();
+        header
+            .waiters
+            .wait_for(&header.wake_seq, spins, timeout, check)
     }
 
     /// The global ownership word for consumer index `index`.
@@ -489,6 +530,7 @@ impl<T> WriteGuard<'_, T> {
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
         self.producer.lane.publish(NonZeroUsize::MIN);
+        self.producer.queue.wake();
     }
 }
 
@@ -536,6 +578,7 @@ impl<T> WriteBatch<'_, T> {
 impl<T> Drop for WriteBatch<'_, T> {
     fn drop(&mut self) {
         self.producer.lane.publish(self.count);
+        self.producer.queue.wake();
     }
 }
 
@@ -544,6 +587,8 @@ impl<T> Drop for WriteBatch<'_, T> {
 pub struct Consumer<T> {
     queue: SharedQueue<T>,
     index: usize,
+    /// One cached view per lane (avoids rebuilding it on every read).
+    lanes: Box<[ProducerLane<T>]>,
     /// Next sequence to read per lane (local cache of the published cursors).
     next_by_lane: Box<[usize]>,
     /// Lane to start the next round-robin scan from (rotates for fairness).
@@ -575,14 +620,19 @@ impl<T> Consumer<T> {
     fn from_queue(queue: SharedQueue<T>) -> Result<Self, Error> {
         let index = queue.acquire_consumer_index()?;
         let producer_slots = queue.producer_slots();
-        // Join each lane at its current reservation; cache the start positions.
+        // Cache one view per lane and join each at its current reservation,
+        // caching the start positions.
+        let mut lanes = Vec::with_capacity(producer_slots);
         let mut next_by_lane = Vec::with_capacity(producer_slots);
         for lane in 0..producer_slots {
-            next_by_lane.push(queue.lane(lane).join_consumer(index));
+            let lane = queue.lane(lane);
+            next_by_lane.push(lane.join_consumer(index));
+            lanes.push(lane);
         }
         Ok(Self {
             queue,
             index,
+            lanes: lanes.into_boxed_slice(),
             next_by_lane: next_by_lane.into_boxed_slice(),
             scan_start_lane: 0,
         })
@@ -596,7 +646,7 @@ impl<T> Consumer<T> {
         let mut lane = self.scan_start_lane;
         for _ in 0..producer_slots {
             let next = self.next_by_lane[lane];
-            if self.queue.lane(lane).published().wrapping_sub(next) > 0 {
+            if self.lanes[lane].published().wrapping_sub(next) > 0 {
                 return Some((lane, next));
             }
             // `lane < producer_slots`, so the wrap is a conditional subtract, not
@@ -616,7 +666,7 @@ impl<T> Consumer<T> {
     fn advance(&mut self, lane: usize, count: NonZeroUsize) {
         let next = self.next_by_lane[lane].wrapping_add(count.get());
         self.next_by_lane[lane] = next;
-        self.queue.lane(lane).set_consumer_cursor(self.index, next);
+        self.lanes[lane].set_consumer_cursor(self.index, next);
         // `lane < producer_slots`, so the wrap is a conditional subtract.
         let mut scan_start_lane = lane.wrapping_add(1);
         if scan_start_lane == self.queue.producer_slots() {
@@ -635,7 +685,7 @@ impl<T> Consumer<T> {
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
         // advance below. The copy happens before the cursor advances.
-        let value = unsafe { self.queue.lane(lane).payload_ptr(sequence).as_ptr().read() };
+        let value = unsafe { self.lanes[lane].payload_ptr(sequence).as_ptr().read() };
         self.advance(lane, NonZeroUsize::MIN);
         Some(value)
     }
@@ -643,12 +693,11 @@ impl<T> Consumer<T> {
     /// Reserves the next available value in place without copying, or `None` if
     /// every lane is caught up. The returned guard holds this consumer's cursor
     /// at the value's sequence, so the producer cannot overwrite it until the
-    /// guard is committed (dropping without committing leaves the cursor for a
-    /// re-read).
+    /// guard is dropped, which advances past it.
     #[must_use]
     pub fn reserve_read(&mut self) -> Option<ReadGuard<'_, T>> {
         let (lane, sequence) = self.next_readable()?;
-        let payload = self.queue.lane(lane).payload_ptr(sequence);
+        let payload = self.lanes[lane].payload_ptr(sequence);
         Some(ReadGuard {
             consumer: self,
             lane,
@@ -661,12 +710,12 @@ impl<T> Consumer<T> {
     /// lane, so its length is bounded by that lane's available run as well as by
     /// `max`. The returned guard holds this consumer's cursor at the batch start,
     /// so the producer cannot overwrite any of the batched cells until the guard
-    /// is committed (or dropped, which leaves the cursor for a re-read).
+    /// is dropped, which advances past the whole batch.
     #[must_use]
     pub fn reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         let (lane, start) = self.next_readable()?;
         // `next_readable` guarantees at least one published value past `start`.
-        let available = self.queue.lane(lane).published().wrapping_sub(start);
+        let available = self.lanes[lane].published().wrapping_sub(start);
         let count = available.min(max.get());
         let count = NonZeroUsize::new(count).expect("readable lane has at least one value");
         Some(ReadBatch {
@@ -676,14 +725,57 @@ impl<T> Consumer<T> {
             count,
         })
     }
+
+    /// Blocks until any lane has an unread value or `timeout` elapses, then
+    /// returns a [`ReadGuard`] for it; `Err(Timeout)` if none arrived in time.
+    pub fn reserve_read_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReadGuard<'_, T>, WaitError> {
+        self.wait_until_readable(timeout)?;
+        Ok(self
+            .reserve_read()
+            .expect("a lane is readable after a successful wait"))
+    }
+
+    /// Blocks until any lane has unread values or `timeout` elapses, then returns
+    /// a [`ReadBatch`] of up to `max` of them; `Err(Timeout)` if none arrived.
+    pub fn reserve_read_batch_timeout(
+        &mut self,
+        max: NonZeroUsize,
+        timeout: Duration,
+    ) -> Result<ReadBatch<'_, T>, WaitError> {
+        self.wait_until_readable(timeout)?;
+        Ok(self
+            .reserve_read_batch(max)
+            .expect("a lane is readable after a successful wait"))
+    }
+
+    /// Blocks until any lane has an unread value or `timeout` elapses, then
+    /// copies it out; `Err(Timeout)` if none arrived in time.
+    ///
+    /// # Safety
+    /// - `T` must be valid to read from shared-memory bytes in this process.
+    pub unsafe fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
+        let guard = self.reserve_read_timeout(timeout)?;
+        // SAFETY: forwarded to the caller's contract.
+        Ok(unsafe { guard.read() })
+    }
+
+    /// Blocks until [`Self::next_readable`] would succeed, sleeping on the queue's
+    /// global wake counter (a publish on any lane wakes it).
+    fn wait_until_readable(&self, timeout: Duration) -> Result<(), WaitError> {
+        self.queue
+            .wait_for(timeout, || self.next_readable().map(|_| ()))
+    }
 }
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         // Drop each lane's reserve limit first, then the global ownership, so no
         // limit lingers for an index another consumer could reclaim.
-        for lane in 0..self.queue.producer_slots() {
-            self.queue.lane(lane).release_consumer(self.index);
+        for lane in self.lanes.iter() {
+            lane.release_consumer(self.index);
         }
         self.queue.release_consumer_index(self.index);
     }
@@ -761,9 +853,7 @@ impl<T> ReadBatch<'_, T> {
     /// - `index < len`.
     pub unsafe fn as_ptr(&self, index: usize) -> *const T {
         debug_assert!(index < self.count.get());
-        self.consumer
-            .queue
-            .lane(self.lane)
+        self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
             .as_ptr()
     }
@@ -1128,6 +1218,88 @@ mod tests {
             // SAFETY: `Payload` is `u64`.
             assert_eq!(unsafe { c.try_read() }, Some(99));
             assert_eq!(unsafe { c.try_read() }, None);
+        }
+    }
+
+    #[test]
+    fn reserve_read_timeout_times_out_then_observes_publication() {
+        for create in producer_creators() {
+            let mut p = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let mut c = p.join_as_consumer().unwrap();
+
+            // Nothing published on any lane yet: a zero timeout reports `Timeout`
+            // rather than blocking.
+            assert!(matches!(
+                c.reserve_read_timeout(Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
+
+            // A publish on any lane satisfies the (already-elapsed) wait.
+            assert!(p.try_write(42).is_ok());
+            let guard = c.reserve_read_timeout(Duration::ZERO).expect("readable");
+            // SAFETY: `Payload` is `u64`.
+            assert_eq!(unsafe { *guard.as_ref() }, 42);
+        }
+    }
+
+    /// Exercises the real `FUTEX_WAIT` syscall (not just the elapsed-deadline
+    /// short-circuit): with nothing published, a bounded wait blocks in the
+    /// kernel on the wake counter and returns `Timeout`.
+    #[cfg(not(miri))]
+    #[test]
+    fn reserve_read_timeout_blocks_in_futex_then_times_out() {
+        for create in producer_creators() {
+            let p = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let mut c = p.join_as_consumer().unwrap();
+            assert!(matches!(
+                c.reserve_read_timeout(Duration::from_millis(5)),
+                Err(WaitError::Timeout)
+            ));
+        }
+    }
+
+    #[test]
+    fn read_and_batch_timeout_observe_publication() {
+        for create in producer_creators() {
+            let mut p = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let mut c = p.join_as_consumer().unwrap();
+
+            // SAFETY: `Payload` is `u64`.
+            assert!(matches!(
+                unsafe { c.read_timeout(Duration::ZERO) },
+                Err(WaitError::Timeout)
+            ));
+            assert!(matches!(
+                c.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
+
+            for value in 0..2u64 {
+                assert!(p.try_write(value).is_ok());
+            }
+            // The batch sees both published values; dropping it commits them.
+            {
+                let batch = c
+                    .reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO)
+                    .expect("readable");
+                assert_eq!(batch.len(), 2);
+            }
+            assert!(matches!(
+                c.reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO),
+                Err(WaitError::Timeout)
+            ));
         }
     }
 }

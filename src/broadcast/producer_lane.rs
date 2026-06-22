@@ -267,6 +267,10 @@ impl<T> ProducerLane<T> {
     /// so the publication cursor only advances here and always sits at the start
     /// of the just-reserved batch; advancing it by `count` publishes exactly that
     /// batch.
+    ///
+    /// Release-orders the ring writes before the publication a consumer reads
+    /// with Acquire. Waking blocked consumers is the queue's job (the wake state
+    /// is global, not per-lane), done after this returns.
     pub(crate) fn publish(&mut self, count: NonZeroUsize) {
         self.header()
             .producer_publication

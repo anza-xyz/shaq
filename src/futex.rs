@@ -1,29 +1,34 @@
 //! Futex-backed waiting for the shared-memory queues.
 //!
-//! The futex word is the queue's own 64-bit publication cursor: every publish
-//! advances it, so there is no separate sequence word a waiter could miss.
+//! The futex word is a 64-bit atomic whose low 32 bits change on (or just
+//! before) every wake. For the single-cursor queues it is the publication
+//! cursor itself — every publish advances it. A multi-cursor queue (the
+//! broadcast, which has one cursor per lane) instead points waiters at a
+//! dedicated wake counter that a publish bumps only when a waiter is present
+//! (see [`Waiters::bump_and_wake`]); there the caller's `check` is what gates
+//! on real data, and the counter exists only to break a racing `FUTEX_WAIT`.
 //!
 //! # Why no wake is lost
 //!
-//! The producer publishes the cursor (Release), then in [`Waiters::wake`]
-//! issues a SeqCst fence and loads `waiters`, skipping the wake syscall if
-//! it is zero. A waiter increments `waiters`, issues a SeqCst fence (in
-//! `register`), then rechecks for data before sleeping. SeqCst fences are
-//! totally ordered, and a load after the later fence must see a store made
-//! before the earlier one. So either the producer's load sees the waiter
-//! and wakes it, or the waiter's recheck sees the publication (or
-//! `FUTEX_WAIT` bounces with `EAGAIN`) and it never sleeps. Without the
-//! fences both loads can be stale and a wake can be lost.
+//! The producer advances the futex word (Release), then issues a SeqCst fence
+//! and loads `waiters`, skipping the wake syscall if it is zero. A waiter
+//! increments `waiters`, issues a SeqCst fence (in `register`), then rechecks
+//! for data before sleeping. SeqCst fences are totally ordered, and a load
+//! after the later fence must see a store made before the earlier one. So
+//! either the producer's load sees the waiter and wakes it, or the waiter's
+//! recheck sees the new data (or `FUTEX_WAIT` bounces with `EAGAIN`) and it
+//! never sleeps. Without the fences both loads can be stale and a wake can be
+//! lost.
 //!
 //! # The futex word
 //!
-//! Userspace accesses the cursor only as a 64-bit atomic; the kernel's
-//! 32-bit `FUTEX_WAIT` compare reads its low half (byte offset 0 on
-//! little-endian, 4 on big-endian), which is 4-byte aligned and cannot tear.
-//! Never materialize an `&AtomicU32` into the cursor in Rust code — only a
-//! raw pointer passed to the syscall. If the cursor advances by an exact
-//! multiple of 2^32 between snapshot and compare the wait oversleeps; that
-//! is bounded by the timeout and astronomically unlikely.
+//! Userspace accesses the word only as a 64-bit atomic; the kernel's 32-bit
+//! `FUTEX_WAIT` compare reads its low half (byte offset 0 on little-endian, 4
+//! on big-endian), which is 4-byte aligned and cannot tear. Never materialize
+//! an `&AtomicU32` into it in Rust code — only a raw pointer passed to the
+//! syscall. If the word advances by an exact multiple of 2^32 between snapshot
+//! and compare the wait oversleeps; that is bounded by the timeout and
+//! astronomically unlikely.
 
 use crate::{error::WaitError, CacheAlignedAtomicSize};
 use core::{
@@ -47,6 +52,7 @@ fn remaining_until(deadline: Instant) -> Result<Duration, WaitError> {
         .ok_or(WaitError::Timeout)
 }
 
+#[derive(Default)]
 #[repr(C)]
 pub(crate) struct Waiters {
     /// Approximate count of waiters registered against the queue's
@@ -65,9 +71,15 @@ impl Waiters {
     /// `cursor` is the queue's publication cursor used as the futex word
     /// while sleeping; an advance of `cursor` must imply that `check` can
     /// observe new data.
+    ///
+    /// `spins` is how many times to re-`check` before the first sleep. A caller
+    /// whose `check` is itself expensive (e.g. it scans many lanes) should pass
+    /// a smaller count so the total spin work stays bounded; see
+    /// [`SPIN_ATTEMPTS`] for the baseline used by a unit-cost check.
     pub(crate) fn wait_for<T>(
         &self,
         cursor: &AtomicUsize,
+        spins: usize,
         timeout: Duration,
         mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, WaitError> {
@@ -81,7 +93,7 @@ impl Waiters {
 
         // Spin only before the first sleep; once this thread has blocked it
         // is on the slow path and goes straight back to waiting.
-        for _ in 0..SPIN_ATTEMPTS {
+        for _ in 0..spins {
             spin_loop();
             if let Some(value) = check() {
                 return Ok(value);
@@ -163,13 +175,38 @@ impl Waiters {
         let count = waiters.min(count).min(MAX_WAKE_COUNT) as u32;
         imp::wake(cursor, count);
     }
+
+    /// Bumps `word` and wakes all registered waiters — but only if any are
+    /// registered, so a queue with no blocked waiter never writes the shared
+    /// `word` on its hot path.
+    ///
+    /// Unlike [`Self::wake`], the bump is conditional and done here: `word` is a
+    /// dedicated wake counter that the caller does **not** otherwise advance, so
+    /// this increment is what breaks a racing waiter's `FUTEX_WAIT`. Callers must
+    /// have published the real data (the lane cursors a waiter rechecks) with a
+    /// Release store before calling; the fence here pairs that with a registering
+    /// waiter (see module docs).
+    pub(crate) fn bump_and_wake(&self, word: &AtomicUsize) {
+        fence(Ordering::SeqCst);
+        let waiters = self.waiters.load(Ordering::Relaxed);
+        if waiters == 0 {
+            return;
+        }
+
+        // Change the futex word so a waiter that snapshotted it but has not yet
+        // slept bounces out of `FUTEX_WAIT` with `EAGAIN`.
+        word.fetch_add(1, Ordering::Relaxed);
+        let count = waiters.min(MAX_WAKE_COUNT) as u32;
+        imp::wake(word, count);
+    }
 }
 
 const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 
-/// Extra `check` attempts before a waiter's first sleep in
-/// [`Waiters::wait_for`].
-const SPIN_ATTEMPTS: usize = 2048;
+/// Baseline `check` attempts before a waiter's first sleep in
+/// [`Waiters::wait_for`], for a unit-cost `check`. Callers with a costlier
+/// `check` scale this down so the total spin work stays comparable.
+pub(crate) const SPIN_ATTEMPTS: usize = 2048;
 
 #[cfg(target_os = "linux")]
 mod imp {

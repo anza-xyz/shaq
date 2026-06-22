@@ -2,7 +2,7 @@
 
 use crate::{
     error::{Error, WaitError},
-    futex::Waiters,
+    futex::{Waiters, SPIN_ATTEMPTS},
     normalized_capacity,
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
@@ -333,7 +333,7 @@ impl<T> Consumer<T> {
         let header = unsafe { self.queue.header.as_ref() };
         header
             .waiters
-            .wait_for(&header.producer_publication, timeout, check)
+            .wait_for(&header.producer_publication, SPIN_ATTEMPTS, timeout, check)
     }
 
     /// Makes reserved-but-not-released reads left behind by a previous
