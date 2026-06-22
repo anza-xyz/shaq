@@ -218,6 +218,36 @@ impl<T> ProducerLane<T> {
         );
     }
 
+    /// Rewinds the reservation back to the publication. A dead producer may have
+    /// reserved cells it never published; those were never visible to a consumer,
+    /// so they are safely discarded, restoring the `reservation == publication`
+    /// invariant the next owner continues from.
+    fn rewind_reservation(&self) {
+        let header = self.header();
+        let published = header.producer_publication.load(Ordering::Acquire);
+        header
+            .producer_reservation
+            .store(published, Ordering::Release);
+    }
+
+    /// Force-claims a lane whose previous producer died and rewinds its
+    /// reservation, so the recovered producer resumes publishing from the last
+    /// published sequence.
+    ///
+    /// The caller must guarantee (via the global ownership contract) that the
+    /// previous owner is dead and no other producer holds this lane.
+    pub(crate) fn recover(&self) {
+        self.header().state.store(LANE_ACTIVE, Ordering::Release);
+        self.rewind_reservation();
+    }
+
+    /// Force-releases a dead producer's lane back to free (rewinding its
+    /// reservation first) so the normal acquire path can reclaim it.
+    pub(crate) fn force_release(&self) {
+        self.rewind_reservation();
+        self.header().state.store(LANE_FREE, Ordering::Release);
+    }
+
     /// The binding reserve limit across consumers: the lowest sequence the
     /// producer may NOT yet reserve. Each slot holds `next_to_read + capacity`;
     /// unowned slots hold [`UNCLAIMED`] and so drop out of the `min`. With every
@@ -284,11 +314,14 @@ impl<T> ProducerLane<T> {
     /// global consumer-ownership state, so this slot has a single writer (the
     /// owning consumer): no CAS is needed — a release store publishes the limit.
     ///
-    /// The start is the lane's **current reservation**, not a caller-supplied
-    /// value: it is the freshest sequence the producer has not yet written, so
-    /// its cell cannot already be overwritten and there is a full ring of margin
-    /// before the producer could lap it. Starting earlier could land on a cell
-    /// the producer is still writing (reserved but unpublished) or has recycled.
+    /// The start is normally the lane's **current reservation**: the freshest
+    /// sequence the producer has not yet written, so its cell cannot already be
+    /// overwritten and there is a full ring of margin before the producer could
+    /// lap it. With `from_backlog`, the start is instead up to one ring behind the
+    /// reservation (the oldest still-available item, floored at the first
+    /// sequence), so a consumer on a slow queue can read data published before it
+    /// joined. If the producer has already lapped that point, the handshake below
+    /// fast-forwards to the frontier — you cannot read cells already being recycled.
     ///
     /// The slot stores the **reserve limit** `start + capacity` (see the type
     /// docs). Reading the reservation and publishing the limit are not atomic,
@@ -301,12 +334,25 @@ impl<T> ProducerLane<T> {
     /// re-reading the reservation) pairs with the matching fence in `reserve`,
     /// so the producer either sees our limit (and stops) or we see its advance
     /// (and fast-forward) — at least one (cf. `futex::Waiters`).
-    pub(crate) fn join_consumer(&self, consumer_index: usize) -> usize {
+    ///
+    /// The limit is published with a single release store, so the slot never
+    /// passes through [`UNCLAIMED`]. This also makes the call usable for
+    /// recovery: re-joining a dead owner's index overwrites its stale limit
+    /// directly, never dropping this consumer's backpressure mid-claim.
+    pub(crate) fn join_consumer(&self, consumer_index: usize, from_backlog: bool) -> usize {
         let capacity = self.capacity();
         let slot = self.consumer_limit(consumer_index);
-        debug_assert_eq!(slot.load(Ordering::Relaxed), UNCLAIMED);
 
-        let start = self.reserved();
+        let start = {
+            let reserved = self.reserved();
+            if from_backlog {
+                // Up to one ring behind the frontier (floored at the first
+                // sequence): the oldest item still guaranteed to be in the ring.
+                reserved.saturating_sub(capacity)
+            } else {
+                reserved
+            }
+        };
         let limit = start.wrapping_add(capacity);
         debug_assert!(limit != UNCLAIMED);
         slot.store(limit, Ordering::Release);
@@ -338,6 +384,21 @@ impl<T> ProducerLane<T> {
     pub(crate) fn release_consumer(&self, consumer_index: usize) {
         self.consumer_limit(consumer_index)
             .store(UNCLAIMED, Ordering::Release);
+    }
+
+    /// Reconstructs a recovering consumer's next-to-read on this lane from its
+    /// surviving reserve limit (`next_to_read + capacity`), so it resumes where
+    /// the dead owner left off — those unread cells are still pinned by the
+    /// limit. This only reads the slot, so this consumer's backpressure is never
+    /// dropped. If the slot was never claimed (the owner died before joining this
+    /// lane), start fresh at the frontier.
+    pub(crate) fn recover_consumer(&self, consumer_index: usize) -> usize {
+        let limit = self.consumer_limit(consumer_index).load(Ordering::Acquire);
+        if limit == UNCLAIMED {
+            self.join_consumer(consumer_index, false)
+        } else {
+            limit.wrapping_sub(self.capacity())
+        }
     }
 
     #[inline]
@@ -466,7 +527,7 @@ mod tests {
         let (_region, mut lane) = lane(4, 1);
         assert!(lane.try_acquire());
         // Join consumer 0; nothing published yet, so it starts at sequence 0.
-        assert_eq!(lane.join_consumer(0), 0);
+        assert_eq!(lane.join_consumer(0, false), 0);
 
         // Fill the ring; the consumer has read nothing, so the next reserve laps.
         for value in 0..4u64 {
@@ -496,14 +557,14 @@ mod tests {
             assert!(publish_value(&mut lane, value));
         }
         // A consumer joining now starts at the reservation, not 0.
-        assert_eq!(lane.join_consumer(0), 3);
+        assert_eq!(lane.join_consumer(0, false), 3);
     }
 
     #[test]
     fn released_consumer_no_longer_constrains() {
         let (_region, mut lane) = lane(4, 1);
         assert!(lane.try_acquire());
-        assert_eq!(lane.join_consumer(0), 0);
+        assert_eq!(lane.join_consumer(0, false), 0);
         for value in 0..4u64 {
             assert!(publish_value(&mut lane, value));
         }

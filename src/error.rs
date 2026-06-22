@@ -3,14 +3,22 @@ use std::fmt::Display;
 #[derive(Debug)]
 pub enum Error {
     InvalidMagic,
-    InvalidVersion { expected: u32, actual: u32 },
+    InvalidVersion {
+        expected: u32,
+        actual: u32,
+    },
     InvalidBufferSize,
-    InvalidRegionAlignment { minimum: usize, actual: usize },
+    InvalidRegionAlignment {
+        minimum: usize,
+        actual: usize,
+    },
     Allocation(std::alloc::Layout),
     Io(std::io::Error),
     Mmap(std::io::Error),
     ProducerSlotsExhausted,
     ConsumerSlotsExhausted,
+    /// A recovery index was out of range for the queue's slot count.
+    InvalidIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +56,7 @@ impl Display for Error {
             Self::Mmap(err) => write!(f, "mmap; err={err}"),
             Self::ProducerSlotsExhausted => write!(f, "producer slots exhausted"),
             Self::ConsumerSlotsExhausted => write!(f, "consumer slots exhausted"),
+            Self::InvalidIndex => write!(f, "invalid index"),
         }
     }
 }
