@@ -78,9 +78,12 @@ impl Layout {
         if capacity == 0 || capacity > u32::MAX as usize {
             return None;
         }
+        // `consumer_slots == 0` is allowed: producers then run free (no consumer
+        // can constrain the reserve limit), useful for measuring a producer in
+        // isolation. `producer_slots` must be at least one — a queue with no
+        // lanes can hold nothing.
         if config.producer_slots == 0
             || config.producer_slots > u32::MAX as usize
-            || config.consumer_slots == 0
             || config.consumer_slots > u32::MAX as usize
         {
             return None;
@@ -999,6 +1002,26 @@ mod tests {
             for value in 0..16u64 {
                 assert!(p.try_write(value).is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn zero_consumer_slots_lets_producer_run_free() {
+        for create in producer_creators() {
+            let mut p = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 0,
+            });
+            // No consumer can ever constrain the lane, so writes never block.
+            for value in 0..16u64 {
+                assert!(p.try_write(value).is_ok());
+            }
+            // And no consumer can join when there are no consumer slots.
+            assert!(matches!(
+                p.join_as_consumer(),
+                Err(Error::ConsumerSlotsExhausted)
+            ));
         }
     }
 
