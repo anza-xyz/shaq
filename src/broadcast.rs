@@ -91,7 +91,11 @@ struct Layout {
 }
 
 impl Layout {
-    fn new<T>(config: &BroadcastConfig) -> Option<Self> {
+    fn new<T>(config: &BroadcastConfig) -> Result<Self, Error> {
+        Self::checked_new::<T>(config).ok_or(Error::InvalidBufferSize)
+    }
+
+    fn checked_new<T>(config: &BroadcastConfig) -> Option<Self> {
         if config.capacity == 0 {
             return None;
         }
@@ -145,7 +149,7 @@ impl Layout {
         };
         // `capacity` is already a power of two, so the recomputed layout must
         // match the stored capacity exactly.
-        let layout = Layout::new::<T>(&config).ok_or(Error::InvalidBufferSize)?;
+        let layout = Layout::new::<T>(&config)?;
         if layout.capacity as usize != capacity || region_size < layout.total {
             return Err(Error::InvalidBufferSize);
         }
@@ -176,7 +180,7 @@ impl<T> SharedQueue<T> {
         region: &Arc<Region>,
         config: &BroadcastConfig,
     ) -> Result<Self, Error> {
-        let layout = Layout::new::<T>(config).ok_or(Error::InvalidBufferSize)?;
+        let layout = Layout::new::<T>(config)?;
         if region.size() < layout.total {
             return Err(Error::InvalidBufferSize);
         }
@@ -379,7 +383,7 @@ impl<T> SharedQueue<T> {
     /// - `file` must be initialized as a queue at most once (by the designated
     ///   initializer) and not resized while any handle is joined.
     unsafe fn create(file: &File, config: &BroadcastConfig) -> Result<Self, Error> {
-        let layout = Layout::new::<T>(config).ok_or(Error::InvalidBufferSize)?;
+        let layout = Layout::new::<T>(config)?;
         file.set_len(layout.total as u64)?;
         let region = Region::map_file(file, layout.total)?;
         // SAFETY: caller guarantees this mapping is initialized exactly once.
@@ -1277,7 +1281,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        assert!(Layout::new::<Payload>(&config).is_none());
+        assert!(Layout::new::<Payload>(&config).is_err());
     }
 
     #[test]
@@ -1287,7 +1291,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        assert!(Layout::new::<Payload>(&config).is_none());
+        assert!(Layout::new::<Payload>(&config).is_err());
     }
 
     #[test]
