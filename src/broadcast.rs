@@ -28,10 +28,11 @@
 //! table, and the blocked-consumer wake counter) followed by one lane block per
 //! producer.
 
+mod consumer_state;
 mod producer_lane;
 
 use core::marker::PhantomData;
-use core::mem::{align_of, size_of};
+use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -44,12 +45,10 @@ use crate::futex::{Waiters, SPIN_ATTEMPTS};
 use crate::shmem::Region;
 use crate::{CacheAlignedAtomicSize, VERSION};
 
+use consumer_state::ConsumerState;
 use producer_lane::ProducerLane;
 
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
-
-const CONSUMER_FREE: u64 = 0;
-const CONSUMER_ACTIVE: u64 = 1;
 
 /// Runtime configuration for a broadcast queue.
 ///
@@ -116,8 +115,8 @@ impl Layout {
         let capacity = capacity as u32;
 
         let consumer_state_offset =
-            size_of::<SharedQueueHeader>().next_multiple_of(align_of::<AtomicU64>());
-        let consumer_state_bytes = config.consumer_slots.checked_mul(size_of::<AtomicU64>())?;
+            size_of::<SharedQueueHeader>().next_multiple_of(ConsumerState::block_align());
+        let consumer_state_bytes = ConsumerState::block_size(config.consumer_slots)?;
 
         let block_align = ProducerLane::<T>::block_align();
         let producer_blocks_offset = consumer_state_offset
@@ -161,12 +160,11 @@ impl Layout {
 struct SharedQueue<T> {
     region: Arc<Region>,
     header: NonNull<SharedQueueHeader>,
-    consumer_state: NonNull<AtomicU64>,
+    consumer_state: ConsumerState,
     producer_blocks: NonNull<u8>,
     // Runtime scalars (the layout offsets are construction-only, so not kept).
     capacity: u32,
     producer_slots: usize,
-    consumer_slots: usize,
     block_stride: usize,
     _marker: PhantomData<T>,
 }
@@ -225,20 +223,9 @@ impl<T> SharedQueue<T> {
         header.wake_seq.store(0, Ordering::Release);
 
         // Global consumer-ownership table: every index free.
+        let consumer_state = unsafe { base.byte_add(layout.consumer_state_offset) };
         // SAFETY: the layout reserves `consumer_slots` AtomicU64s here.
-        let consumer_state = unsafe {
-            base.byte_add(layout.consumer_state_offset)
-                .cast::<AtomicU64>()
-        };
-        for index in 0..layout.consumer_slots {
-            // SAFETY: `index < consumer_slots`.
-            unsafe {
-                consumer_state
-                    .add(index)
-                    .as_ptr()
-                    .write(AtomicU64::new(CONSUMER_FREE))
-            };
-        }
+        unsafe { ConsumerState::init(consumer_state, layout.consumer_slots) };
 
         // Producer-lane blocks.
         // SAFETY: the layout reserves `producer_slots` blocks of `block_stride`.
@@ -258,7 +245,12 @@ impl<T> SharedQueue<T> {
         let base = region.addr();
         let header = base.cast::<SharedQueueHeader>();
         // SAFETY: offsets lie within the region.
-        let consumer_state = unsafe { base.byte_add(layout.consumer_state_offset).cast() };
+        let consumer_state = unsafe {
+            ConsumerState::from_block(
+                base.byte_add(layout.consumer_state_offset),
+                layout.consumer_slots,
+            )
+        };
         // SAFETY: offsets lie within the region.
         let producer_blocks = unsafe { base.byte_add(layout.producer_blocks_offset) };
         Self {
@@ -268,7 +260,6 @@ impl<T> SharedQueue<T> {
             producer_blocks,
             capacity: layout.capacity,
             producer_slots: layout.producer_slots,
-            consumer_slots: layout.consumer_slots,
             block_stride: layout.block_stride,
             _marker: PhantomData,
         }
@@ -288,7 +279,7 @@ impl<T> SharedQueue<T> {
                 .byte_add(lane.wrapping_mul(self.block_stride))
         };
         // SAFETY: the block was initialized with these parameters.
-        unsafe { ProducerLane::from_block(block, self.capacity, self.consumer_slots) }
+        unsafe { ProducerLane::from_block(block, self.capacity, self.consumer_slots()) }
     }
 
     /// Claims a free producer lane, returning its index.
@@ -303,7 +294,7 @@ impl<T> SharedQueue<T> {
 
     #[inline]
     fn consumer_slots(&self) -> usize {
-        self.consumer_slots
+        self.consumer_state.len()
     }
 
     #[inline]
@@ -337,44 +328,20 @@ impl<T> SharedQueue<T> {
             .wait_for(&header.wake_seq, spins, timeout, check)
     }
 
-    /// The global ownership word for consumer index `index`.
-    #[inline]
-    fn consumer_state(&self, index: usize) -> &AtomicU64 {
-        debug_assert!(index < self.consumer_slots);
-        // SAFETY: `index < consumer_slots`; the slot was initialized.
-        unsafe { &*self.consumer_state.add(index).as_ptr() }
-    }
-
     /// Claims a free consumer index in the global ownership table.
     fn acquire_consumer_index(&self) -> Result<usize, Error> {
-        for index in 0..self.consumer_slots {
-            if self
-                .consumer_state(index)
-                .compare_exchange(
-                    CONSUMER_FREE,
-                    CONSUMER_ACTIVE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(index);
-            }
-        }
-        Err(Error::ConsumerSlotsExhausted)
+        self.consumer_state.acquire()
     }
 
     /// Releases a consumer index back to free.
     fn release_consumer_index(&self, index: usize) {
-        self.consumer_state(index)
-            .store(CONSUMER_FREE, Ordering::Release);
+        self.consumer_state.release(index);
     }
 
     /// Force-owns a consumer index whose previous owner died (no CAS). The
     /// caller guarantees that owner is dead and no live handle uses the index.
     fn recover_consumer_index(&self, index: usize) {
-        self.consumer_state(index)
-            .store(CONSUMER_ACTIVE, Ordering::Release);
+        self.consumer_state.recover(index);
     }
 
     /// Maps `file`, initializing it as a broadcast queue.
@@ -411,7 +378,6 @@ impl<T> Clone for SharedQueue<T> {
             producer_blocks: self.producer_blocks,
             capacity: self.capacity,
             producer_slots: self.producer_slots,
-            consumer_slots: self.consumer_slots,
             block_stride: self.block_stride,
             _marker: PhantomData,
         }
@@ -769,7 +735,7 @@ impl<T> Consumer<T> {
             .collect();
         let next_by_lane = lanes
             .iter()
-            .map(|lane| lane.join_consumer(index, from_backlog))
+            .map(|lane| Self::join_lane(lane, index, from_backlog))
             .collect();
         Ok(Self {
             queue,
@@ -817,7 +783,7 @@ impl<T> Consumer<T> {
             .collect();
         let next_by_lane = lanes
             .iter()
-            .map(|lane| lane.recover_consumer(index))
+            .map(|lane| Self::recover_lane(lane, index))
             .collect();
         Ok(Self {
             queue,
@@ -846,10 +812,20 @@ impl<T> Consumer<T> {
             return Err(Error::InvalidIndex);
         }
         for lane in 0..queue.producer_slots() {
-            queue.lane(lane).release_consumer(index);
+            queue.lane(lane).consumer_state().release(index);
         }
         queue.release_consumer_index(index);
         Ok(())
+    }
+
+    fn join_lane(lane: &ProducerLane<T>, index: usize, from_backlog: bool) -> usize {
+        let consumer_state = lane.consumer_state();
+        consumer_state.join(index, from_backlog, lane.published(), || lane.reserved())
+    }
+
+    fn recover_lane(lane: &ProducerLane<T>, index: usize) -> usize {
+        let consumer_state = lane.consumer_state();
+        consumer_state.recover(index, lane.published(), || lane.reserved())
     }
 
     /// Finds the next readable `(lane, sequence)`, scanning round-robin from
@@ -879,7 +855,9 @@ impl<T> Consumer<T> {
     fn advance(&mut self, lane: usize, count: NonZeroUsize) {
         let next = self.next_by_lane[lane].wrapping_add(count.get());
         self.next_by_lane[lane] = next;
-        self.lanes[lane].set_consumer_cursor(self.index, next);
+        self.lanes[lane]
+            .consumer_state()
+            .set_cursor(self.index, next);
         // `lane < producer_slots`, so the wrap is a conditional subtract.
         let mut scan_start_lane = lane.wrapping_add(1);
         if scan_start_lane == self.queue.producer_slots() {
@@ -988,7 +966,7 @@ impl<T> Drop for Consumer<T> {
         // Drop each lane's reserve limit first, then the global ownership, so no
         // limit lingers for an index another consumer could reclaim.
         for lane in self.lanes.iter() {
-            lane.release_consumer(self.index);
+            lane.consumer_state().release(self.index);
         }
         self.queue.release_consumer_index(self.index);
     }
@@ -1712,13 +1690,14 @@ mod tests {
         // position recorded (next-to-read = 1). Build that state directly (claim
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
-        queue.lane(0).join_consumer(index, false);
+        let lane = queue.lane(0);
+        Consumer::join_lane(&lane, index, false);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
         }
-        queue.lane(0).set_consumer_cursor(index, 1);
+        lane.consumer_state().set_cursor(index, 1);
 
         // Recovery resumes at the recorded position: it reads the unread backlog
         // (items 1, 2), never re-reading item 0.
@@ -1742,12 +1721,13 @@ mod tests {
         // The only consumer index is claimed and the lane's limit recorded, then
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
-        queue.lane(0).join_consumer(index, false);
+        let lane = queue.lane(0);
+        Consumer::join_lane(&lane, index, false);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
         }
-        queue.lane(0).set_consumer_cursor(index, 1);
+        lane.consumer_state().set_cursor(index, 1);
 
         // A fresh join can't proceed — the index is still owned.
         assert!(matches!(
@@ -1758,7 +1738,7 @@ mod tests {
         // Force-release frees it (clear limits + free the index); a catch-up join
         // then reclaims it and reads the still-present backlog from the start.
         for lane in 0..queue.producer_slots() {
-            queue.lane(lane).release_consumer(index);
+            queue.lane(lane).consumer_state().release(index);
         }
         queue.release_consumer_index(index);
         let mut fresh = Consumer::from_queue(queue.clone(), true).unwrap();
