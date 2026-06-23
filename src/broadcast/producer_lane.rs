@@ -2,7 +2,6 @@
 //! ownership state, its reserve/publication cursors, the per-consumer reserve
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
-use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
@@ -53,12 +52,12 @@ struct LaneHeader {
 /// Block layout: `LaneHeader`, then `[CacheAlignedAtomicSize; consumer_slots]`
 /// limits (one per cache line), then `[T; capacity]`.
 pub(crate) struct ProducerLane<T> {
-    block: NonNull<u8>,
+    header: NonNull<LaneHeader>,
+    consumers: NonNull<CacheAlignedAtomicSize>,
+    ring: NonNull<T>,
+
     mask: usize, // capacity - 1
     consumer_slots: usize,
-    consumers_offset: usize,
-    ring_offset: usize,
-    _marker: PhantomData<T>,
 }
 
 #[inline]
@@ -143,13 +142,24 @@ impl<T> ProducerLane<T> {
         consumer_slots: usize,
     ) -> Self {
         debug_assert!(capacity.is_power_of_two());
+
+        let header = block.cast();
+        // SAFETY: `block` is an initialized region - it must be large enough
+        //         for consumers to fit (if init succeeded).
+        let consumers = unsafe { block.byte_add(consumers_offset()) }.cast();
+        // SAFETY: `block` is an initialized region - it must be large enough
+        //         for ring data to fit (if init succeeded).
+        let ring = unsafe {
+            block.byte_add(ring_offset::<T>(consumer_slots).expect("validated_lane layout"))
+        }
+        .cast();
+
         Self {
-            block,
+            header,
+            consumers,
+            ring,
             mask: (capacity as usize).wrapping_sub(1),
             consumer_slots,
-            consumers_offset: consumers_offset(),
-            ring_offset: ring_offset::<T>(consumer_slots).expect("validated lane layout"),
-            _marker: PhantomData,
         }
     }
 
@@ -160,8 +170,8 @@ impl<T> ProducerLane<T> {
 
     #[inline]
     fn header(&self) -> &LaneHeader {
-        // SAFETY: the block begins with an initialized `LaneHeader` for its lifetime.
-        unsafe { &*self.block.cast::<LaneHeader>().as_ptr() }
+        // SAFETY: The lane has an initialized header that lives for the lane's lifetime.
+        unsafe { self.header.as_ref() }
     }
 
     /// The slot holding consumer `consumer_index`'s reserve limit
@@ -170,14 +180,7 @@ impl<T> ProducerLane<T> {
     fn consumer_limit(&self, consumer_index: usize) -> &CacheAlignedAtomicSize {
         debug_assert!(consumer_index < self.consumer_slots);
         // SAFETY: `consumer_index < consumer_slots`; the slot was initialized.
-        unsafe {
-            &*self
-                .block
-                .byte_add(self.consumers_offset)
-                .cast::<CacheAlignedAtomicSize>()
-                .add(consumer_index)
-                .as_ptr()
-        }
+        unsafe { &*self.consumers.add(consumer_index).as_ptr() }
     }
 
     /// Pointer to the ring cell holding `sequence` — used by the producer to
@@ -185,12 +188,7 @@ impl<T> ProducerLane<T> {
     #[inline]
     pub(crate) fn payload_ptr(&self, sequence: usize) -> NonNull<T> {
         // SAFETY: `sequence & mask < capacity`; the ring has `capacity` cells.
-        unsafe {
-            self.block
-                .byte_add(self.ring_offset)
-                .cast::<T>()
-                .add(sequence & self.mask)
-        }
+        unsafe { self.ring.add(sequence & self.mask) }
     }
 
     /// Claims the lane for a producer. Returns `false` if already owned.
