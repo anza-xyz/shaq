@@ -174,6 +174,12 @@ impl<T> ProducerLane<T> {
         unsafe { self.header.as_ref() }
     }
 
+    #[inline]
+    fn consumers(&self) -> &[CacheAlignedAtomicSize] {
+        // SAFETY: layout reserves `consumer_slots` aligned slots here
+        unsafe { slice::from_raw_parts(self.consumers.as_ptr(), self.consumer_slots) }
+    }
+
     /// The slot holding consumer `consumer_index`'s reserve limit
     /// (`next_to_read + capacity`, or [`UNCLAIMED`]).
     #[inline]
@@ -244,14 +250,11 @@ impl<T> ProducerLane<T> {
     /// unowned slots hold [`UNCLAIMED`] and so drop out of the `min`. With every
     /// slot unowned the result is [`UNCLAIMED`] (no constraint).
     fn reserve_limit(&self) -> usize {
-        let mut limit = UNCLAIMED;
-        for consumer_index in 0..self.consumer_slots {
-            let consumer_limit = self.consumer_limit(consumer_index).load(Ordering::Acquire);
-            if consumer_limit < limit {
-                limit = consumer_limit;
-            }
-        }
-        limit
+        self.consumers()
+            .iter()
+            .map(|c| c.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(UNCLAIMED)
     }
 
     /// Reserves `count` consecutive sequences for writing, returning the first.
