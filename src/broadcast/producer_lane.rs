@@ -3,9 +3,11 @@
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
+use core::slice;
 use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 
 use crate::CacheAlignedAtomicSize;
@@ -112,22 +114,21 @@ impl<T> ProducerLane<T> {
                 producer_publication: CacheAlignedAtomicSize::default(),
             });
         }
-        // SAFETY: `consumers_offset` reserves `consumer_slots` cursors.
-        let consumers = unsafe {
-            block
-                .byte_add(consumers_offset())
-                .cast::<CacheAlignedAtomicSize>()
+        // SAFETY: layout reserves `consumer_slots` aligned slots here; init runs
+        // once with no other handle joined, so &mut is exclusive.
+        let slots: &mut [MaybeUninit<CacheAlignedAtomicSize>] = unsafe {
+            slice::from_raw_parts_mut(
+                block
+                    .byte_add(consumers_offset())
+                    .cast::<MaybeUninit<CacheAlignedAtomicSize>>()
+                    .as_ptr(),
+                consumer_slots,
+            )
         };
-        for consumer_index in 0..consumer_slots {
-            // SAFETY: `consumer_index < consumer_slots`. Unowned slots start at the sentinel.
-            unsafe {
-                consumers
-                    .add(consumer_index)
-                    .as_ptr()
-                    .write(CacheAlignedAtomicSize {
-                        inner: AtomicUsize::new(UNCLAIMED),
-                    });
-            }
+        for slot in slots {
+            slot.write(CacheAlignedAtomicSize {
+                inner: AtomicUsize::new(UNCLAIMED),
+            });
         }
     }
 
