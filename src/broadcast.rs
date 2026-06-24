@@ -865,10 +865,7 @@ impl<T> Consumer<T> {
 
     /// Reads the next available value by copying it out, or `None` if every lane
     /// is caught up.
-    ///
-    /// # Safety
-    /// - `T` must be valid to read from shared-memory bytes in this process.
-    pub unsafe fn try_read(&mut self) -> Option<T> {
+    pub fn try_read(&mut self) -> Option<T> {
         let (lane, sequence) = self.next_readable()?;
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
@@ -941,13 +938,9 @@ impl<T> Consumer<T> {
 
     /// Blocks until any lane has an unread value or `timeout` elapses, then
     /// copies it out; `Err(Timeout)` if none arrived in time.
-    ///
-    /// # Safety
-    /// - `T` must be valid to read from shared-memory bytes in this process.
-    pub unsafe fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
         let guard = self.reserve_read_timeout(timeout)?;
-        // SAFETY: forwarded to the caller's contract.
-        Ok(unsafe { guard.read() })
+        Ok(guard.read())
     }
 
     /// Blocks until [`Self::next_readable`] would succeed, sleeping on the queue's
@@ -984,27 +977,17 @@ pub struct ReadGuard<'a, T> {
 }
 
 impl<T> ReadGuard<'_, T> {
-    /// Pointer to the borrowed value.
-    pub fn as_ptr(&self) -> *const T {
-        self.payload.as_ptr()
-    }
-
-    /// Reference to the borrowed value.
-    ///
-    /// # Safety
-    /// - `T` must be valid to reference as shared-memory bytes in this process.
-    pub unsafe fn as_ref(&self) -> &T {
-        // SAFETY: the cell is published and held by this consumer's cursor.
-        unsafe { self.payload.as_ref() }
-    }
-
     /// Copies the value out; the guard advances past it on drop.
-    ///
-    /// # Safety
-    /// - `T` must be valid to read from shared-memory bytes in this process.
-    pub unsafe fn read(self) -> T {
+    pub fn read(self) -> T {
         // SAFETY: the cell is published and held by this consumer's cursor.
         unsafe { self.payload.as_ptr().read() }
+    }
+}
+
+impl<T> AsRef<T> for ReadGuard<'_, T> {
+    fn as_ref(&self) -> &T {
+        // SAFETY: the cell is published and held by this consumer's cursor.
+        unsafe { self.payload.as_ref() }
     }
 }
 
@@ -1049,11 +1032,9 @@ impl<T> ReadBatch<'_, T> {
     /// Reference to the value at `index`.
     ///
     /// # Safety
-    /// - `index < len`; `T` must be valid to reference as shared-memory bytes in
-    ///   this process, and the reference must not be used after the guard is
-    ///   dropped.
+    /// - `index < len`
     pub unsafe fn as_ref(&self, index: usize) -> &T {
-        // SAFETY: forwarded; the cell is published and held by this consumer's
+        // SAFETY: the cell is published and held by this consumer's
         // cursor.
         unsafe { &*self.as_ptr(index) }
     }
@@ -1061,8 +1042,7 @@ impl<T> ReadBatch<'_, T> {
     /// Copies the value at `index` out.
     ///
     /// # Safety
-    /// - `index < len`; `T` must be valid to read from shared-memory bytes in
-    ///   this process.
+    /// - `index < len`
     pub unsafe fn read(&self, index: usize) -> T {
         // SAFETY: forwarded; the cell is published and held by this consumer's
         // cursor until the batch is dropped.
@@ -1143,8 +1123,7 @@ mod tests {
                 assert!(p.try_write(value * 10).is_ok());
             }
             for value in 0..5u64 {
-                // SAFETY: `Payload` is `u64`, valid for any bytes.
-                assert_eq!(unsafe { c.try_read() }, Some(value * 10));
+                assert_eq!(c.try_read(), Some(value * 10));
             }
         }
     }
@@ -1169,8 +1148,7 @@ mod tests {
                 }
             }
             for value in 1..=3u64 {
-                // SAFETY: `Payload` is `u64`, valid for any bytes.
-                assert_eq!(unsafe { c.try_read() }, Some(value));
+                assert_eq!(c.try_read(), Some(value));
             }
         }
     }
@@ -1188,10 +1166,9 @@ mod tests {
             assert!(p.try_write_slice(&[1, 2, 3]));
 
             for value in 1..=3u64 {
-                // SAFETY: `Payload` is `u64`, valid POD-like bytes.
-                assert_eq!(unsafe { c.try_read() }, Some(value));
+                assert_eq!(c.try_read(), Some(value));
             }
-            assert_eq!(unsafe { c.try_read() }, None);
+            assert_eq!(c.try_read(), None);
         }
     }
 
@@ -1290,13 +1267,11 @@ mod tests {
                 assert!(p.try_write(value * 10).is_ok());
             }
             for value in 0..5u64 {
-                // SAFETY: `Payload` is `u64`, valid for any bytes.
-                assert_eq!(unsafe { c0.try_read() }, Some(value * 10));
-                assert_eq!(unsafe { c1.try_read() }, Some(value * 10));
+                assert_eq!(c0.try_read(), Some(value * 10));
+                assert_eq!(c1.try_read(), Some(value * 10));
             }
-            // SAFETY: see above.
-            assert_eq!(unsafe { c0.try_read() }, None);
-            assert_eq!(unsafe { c1.try_read() }, None);
+            assert_eq!(c0.try_read(), None);
+            assert_eq!(c1.try_read(), None);
 
             // A released consumer's index can be reclaimed.
             drop(c1);
@@ -1321,8 +1296,7 @@ mod tests {
             assert!(p.try_write(99).is_err());
 
             // The consumer reads one; one cell frees up.
-            // SAFETY: `Payload` is `u64`.
-            assert_eq!(unsafe { c.try_read() }, Some(0));
+            assert_eq!(c.try_read(), Some(0));
             assert!(p.try_write(99).is_ok());
             assert!(p.try_write(100).is_err());
         }
@@ -1340,8 +1314,7 @@ mod tests {
             assert!(p.try_write(10).is_ok());
 
             let guard = c.try_reserve_read().expect("readable");
-            // SAFETY: the cell is published.
-            assert_eq!(unsafe { *guard.as_ref() }, 10);
+            assert_eq!(*guard.as_ref(), 10);
 
             // The producer can fill the rest of the ring but cannot overwrite the
             // cell the guard still holds (sequence 0).
@@ -1349,8 +1322,7 @@ mod tests {
                 assert!(p.try_write(value).is_ok());
             }
             assert!(p.try_write(14).is_err());
-            // SAFETY: the guard still protects sequence 0.
-            assert_eq!(unsafe { *guard.as_ref() }, 10);
+            assert_eq!(*guard.as_ref(), 10);
 
             // Dropping the guard commits, advancing past the cell and freeing it.
             drop(guard);
@@ -1372,16 +1344,14 @@ mod tests {
             {
                 // SAFETY: the reserved slot is initialized before `guard` is dropped.
                 let mut guard = unsafe { p.try_reserve_write() }.unwrap();
-                // SAFETY: `Payload` is `u64`, valid for any bytes.
                 guard.as_mut_ref().write(42);
             }
             // `write` consumes the guard and publishes on drop too.
             // SAFETY: `write` initializes the reserved slot before publishing.
             unsafe { p.try_reserve_write() }.unwrap().write(43);
 
-            // SAFETY: `Payload` is `u64`; `read` copies out, committing on drop.
-            assert_eq!(unsafe { c.try_reserve_read().unwrap().read() }, 42);
-            assert_eq!(unsafe { c.try_reserve_read().unwrap().read() }, 43);
+            assert_eq!(c.try_reserve_read().unwrap().read(), 42);
+            assert_eq!(c.try_reserve_read().unwrap().read(), 43);
             assert!(c.try_reserve_read().is_none());
         }
     }
@@ -1469,9 +1439,8 @@ mod tests {
             // Joins at the current publication (3), so it sees only later items.
             let mut c = p.join_as_consumer().unwrap();
             assert!(p.try_write(99).is_ok());
-            // SAFETY: `Payload` is `u64`.
-            assert_eq!(unsafe { c.try_read() }, Some(99));
-            assert_eq!(unsafe { c.try_read() }, None);
+            assert_eq!(c.try_read(), Some(99));
+            assert_eq!(c.try_read(), None);
         }
     }
 
@@ -1493,9 +1462,8 @@ mod tests {
         guard.as_mut_ref().write(42);
         drop(guard);
 
-        // SAFETY: `Payload` is `u64`, valid POD-like bytes.
-        assert_eq!(unsafe { consumer.try_read() }, Some(42));
-        assert_eq!(unsafe { consumer.try_read() }, None);
+        assert_eq!(consumer.try_read(), Some(42));
+        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
@@ -1515,12 +1483,11 @@ mod tests {
             // so it reads data published before it joined, then keeps up.
             let mut c = p.join_as_consumer_from_backlog().unwrap();
             for value in 0..3u64 {
-                // SAFETY: `Payload` is `u64`.
-                assert_eq!(unsafe { c.try_read() }, Some(value));
+                assert_eq!(c.try_read(), Some(value));
             }
             assert!(p.try_write(99).is_ok());
-            assert_eq!(unsafe { c.try_read() }, Some(99));
-            assert_eq!(unsafe { c.try_read() }, None);
+            assert_eq!(c.try_read(), Some(99));
+            assert_eq!(c.try_read(), None);
         }
     }
 
@@ -1544,8 +1511,7 @@ mod tests {
             // A publish on any lane satisfies the (already-elapsed) wait.
             assert!(p.try_write(42).is_ok());
             let guard = c.reserve_read_timeout(Duration::ZERO).expect("readable");
-            // SAFETY: `Payload` is `u64`.
-            assert_eq!(unsafe { *guard.as_ref() }, 42);
+            assert_eq!(*guard.as_ref(), 42);
         }
     }
 
@@ -1579,9 +1545,8 @@ mod tests {
             });
             let mut c = p.join_as_consumer().unwrap();
 
-            // SAFETY: `Payload` is `u64`.
             assert!(matches!(
-                unsafe { c.read_timeout(Duration::ZERO) },
+                c.read_timeout(Duration::ZERO),
                 Err(WaitError::Timeout)
             ));
             assert!(matches!(
@@ -1648,10 +1613,9 @@ mod tests {
 
         // The consumer (joined before the crash) sees every item in order.
         for value in 1..=3u64 {
-            // SAFETY: `Payload` is `u64`.
-            assert_eq!(unsafe { consumer.try_read() }, Some(value));
+            assert_eq!(consumer.try_read(), Some(value));
         }
-        assert_eq!(unsafe { consumer.try_read() }, None);
+        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
@@ -1703,10 +1667,9 @@ mod tests {
         // (items 1, 2), never re-reading item 0.
         let mut recovered = Consumer::recover_in_queue(queue.clone(), index).unwrap();
         assert_eq!(recovered.index(), index);
-        // SAFETY: `Payload` is `u64`.
-        assert_eq!(unsafe { recovered.try_read() }, Some(1));
-        assert_eq!(unsafe { recovered.try_read() }, Some(2));
-        assert_eq!(unsafe { recovered.try_read() }, None);
+        assert_eq!(recovered.try_read(), Some(1));
+        assert_eq!(recovered.try_read(), Some(2));
+        assert_eq!(recovered.try_read(), None);
     }
 
     #[test]
@@ -1744,10 +1707,9 @@ mod tests {
         let mut fresh = Consumer::from_queue(queue.clone(), true).unwrap();
         assert_eq!(fresh.index(), index);
         for value in 0..3u64 {
-            // SAFETY: `Payload` is `u64`.
-            assert_eq!(unsafe { fresh.try_read() }, Some(value));
+            assert_eq!(fresh.try_read(), Some(value));
         }
-        assert_eq!(unsafe { fresh.try_read() }, None);
+        assert_eq!(fresh.try_read(), None);
     }
 
     #[test]
