@@ -522,6 +522,7 @@ impl<T> Producer<T> {
     /// Writes items from a slice into this producer's lane.
     ///
     /// Returns `false` if there is not enough space.
+    #[must_use]
     pub fn try_write_slice(&mut self, items: &[T]) -> bool
     where
         T: Copy,
