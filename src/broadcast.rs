@@ -619,7 +619,7 @@ impl<T> WriteGuard<'_, T> {
 
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
-        self.producer.lane.publish(NonZeroUsize::MIN);
+        self.producer.lane.publish(self.start, NonZeroUsize::MIN);
         self.producer.queue.wake();
     }
 }
@@ -669,7 +669,7 @@ impl<T> WriteBatch<'_, T> {
 
 impl<T> Drop for WriteBatch<'_, T> {
     fn drop(&mut self) {
-        self.producer.lane.publish(self.count);
+        self.producer.lane.publish(self.start, self.count);
         self.producer.queue.wake();
     }
 }
