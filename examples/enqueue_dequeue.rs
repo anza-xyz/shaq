@@ -493,7 +493,7 @@ fn run_broadcast_producer(
         for index in 0..batch.len() {
             // SAFETY: `index < len`; the reserved cell is ours to initialize.
             unsafe {
-                (*batch.as_mut_ptr(index)).data.fill(42);
+                (*batch.as_mut_ref(index)).assume_init_mut().data.fill(42);
             }
         }
         Some(batch.len())

@@ -37,6 +37,7 @@ use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -588,7 +589,7 @@ impl<T> Drop for Producer<T> {
 unsafe impl<T: Send> Send for Producer<T> {}
 
 /// A reservation of one cell in a producer's lane. Write it via
-/// [`Self::write`]/[`Self::as_mut_ptr`], then drop the guard to publish it.
+/// [`Self::write`]/[`Self::as_mut_ref`], then drop the guard to publish it.
 #[must_use]
 pub struct WriteGuard<'a, T> {
     producer: &'a mut Producer<T>,
@@ -596,19 +597,10 @@ pub struct WriteGuard<'a, T> {
 }
 
 impl<T> WriteGuard<'_, T> {
-    /// Pointer to the reserved cell.
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.producer.lane.payload_ptr(self.start).as_ptr()
-    }
-
     /// Mutable reference to the reserved cell.
-    ///
-    /// # Safety
-    /// - The cell is uninitialized; `T` must be valid for any bytes (the caller
-    ///   must not read it before fully initializing it).
-    pub unsafe fn as_mut_ref(&mut self) -> &mut T {
+    pub fn as_mut_ref(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: forwarded; the cell is reserved for this producer.
-        unsafe { &mut *self.as_mut_ptr() }
+        unsafe { &mut *self.producer.lane.payload_ptr(self.start).as_ptr().cast() }
     }
 
     /// Writes `value` into the reserved cell; the guard publishes it on drop.
@@ -632,7 +624,7 @@ impl<T> Drop for WriteGuard<'_, T> {
 }
 
 /// A reservation of `count` cells in a producer's lane. Write every cell via
-/// [`Self::write`]/[`Self::as_mut_ptr`], then drop the batch to publish them.
+/// [`Self::write`]/[`Self::as_mut_ref`], then drop the batch to publish them.
 #[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
@@ -649,17 +641,19 @@ impl<T> WriteBatch<'_, T> {
         false
     }
 
-    /// Pointer to the reserved cell at `index`.
+    /// Mutable reference to the reserved cell at `index`.
     ///
     /// # Safety
-    /// - `index < len`; the cell is uninitialized and the caller must fully
-    ///   initialize `T` before the batch is dropped.
-    pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
+    /// - `index < len`.
+    pub unsafe fn as_mut_ref(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
-        self.producer
+        let ptr = self
+            .producer
             .lane
             .payload_ptr(self.start.wrapping_add(index))
-            .as_ptr()
+            .as_ptr();
+        // SAFETY: forwarded; the cell is reserved for this producer.
+        unsafe { &mut *ptr.cast() }
     }
 
     /// Writes `value` into the reserved cell at `index`.
@@ -668,7 +662,7 @@ impl<T> WriteBatch<'_, T> {
     /// - `index < len`.
     pub unsafe fn write(&mut self, index: usize, value: T) {
         // SAFETY: forwarded; `index < len` and the cell is reserved.
-        unsafe { self.as_mut_ptr(index).write(value) };
+        unsafe { self.as_mut_ref(index).write(value) };
     }
 }
 
@@ -1379,7 +1373,7 @@ mod tests {
                 // SAFETY: the reserved slot is initialized before `guard` is dropped.
                 let mut guard = unsafe { p.try_reserve_write() }.unwrap();
                 // SAFETY: `Payload` is `u64`, valid for any bytes.
-                unsafe { *guard.as_mut_ref() = 42 };
+                guard.as_mut_ref().write(42);
             }
             // `write` consumes the guard and publishes on drop too.
             // SAFETY: `write` initializes the reserved slot before publishing.
@@ -1496,8 +1490,7 @@ mod tests {
         let mut consumer = Consumer::from_queue(queue.clone(), false).unwrap();
 
         assert!(consumer.try_reserve_read().is_none());
-        // SAFETY: `Payload` is `u64`, valid POD-like bytes.
-        unsafe { *guard.as_mut_ref() = 42 };
+        guard.as_mut_ref().write(42);
         drop(guard);
 
         // SAFETY: `Payload` is `u64`, valid POD-like bytes.
