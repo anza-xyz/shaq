@@ -214,9 +214,11 @@ impl<T> ProducerLane<T> {
     /// Reserves `count` consecutive sequences for writing, returning the first.
     /// `None` on backpressure: the batch would overwrite a cell an active
     /// consumer has not yet read, or it exceeds the ring capacity.
+    /// On success this returns Some(seqnum) - with seqnum being
+    /// the starting sequence number of the reservation.
     ///
     /// Write each reserved cell via [`Self::payload_ptr`], then [`Self::publish`].
-    pub(crate) fn reserve(&mut self, count: NonZeroUsize) -> Option<usize> {
+    pub(crate) fn try_reserve(&mut self, count: NonZeroUsize) -> Option<usize> {
         if count.get() > self.capacity() {
             return None;
         }
@@ -300,7 +302,7 @@ mod tests {
     /// Reserves, writes, and publishes one value; `false` on backpressure.
     fn publish_value(lane: &mut ProducerLane<Payload>, value: Payload) -> bool {
         let one = NonZeroUsize::new(1).unwrap();
-        let Some(start) = lane.reserve(one) else {
+        let Some(start) = lane.try_reserve(one) else {
             return false;
         };
         // SAFETY: the cell is reserved and not yet published.
@@ -337,7 +339,7 @@ mod tests {
         let (_region, mut lane) = lane(8, 1);
         assert!(lane.try_acquire());
         let count = NonZeroUsize::new(3).unwrap();
-        let start = lane.reserve(count).expect("reserve");
+        let start = lane.try_reserve(count).expect("reserve");
         for offset in 0..count.get() {
             // SAFETY: each cell in the batch is reserved and unpublished.
             unsafe {
@@ -360,7 +362,7 @@ mod tests {
     fn reserve_rejects_count_above_capacity() {
         let (_region, mut lane) = lane(4, 1);
         assert!(lane.try_acquire());
-        assert!(lane.reserve(NonZeroUsize::new(5).unwrap()).is_none());
+        assert!(lane.try_reserve(NonZeroUsize::new(5).unwrap()).is_none());
     }
 
     #[test]

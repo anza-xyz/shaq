@@ -550,7 +550,7 @@ impl<T> Producer<T> {
     ///   dropped.
     #[must_use]
     pub unsafe fn reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
-        let start = self.lane.reserve(NonZeroUsize::MIN)?;
+        let start = self.lane.try_reserve(NonZeroUsize::MIN)?;
         Some(WriteGuard {
             producer: self,
             start,
@@ -565,7 +565,7 @@ impl<T> Producer<T> {
     ///   dropped.
     #[must_use]
     pub unsafe fn reserve_write_batch(&mut self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
-        let start = self.lane.reserve(count)?;
+        let start = self.lane.try_reserve(count)?;
         Some(WriteBatch {
             producer: self,
             start,
@@ -1667,7 +1667,7 @@ mod tests {
         // the reservation runs ahead of the publication.
         let mut lane = queue.lane(0);
         assert!(lane.try_acquire());
-        lane.reserve(NonZeroUsize::new(3).unwrap());
+        lane.try_reserve(NonZeroUsize::new(3).unwrap());
         assert_eq!(lane.reserved(), 3);
         assert_eq!(lane.published(), 0);
 
