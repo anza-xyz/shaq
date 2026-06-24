@@ -509,7 +509,7 @@ impl<T> Producer<T> {
     pub fn try_write(&mut self, value: T) -> Result<(), T> {
         // SAFETY: on successful reservation, `value` is written before the guard
         // is dropped and publishes the cell.
-        match unsafe { self.reserve_write() } {
+        match unsafe { self.try_reserve_write() } {
             Some(guard) => {
                 guard.write(value);
                 Ok(())
@@ -530,7 +530,7 @@ impl<T> Producer<T> {
         };
 
         // SAFETY: if reservation succeeds, every reserved cell is written below.
-        let mut batch = match unsafe { self.reserve_write_batch(len) } {
+        let mut batch = match unsafe { self.try_reserve_write_batch(len) } {
             Some(batch) => batch,
             None => return false,
         };
@@ -549,7 +549,7 @@ impl<T> Producer<T> {
     /// - The caller must initialize the reserved cell before the guard is
     ///   dropped.
     #[must_use]
-    pub unsafe fn reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
+    pub unsafe fn try_reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
         let start = self.lane.try_reserve(NonZeroUsize::MIN)?;
         Some(WriteGuard {
             producer: self,
@@ -564,7 +564,10 @@ impl<T> Producer<T> {
     /// - The caller must initialize every reserved cell before the batch is
     ///   dropped.
     #[must_use]
-    pub unsafe fn reserve_write_batch(&mut self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
+    pub unsafe fn try_reserve_write_batch(
+        &mut self,
+        count: NonZeroUsize,
+    ) -> Option<WriteBatch<'_, T>> {
         let start = self.lane.try_reserve(count)?;
         Some(WriteBatch {
             producer: self,
@@ -886,7 +889,7 @@ impl<T> Consumer<T> {
     /// at the value's sequence, so the producer cannot overwrite it until the
     /// guard is dropped, which advances past it.
     #[must_use]
-    pub fn reserve_read(&mut self) -> Option<ReadGuard<'_, T>> {
+    pub fn try_reserve_read(&mut self) -> Option<ReadGuard<'_, T>> {
         let (lane, sequence) = self.next_readable()?;
         let payload = self.lanes[lane].payload_ptr(sequence);
         Some(ReadGuard {
@@ -903,7 +906,7 @@ impl<T> Consumer<T> {
     /// so the producer cannot overwrite any of the batched cells until the guard
     /// is dropped, which advances past the whole batch.
     #[must_use]
-    pub fn reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
+    pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         let (lane, start) = self.next_readable()?;
         // `next_readable` guarantees at least one published value past `start`.
         let available = self.lanes[lane].published().wrapping_sub(start);
@@ -925,7 +928,7 @@ impl<T> Consumer<T> {
     ) -> Result<ReadGuard<'_, T>, WaitError> {
         self.wait_until_readable(timeout)?;
         Ok(self
-            .reserve_read()
+            .try_reserve_read()
             .expect("a lane is readable after a successful wait"))
     }
 
@@ -938,7 +941,7 @@ impl<T> Consumer<T> {
     ) -> Result<ReadBatch<'_, T>, WaitError> {
         self.wait_until_readable(timeout)?;
         Ok(self
-            .reserve_read_batch(max)
+            .try_reserve_read_batch(max)
             .expect("a lane is readable after a successful wait"))
     }
 
@@ -1164,7 +1167,7 @@ mod tests {
             {
                 // SAFETY: every reserved slot is initialized below.
                 let mut batch =
-                    unsafe { p.reserve_write_batch(NonZeroUsize::new(3).unwrap()) }.unwrap();
+                    unsafe { p.try_reserve_write_batch(NonZeroUsize::new(3).unwrap()) }.unwrap();
                 assert_eq!(batch.len(), 3);
                 for index in 0..3usize {
                     // SAFETY: index < len.
@@ -1342,7 +1345,7 @@ mod tests {
             let mut c = p.join_as_consumer().unwrap();
             assert!(p.try_write(10).is_ok());
 
-            let guard = c.reserve_read().expect("readable");
+            let guard = c.try_reserve_read().expect("readable");
             // SAFETY: the cell is published.
             assert_eq!(unsafe { *guard.as_ref() }, 10);
 
@@ -1374,18 +1377,18 @@ mod tests {
             // A single write guard publishes its cell when dropped.
             {
                 // SAFETY: the reserved slot is initialized before `guard` is dropped.
-                let mut guard = unsafe { p.reserve_write() }.unwrap();
+                let mut guard = unsafe { p.try_reserve_write() }.unwrap();
                 // SAFETY: `Payload` is `u64`, valid for any bytes.
                 unsafe { *guard.as_mut_ref() = 42 };
             }
             // `write` consumes the guard and publishes on drop too.
             // SAFETY: `write` initializes the reserved slot before publishing.
-            unsafe { p.reserve_write() }.unwrap().write(43);
+            unsafe { p.try_reserve_write() }.unwrap().write(43);
 
             // SAFETY: `Payload` is `u64`; `read` copies out, committing on drop.
-            assert_eq!(unsafe { c.reserve_read().unwrap().read() }, 42);
-            assert_eq!(unsafe { c.reserve_read().unwrap().read() }, 43);
-            assert!(c.reserve_read().is_none());
+            assert_eq!(unsafe { c.try_reserve_read().unwrap().read() }, 42);
+            assert_eq!(unsafe { c.try_reserve_read().unwrap().read() }, 43);
+            assert!(c.try_reserve_read().is_none());
         }
     }
 
@@ -1404,7 +1407,9 @@ mod tests {
 
             // Bounded by `max` (3) below the available run (5); drop commits it.
             {
-                let batch = c.reserve_read_batch(NonZeroUsize::new(3).unwrap()).unwrap();
+                let batch = c
+                    .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
+                    .unwrap();
                 assert_eq!(batch.len(), 3);
                 for index in 0..3 {
                     // SAFETY: `index < len`; `Payload` is `u64`.
@@ -1414,7 +1419,7 @@ mod tests {
             // Now bounded by the available run (2), not `max`.
             {
                 let batch = c
-                    .reserve_read_batch(NonZeroUsize::new(10).unwrap())
+                    .try_reserve_read_batch(NonZeroUsize::new(10).unwrap())
                     .unwrap();
                 assert_eq!(batch.len(), 2);
                 for index in 0..2 {
@@ -1423,7 +1428,7 @@ mod tests {
                 }
             }
             assert!(c
-                .reserve_read_batch(NonZeroUsize::new(1).unwrap())
+                .try_reserve_read_batch(NonZeroUsize::new(1).unwrap())
                 .is_none());
         }
     }
@@ -1443,7 +1448,9 @@ mod tests {
 
             // The batch holds the whole ring; the producer is fully blocked.
             {
-                let batch = c.reserve_read_batch(NonZeroUsize::new(4).unwrap()).unwrap();
+                let batch = c
+                    .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                    .unwrap();
                 assert_eq!(batch.len(), 4);
                 assert!(p.try_write(99).is_err());
             }
@@ -1485,10 +1492,10 @@ mod tests {
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
 
         // SAFETY: the reserved slot is initialized before the guard is dropped.
-        let mut guard = unsafe { producer.reserve_write() }.unwrap();
+        let mut guard = unsafe { producer.try_reserve_write() }.unwrap();
         let mut consumer = Consumer::from_queue(queue.clone(), false).unwrap();
 
-        assert!(consumer.reserve_read().is_none());
+        assert!(consumer.try_reserve_read().is_none());
         // SAFETY: `Payload` is `u64`, valid POD-like bytes.
         unsafe { *guard.as_mut_ref() = 42 };
         drop(guard);
