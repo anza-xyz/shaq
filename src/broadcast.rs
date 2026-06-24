@@ -1280,6 +1280,76 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
+    #[test]
+    fn threaded_producer_publish_is_visible_to_all_consumers() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const ITEMS: usize = 257;
+        const BATCH: usize = 7;
+
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 32,
+                producer_slots: 1,
+                consumer_slots: 2,
+            });
+            let consumers = [
+                producer.join_as_consumer().unwrap(),
+                producer.join_as_consumer().unwrap(),
+            ];
+            let start = Arc::new(Barrier::new(consumers.len() + 1));
+
+            let consumer_threads: Vec<_> = consumers
+                .into_iter()
+                .map(|mut consumer| {
+                    let start = Arc::clone(&start);
+                    thread::spawn(move || {
+                        start.wait();
+                        let mut seen = Vec::with_capacity(ITEMS);
+                        for _ in 0..ITEMS {
+                            seen.push(
+                                consumer
+                                    .read_timeout(Duration::from_secs(1))
+                                    .expect("published value"),
+                            );
+                        }
+                        assert!(matches!(
+                            consumer.read_timeout(Duration::ZERO),
+                            Err(WaitError::Timeout)
+                        ));
+                        seen
+                    })
+                })
+                .collect();
+
+            let producer_start = Arc::clone(&start);
+            let producer_thread = thread::spawn(move || {
+                producer_start.wait();
+                let mut next = 0usize;
+                while next < ITEMS {
+                    let count = (ITEMS - next).min(BATCH);
+                    let mut batch = [0u64; BATCH];
+                    for (offset, slot) in batch[..count].iter_mut().enumerate() {
+                        *slot = (next + offset) as u64;
+                    }
+                    if producer.try_write_slice(&batch[..count]) {
+                        next += count;
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            });
+
+            producer_thread.join().expect("producer thread");
+            let expected: Vec<_> = (0..ITEMS as u64).collect();
+            for consumer_thread in consumer_threads {
+                assert_eq!(consumer_thread.join().expect("consumer thread"), expected);
+            }
+        }
+    }
+
     #[test]
     fn slow_consumer_backpressures_producer() {
         for create in producer_creators() {
