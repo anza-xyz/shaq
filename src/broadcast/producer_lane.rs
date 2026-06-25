@@ -164,6 +164,7 @@ impl<T> ProducerLane<T> {
     }
 
     /// Claims the lane for a producer. Returns `false` if already owned.
+    #[must_use]
     pub(crate) fn try_acquire(&self) -> bool {
         self.header()
             .state
