@@ -78,6 +78,36 @@ struct SharedQueueHeader {
     wake_seq: CacheAlignedAtomicSize,
 }
 
+impl SharedQueueHeader {
+    /// Initializes the shared queue header and publishes the region.
+    ///
+    /// # Safety
+    /// - `header` must be non-null, properly aligned, and large enough for
+    ///   [`SharedQueueHeader`].
+    /// - Access to `header` must be unique.
+    /// - The queue's non-header sections must already be initialized.
+    unsafe fn init(header: NonNull<Self>, layout: &Layout) {
+        // SAFETY: caller guarantees valid, uniquely-owned storage for the header.
+        unsafe {
+            header.as_ptr().write(Self {
+                magic: AtomicU64::new(0),
+                version: VERSION,
+                capacity: layout.capacity,
+                producer_slots: layout.producer_slots as u32,
+                consumer_slots: layout.consumer_slots as u32,
+                waiters: Waiters::default(),
+                wake_seq: CacheAlignedAtomicSize::default(),
+            });
+        }
+
+        // Publish initialization last.
+        // SAFETY: the header was initialized by the write above.
+        unsafe { header.as_ref() }
+            .magic
+            .store(MAGIC, Ordering::Release);
+    }
+}
+
 /// Byte offsets and sizes of the region's sections (a construction-time helper;
 /// `SharedQueue` keeps only the runtime scalars from it).
 struct Layout {
@@ -213,15 +243,6 @@ impl<T> SharedQueue<T> {
     /// - `region` must be at least `layout.total` bytes and initialized once.
     unsafe fn initialize(region: &Arc<Region>, layout: &Layout) {
         let base = region.addr();
-        // SAFETY: regions are page-aligned and large enough for the header.
-        let header = unsafe { &mut *base.cast::<SharedQueueHeader>().as_ptr() };
-        header.version = VERSION;
-        header.capacity = layout.capacity;
-        header.producer_slots = layout.producer_slots as u32;
-        header.consumer_slots = layout.consumer_slots as u32;
-        // Global wake state: no waiters, wake counter at zero.
-        header.waiters.initialize();
-        header.wake_seq.store(0, Ordering::Release);
 
         // Global consumer-ownership table: every index free.
         let consumer_state = unsafe { base.byte_add(layout.consumer_state_offset) };
@@ -238,8 +259,12 @@ impl<T> SharedQueue<T> {
             unsafe { ProducerLane::<T>::init(block, layout.consumer_slots) };
         }
 
-        // Publish initialization last.
-        header.magic.store(MAGIC, Ordering::Release);
+        // Header initialization publishes the queue, so it runs after every
+        // other region section is initialized.
+        let header = base.cast::<SharedQueueHeader>();
+        // SAFETY: region is page-aligned, large enough for the header, uniquely
+        // initialized here, and all non-header sections are initialized above.
+        unsafe { SharedQueueHeader::init(header, layout) };
     }
 
     fn from_region(region: Arc<Region>, layout: Layout) -> Self {
