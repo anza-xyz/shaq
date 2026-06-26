@@ -891,7 +891,10 @@ impl<T> Consumer<T> {
 
     /// Reads the next available value by copying it out, or `None` if every lane
     /// is caught up.
-    pub fn try_read(&mut self) -> Option<T> {
+    pub fn try_read(&mut self) -> Option<T>
+    where
+        T: Copy,
+    {
         let (lane, sequence) = self.next_readable()?;
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
@@ -964,7 +967,10 @@ impl<T> Consumer<T> {
 
     /// Blocks until any lane has an unread value or `timeout` elapses, then
     /// copies it out; `Err(Timeout)` if none arrived in time.
-    pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError>
+    where
+        T: Copy,
+    {
         let guard = self.reserve_read_timeout(timeout)?;
         Ok(guard.read())
     }
@@ -1004,7 +1010,10 @@ pub struct ReadGuard<'a, T> {
 
 impl<T> ReadGuard<'_, T> {
     /// Copies the value out; the guard advances past it on drop.
-    pub fn read(self) -> T {
+    pub fn read(self) -> T
+    where
+        T: Copy,
+    {
         // SAFETY: the cell is published and held by this consumer's cursor.
         unsafe { self.payload.as_ptr().read() }
     }
@@ -1069,7 +1078,10 @@ impl<T> ReadBatch<'_, T> {
     ///
     /// # Safety
     /// - `index < len`
-    pub unsafe fn read(&self, index: usize) -> T {
+    pub unsafe fn read(&self, index: usize) -> T
+    where
+        T: Copy,
+    {
         // SAFETY: forwarded; the cell is published and held by this consumer's
         // cursor until the batch is dropped.
         unsafe { self.as_ptr(index).read() }
