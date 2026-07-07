@@ -129,11 +129,7 @@ struct QueueLayout {
 
 impl QueueLayout {
     fn new<T>(config: &BroadcastConfig) -> Result<Self, Error> {
-        Self::checked_new::<T>(config).ok_or(Error::InvalidBufferSize)
-    }
-
-    fn checked_new<T>(config: &BroadcastConfig) -> Option<Self> {
-        Self::checked_new_for_payload(config, Layout::new::<T>())
+        Self::checked_new_for_payload(config, Layout::new::<T>()).ok_or(Error::InvalidBufferSize)
     }
 
     fn new_for_payload(config: &BroadcastConfig, payload: Layout) -> Result<Self, Error> {
