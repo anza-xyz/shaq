@@ -794,6 +794,27 @@ impl<T> Drop for WriteBatch<'_, T> {
     }
 }
 
+/// A lane with published values past this consumer's cursor: `sequence` is the
+/// next unread sequence, `published` the publication that proved readability.
+/// The unread values stay protected from overwrite until the consumer calls
+/// [`ConsumerCore::advance`] for the lane.
+#[derive(Clone, Copy)]
+struct ReadableLane {
+    lane: usize,
+    sequence: usize,
+    published: usize,
+}
+
+impl ReadableLane {
+    /// Number of consecutive published values to read starting at `sequence`,
+    /// bounded by `max`.
+    fn count(&self, max: NonZeroUsize) -> NonZeroUsize {
+        let available = self.published.wrapping_sub(self.sequence);
+        let count = available.min(max.get());
+        NonZeroUsize::new(count).expect("readable lane has at least one value")
+    }
+}
+
 /// Shared consumer machinery: owns a consumer index, tracks one cursor per
 /// producer lane, and reserves raw payload pointers.
 struct ConsumerCore {
@@ -928,49 +949,9 @@ impl ConsumerCore {
         None
     }
 
-    /// Returns `(lane, payload)` for the next readable payload without advancing
-    /// this consumer's cursor.
-    ///
-    /// `lane` identifies which producer lane the payload came from. `payload`
-    /// points at the published cell for this consumer's current sequence on
-    /// that lane, and remains protected from overwrite until the caller later
-    /// calls [`Self::advance`] for the returned lane.
-    fn try_reserve_read(&mut self) -> Option<(usize, NonNull<u8>)> {
-        let readable = self.next_readable()?;
-        Some(self.reserve_read_at(readable))
-    }
-
-    fn reserve_read_at(&mut self, readable: ReadableLane) -> (usize, NonNull<u8>) {
-        let payload = self.lane(readable.lane).payload_ptr(readable.sequence);
-        (readable.lane, payload)
-    }
-
-    /// Returns `(lane, start, count)` for up to `max` consecutive readable
-    /// payloads from one producer lane without advancing this consumer's cursor.
-    ///
-    /// `lane` identifies the producer lane. `start` is the first sequence to
-    /// read on that lane. `count` is the number of consecutive published cells
-    /// reserved, bounded by both `max` and the lane's current publication. The
-    /// range `start..start + count` remains protected from overwrite until the
-    /// caller later calls [`Self::advance`] for the returned lane and count.
-    fn try_reserve_read_batch(
-        &mut self,
-        max: NonZeroUsize,
-    ) -> Option<(usize, usize, NonZeroUsize)> {
-        let readable = self.next_readable()?;
-        Some(self.reserve_read_batch_at(readable, max))
-    }
-
-    fn reserve_read_batch_at(
-        &mut self,
-        readable: ReadableLane,
-        max: NonZeroUsize,
-    ) -> (usize, usize, NonZeroUsize) {
-        // `next_readable` guarantees at least one published value past `sequence`.
-        let available = readable.published.wrapping_sub(readable.sequence);
-        let count = available.min(max.get());
-        let count = NonZeroUsize::new(count).expect("readable lane has at least one value");
-        (readable.lane, readable.sequence, count)
+    /// Pointer to the published cell at `readable`'s next unread sequence.
+    fn payload_ptr(&self, readable: ReadableLane) -> NonNull<u8> {
+        self.lane(readable.lane).payload_ptr(readable.sequence)
     }
 
     /// Advances this consumer's cursor on `lane` by `count` consumed values,
@@ -1018,13 +999,6 @@ unsafe impl Send for ConsumerCore {}
 pub struct Consumer<T> {
     core: ConsumerCore,
     _marker: PhantomData<T>,
-}
-
-#[derive(Clone, Copy)]
-struct ReadableLane {
-    lane: usize,
-    sequence: usize,
-    published: usize,
 }
 
 impl<T> Consumer<T> {
@@ -1126,12 +1100,13 @@ impl<T> Consumer<T> {
     where
         T: Copy,
     {
-        let (lane, payload) = self.core.try_reserve_read()?;
+        let readable = self.core.next_readable()?;
+        let payload = self.core.payload_ptr(readable);
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
         // advance below. The copy happens before the cursor advances.
         let value = unsafe { payload.cast::<T>().as_ptr().read() };
-        self.core.advance(lane, NonZeroUsize::MIN);
+        self.core.advance(readable.lane, NonZeroUsize::MIN);
         Some(value)
     }
 
@@ -1141,15 +1116,14 @@ impl<T> Consumer<T> {
     /// guard is dropped, which advances past it.
     #[must_use]
     pub fn try_reserve_read(&mut self) -> Option<ReadGuard<'_, T>> {
-        let readable = self.core.next_readable()?;
-        Some(self.reserve_read_at(readable))
+        Some(self.read_guard_for(self.core.next_readable()?))
     }
 
-    fn reserve_read_at(&mut self, readable: ReadableLane) -> ReadGuard<'_, T> {
-        let (lane, payload) = self.core.reserve_read_at(readable);
+    fn read_guard_for(&mut self, readable: ReadableLane) -> ReadGuard<'_, T> {
+        let payload = self.core.payload_ptr(readable);
         ReadGuard {
             consumer: &mut self.core,
-            lane,
+            lane: readable.lane,
             payload: payload.cast(),
         }
     }
@@ -1162,27 +1136,15 @@ impl<T> Consumer<T> {
     /// is dropped, which advances past the whole batch.
     #[must_use]
     pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
-        let (lane, start, count) = self.core.try_reserve_read_batch(max)?;
-        Some(ReadBatch {
-            consumer: &mut self.core,
-            lane,
-            start,
-            count,
-            _marker: PhantomData,
-        })
+        Some(self.read_batch_for(self.core.next_readable()?, max))
     }
 
-    fn reserve_read_batch_at(
-        &mut self,
-        readable: ReadableLane,
-        max: NonZeroUsize,
-    ) -> ReadBatch<'_, T> {
-        let (lane, start, count) = self.core.reserve_read_batch_at(readable, max);
+    fn read_batch_for(&mut self, readable: ReadableLane, max: NonZeroUsize) -> ReadBatch<'_, T> {
         ReadBatch {
             consumer: &mut self.core,
-            lane,
-            start,
-            count,
+            lane: readable.lane,
+            start: readable.sequence,
+            count: readable.count(max),
             _marker: PhantomData,
         }
     }
@@ -1193,8 +1155,7 @@ impl<T> Consumer<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<ReadGuard<'_, T>, WaitError> {
-        let readable = self.core.wait_until_readable(timeout)?;
-        Ok(self.reserve_read_at(readable))
+        Ok(self.read_guard_for(self.core.wait_until_readable(timeout)?))
     }
 
     /// Blocks until any lane has unread values or `timeout` elapses, then returns
@@ -1204,8 +1165,7 @@ impl<T> Consumer<T> {
         max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<ReadBatch<'_, T>, WaitError> {
-        let readable = self.core.wait_until_readable(timeout)?;
-        Ok(self.reserve_read_batch_at(readable, max))
+        Ok(self.read_batch_for(self.core.wait_until_readable(timeout)?, max))
     }
 
     /// Blocks until any lane has an unread value or `timeout` elapses, then
@@ -1417,16 +1377,15 @@ impl SliceConsumer {
     /// Alias for [`Self::try_read`].
     #[must_use]
     pub fn try_reserve_read(&mut self) -> Option<SliceReadGuard<'_>> {
-        let readable = self.core.next_readable()?;
-        Some(self.reserve_read_at(readable))
+        Some(self.read_guard_for(self.core.next_readable()?))
     }
 
-    fn reserve_read_at(&mut self, readable: ReadableLane) -> SliceReadGuard<'_> {
-        let (lane, payload) = self.core.reserve_read_at(readable);
+    fn read_guard_for(&mut self, readable: ReadableLane) -> SliceReadGuard<'_> {
+        let payload = self.core.payload_ptr(readable);
         let len = self.core.payload_size();
         SliceReadGuard {
             consumer: &mut self.core,
-            lane,
+            lane: readable.lane,
             payload,
             len,
         }
@@ -1436,29 +1395,16 @@ impl SliceConsumer {
     /// readable lane, or `None` if every lane is caught up.
     #[must_use]
     pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<SliceReadBatch<'_>> {
-        let (lane, start, count) = self.core.try_reserve_read_batch(max)?;
-        let payload_size = self.core.payload_size();
-        Some(SliceReadBatch {
-            consumer: &mut self.core,
-            lane,
-            start,
-            count,
-            payload_size,
-        })
+        Some(self.read_batch_for(self.core.next_readable()?, max))
     }
 
-    fn reserve_read_batch_at(
-        &mut self,
-        readable: ReadableLane,
-        max: NonZeroUsize,
-    ) -> SliceReadBatch<'_> {
-        let (lane, start, count) = self.core.reserve_read_batch_at(readable, max);
+    fn read_batch_for(&mut self, readable: ReadableLane, max: NonZeroUsize) -> SliceReadBatch<'_> {
         let payload_size = self.core.payload_size();
         SliceReadBatch {
             consumer: &mut self.core,
-            lane,
-            start,
-            count,
+            lane: readable.lane,
+            start: readable.sequence,
+            count: readable.count(max),
             payload_size,
         }
     }
@@ -1475,8 +1421,7 @@ impl SliceConsumer {
         &mut self,
         timeout: Duration,
     ) -> Result<SliceReadGuard<'_>, WaitError> {
-        let readable = self.core.wait_until_readable(timeout)?;
-        Ok(self.reserve_read_at(readable))
+        Ok(self.read_guard_for(self.core.wait_until_readable(timeout)?))
     }
 
     /// Blocks until any lane has unread payloads or `timeout` elapses, then
@@ -1486,8 +1431,7 @@ impl SliceConsumer {
         max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<SliceReadBatch<'_>, WaitError> {
-        let readable = self.core.wait_until_readable(timeout)?;
-        Ok(self.reserve_read_batch_at(readable, max))
+        Ok(self.read_batch_for(self.core.wait_until_readable(timeout)?, max))
     }
 }
 
