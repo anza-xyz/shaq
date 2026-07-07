@@ -31,8 +31,9 @@
 mod consumer_state;
 mod producer_lane;
 
+use core::alloc::Layout;
 use core::marker::PhantomData;
-use core::mem::{align_of, size_of};
+use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::slice;
@@ -89,15 +90,15 @@ impl SharedQueueHeader {
     ///   [`SharedQueueHeader`].
     /// - Access to `header` must be unique.
     /// - The queue's non-header sections must already be initialized.
-    unsafe fn init(header: NonNull<Self>, layout: &Layout) {
+    unsafe fn init(header: NonNull<Self>, layout: &QueueLayout) {
         let value = Self {
             magic: AtomicU64::new(0),
             version: VERSION,
             capacity: layout.capacity,
             producer_slots: layout.producer_slots as u32,
             consumer_slots: layout.consumer_slots as u32,
-            payload_size: layout.payload_size,
-            payload_align: layout.payload_align,
+            payload_size: layout.payload_layout.size(),
+            payload_align: layout.payload_layout.align(),
             waiters: Waiters::default(),
             wake_seq: CacheAlignedAtomicSize::default(),
         };
@@ -115,44 +116,34 @@ impl SharedQueueHeader {
 
 /// Byte offsets and sizes of the region's sections (a construction-time helper;
 /// `SharedQueue` keeps only the runtime scalars from it).
-struct Layout {
+struct QueueLayout {
     capacity: u32,
     producer_slots: usize,
     consumer_slots: usize,
-    payload_size: usize,
-    payload_align: usize,
+    payload_layout: Layout,
     consumer_state_offset: usize,
     producer_blocks_offset: usize,
     block_stride: usize,
     total: usize,
 }
 
-impl Layout {
+impl QueueLayout {
     fn new<T>(config: &BroadcastConfig) -> Result<Self, Error> {
         Self::checked_new::<T>(config).ok_or(Error::InvalidBufferSize)
     }
 
     fn checked_new<T>(config: &BroadcastConfig) -> Option<Self> {
-        if align_of::<T>() > ProducerLane::block_align() {
+        Self::checked_new_for_payload(config, Layout::new::<T>())
+    }
+
+    fn new_for_payload(config: &BroadcastConfig, payload: Layout) -> Result<Self, Error> {
+        Self::checked_new_for_payload(config, payload).ok_or(Error::InvalidBufferSize)
+    }
+
+    fn checked_new_for_payload(config: &BroadcastConfig, payload: Layout) -> Option<Self> {
+        if payload.align() > ProducerLane::block_align() {
             return None;
         }
-        Self::checked_new_for_payload(config, size_of::<T>(), align_of::<T>())
-    }
-
-    fn new_for_payload(
-        config: &BroadcastConfig,
-        payload_size: usize,
-        payload_align: usize,
-    ) -> Result<Self, Error> {
-        Self::checked_new_for_payload(config, payload_size, payload_align)
-            .ok_or(Error::InvalidBufferSize)
-    }
-
-    fn checked_new_for_payload(
-        config: &BroadcastConfig,
-        payload_size: usize,
-        payload_align: usize,
-    ) -> Option<Self> {
         if config.capacity == 0 {
             return None;
         }
@@ -180,13 +171,9 @@ impl Layout {
         let producer_blocks_offset = consumer_state_offset
             .checked_add(consumer_state_bytes)?
             .checked_next_multiple_of(block_align)?;
-        let block_stride = producer_lane::block_size_for_payload(
-            capacity,
-            config.consumer_slots,
-            payload_size,
-            payload_align,
-        )?
-        .checked_next_multiple_of(block_align)?;
+        let block_stride =
+            producer_lane::block_size_for_payload(capacity, config.consumer_slots, payload)?
+                .checked_next_multiple_of(block_align)?;
         let producer_blocks_bytes = block_stride.checked_mul(config.producer_slots)?;
         let total = producer_blocks_offset.checked_add(producer_blocks_bytes)?;
 
@@ -194,8 +181,7 @@ impl Layout {
             capacity,
             producer_slots: config.producer_slots,
             consumer_slots: config.consumer_slots,
-            payload_size,
-            payload_align,
+            payload_layout: payload,
             consumer_state_offset,
             producer_blocks_offset,
             block_stride,
@@ -205,15 +191,31 @@ impl Layout {
 
     /// Reconstructs and validates the layout from an initialized header.
     fn from_header<T>(header: &SharedQueueHeader, region_size: usize) -> Result<Self, Error> {
-        if header.payload_size != size_of::<T>() || header.payload_align != align_of::<T>() {
+        let payload = Self::payload_from_header(header)?;
+        let expected = Layout::new::<T>();
+        if payload.size() != expected.size() || payload.align() != expected.align() {
             return Err(Error::InvalidBufferSize);
         }
-        Self::from_header_payload(header, region_size)
+        Self::from_header_with_payload(header, region_size, payload)
     }
 
     /// Reconstructs and validates the layout from an initialized header without
     /// knowing the producer's Rust payload type.
     fn from_header_payload(header: &SharedQueueHeader, region_size: usize) -> Result<Self, Error> {
+        let payload = Self::payload_from_header(header)?;
+        Self::from_header_with_payload(header, region_size, payload)
+    }
+
+    fn payload_from_header(header: &SharedQueueHeader) -> Result<Layout, Error> {
+        Layout::from_size_align(header.payload_size, header.payload_align)
+            .map_err(|_| Error::InvalidBufferSize)
+    }
+
+    fn from_header_with_payload(
+        header: &SharedQueueHeader,
+        region_size: usize,
+        payload: Layout,
+    ) -> Result<Self, Error> {
         let capacity = header.capacity as usize;
         let config = BroadcastConfig {
             capacity,
@@ -222,7 +224,7 @@ impl Layout {
         };
         // `capacity` is already a power of two, so the recomputed layout must
         // match the stored capacity exactly.
-        let layout = Layout::new_for_payload(&config, header.payload_size, header.payload_align)?;
+        let layout = QueueLayout::new_for_payload(&config, payload)?;
         if layout.capacity as usize != capacity || region_size < layout.total {
             return Err(Error::InvalidBufferSize);
         }
@@ -240,8 +242,7 @@ struct SharedQueue {
     capacity: u32,
     producer_slots: usize,
     block_stride: usize,
-    payload_size: usize,
-    payload_align: usize,
+    payload: Layout,
 }
 
 impl SharedQueue {
@@ -253,7 +254,7 @@ impl SharedQueue {
         region: &Arc<Region>,
         config: &BroadcastConfig,
     ) -> Result<Self, Error> {
-        let layout = Layout::new::<T>(config)?;
+        let layout = QueueLayout::new::<T>(config)?;
         if region.size() < layout.total {
             return Err(Error::InvalidBufferSize);
         }
@@ -267,7 +268,7 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region<T>(region: &Arc<Region>) -> Result<Self, Error> {
-        unsafe { Self::join_region_with(region, Layout::from_header::<T>) }
+        unsafe { Self::join_region_with(region, QueueLayout::from_header::<T>) }
     }
 
     /// Validates an initialized broadcast region and returns a handle without
@@ -276,12 +277,12 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region_untyped(region: &Arc<Region>) -> Result<Self, Error> {
-        unsafe { Self::join_region_with(region, Layout::from_header_payload) }
+        unsafe { Self::join_region_with(region, QueueLayout::from_header_payload) }
     }
 
     unsafe fn join_region_with(
         region: &Arc<Region>,
-        layout_from_header: impl FnOnce(&SharedQueueHeader, usize) -> Result<Layout, Error>,
+        layout_from_header: impl FnOnce(&SharedQueueHeader, usize) -> Result<QueueLayout, Error>,
     ) -> Result<Self, Error> {
         let header = region.addr().cast::<SharedQueueHeader>();
         // SAFETY: regions are page-aligned (>= align_of::<SharedQueueHeader>()).
@@ -301,7 +302,7 @@ impl SharedQueue {
 
     /// # Safety
     /// - `region` must be at least `layout.total` bytes and initialized once.
-    unsafe fn initialize(region: &Arc<Region>, layout: &Layout) {
+    unsafe fn initialize(region: &Arc<Region>, layout: &QueueLayout) {
         let base = region.addr();
 
         // Global consumer-ownership table: every index free.
@@ -327,7 +328,7 @@ impl SharedQueue {
         unsafe { SharedQueueHeader::init(header, layout) };
     }
 
-    fn from_region(region: Arc<Region>, layout: Layout) -> Self {
+    fn from_region(region: Arc<Region>, layout: QueueLayout) -> Self {
         let base = region.addr();
         let header = base.cast::<SharedQueueHeader>();
         // SAFETY: offsets lie within the region.
@@ -345,8 +346,7 @@ impl SharedQueue {
             capacity: layout.capacity,
             producer_slots: layout.producer_slots,
             block_stride: layout.block_stride,
-            payload_size: layout.payload_size,
-            payload_align: layout.payload_align,
+            payload: layout.payload_layout,
         }
     }
 
@@ -365,13 +365,7 @@ impl SharedQueue {
         };
         // SAFETY: the block was initialized with these parameters.
         unsafe {
-            ProducerLane::from_block(
-                block,
-                self.capacity,
-                self.consumer_slots(),
-                self.payload_size,
-                self.payload_align,
-            )
+            ProducerLane::from_block(block, self.capacity, self.consumer_slots(), self.payload)
         }
     }
 
@@ -443,7 +437,7 @@ impl SharedQueue {
     /// - `file` must be initialized as a queue at most once (by the designated
     ///   initializer) and not resized while any handle is joined.
     unsafe fn create<T>(file: &File, config: &BroadcastConfig) -> Result<Self, Error> {
-        let layout = Layout::new::<T>(config)?;
+        let layout = QueueLayout::new::<T>(config)?;
         file.set_len(layout.total as u64)?;
         let region = Region::map_file(file, layout.total)?;
         // SAFETY: caller guarantees this mapping is initialized exactly once.
@@ -484,8 +478,7 @@ impl Clone for SharedQueue {
             capacity: self.capacity,
             producer_slots: self.producer_slots,
             block_stride: self.block_stride,
-            payload_size: self.payload_size,
-            payload_align: self.payload_align,
+            payload: self.payload,
         }
     }
 }
@@ -887,7 +880,7 @@ impl ConsumerCore {
     }
 
     fn payload_size(&self) -> usize {
-        self.queue.payload_size
+        self.queue.payload.size()
     }
 
     #[inline]
@@ -1603,7 +1596,7 @@ mod tests {
     /// In-process (heap-backed) producer. The `Producer` keeps the region alive
     /// via its `SharedQueue`'s `Arc<Region>`.
     fn create_heap_producer(config: BroadcastConfig) -> Producer<Payload> {
-        let size = Layout::new::<Payload>(&config).expect("layout").total;
+        let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once here.
         let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
@@ -1753,7 +1746,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        let size = Layout::new::<Payload>(&config).unwrap().total;
+        let size = QueueLayout::new::<Payload>(&config).unwrap().total;
         let file = create_temp_shmem_file().expect("temp file");
         file.set_len(size as u64).expect("set_len");
         // SAFETY: sized-but-zeroed file → magic mismatch.
@@ -1768,7 +1761,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        let size = Layout::new::<Payload>(&config).expect("layout").total;
+        let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
         let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
@@ -1784,7 +1777,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        let size = Layout::new::<u64>(&config).expect("layout").total;
+        let size = QueueLayout::new::<u64>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
         unsafe { SharedQueue::create_in_region::<u64>(&region, &config) }.unwrap();
@@ -1877,7 +1870,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        assert!(Layout::new::<Payload>(&config).is_err());
+        assert!(QueueLayout::new::<Payload>(&config).is_err());
     }
 
     #[test]
@@ -1887,7 +1880,7 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         };
-        assert!(Layout::new::<Payload>(&config).is_err());
+        assert!(QueueLayout::new::<Payload>(&config).is_err());
     }
 
     #[test]
@@ -2288,7 +2281,7 @@ mod tests {
     /// Allocates a heap-backed queue and returns the shared handle (recovery
     /// tests need the queue directly to simulate a crashed handle).
     fn recovery_queue(config: &BroadcastConfig) -> SharedQueue {
-        let size = Layout::new::<Payload>(config).expect("layout").total;
+        let size = QueueLayout::new::<Payload>(config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
         unsafe { SharedQueue::create_in_region::<Payload>(&region, config) }.unwrap()

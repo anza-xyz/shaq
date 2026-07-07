@@ -2,6 +2,7 @@
 //! ownership state, its reserve/publication cursors, the per-consumer reserve
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
+use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -52,28 +53,24 @@ const fn consumer_state_offset() -> usize {
 
 pub(crate) fn ring_offset_for_payload(
     consumer_slots: usize,
-    payload_align: usize,
+    payload_layout: Layout,
 ) -> Option<usize> {
-    if payload_align == 0
-        || !payload_align.is_power_of_two()
-        || payload_align > ProducerLane::block_align()
-    {
+    if payload_layout.align() > ProducerLane::block_align() {
         return None;
     }
 
     consumer_state_offset()
         .checked_add(LaneConsumerState::block_size(consumer_slots)?)?
-        .checked_next_multiple_of(payload_align)
+        .checked_next_multiple_of(payload_layout.align())
 }
 
 pub(crate) fn block_size_for_payload(
     capacity: u32,
     consumer_slots: usize,
-    payload_size: usize,
-    payload_align: usize,
+    payload_layout: Layout,
 ) -> Option<usize> {
-    ring_offset_for_payload(consumer_slots, payload_align)?
-        .checked_add((capacity as usize).checked_mul(payload_size)?)
+    ring_offset_for_payload(consumer_slots, payload_layout)?
+        .checked_add((capacity as usize).checked_mul(payload_layout.size())?)
 }
 
 impl ProducerLane {
@@ -87,8 +84,8 @@ impl ProducerLane {
     ///
     /// # Safety
     /// - `block` must point at a [`block_size_for_payload`] region for the
-    ///   queue's `(capacity, consumer_slots, payload_size, payload_align)` and
-    ///   be initialized at most once.
+    ///   queue's `(capacity, consumer_slots, payload_layout)` and be initialized
+    ///   at most once.
     pub(crate) unsafe fn init(block: NonNull<u8>, consumer_slots: usize) {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
@@ -108,14 +105,13 @@ impl ProducerLane {
     ///
     /// # Safety
     /// - `block` must reference a block initialized by [`Self::init`] with the
-    ///   same `consumer_slots`, sized for `(capacity, payload_size,
-    ///   payload_align)`, alive for the view's use.
+    ///   same `consumer_slots`, sized for `(capacity, payload_layout)`, alive
+    ///   for the view's use.
     pub(crate) unsafe fn from_block(
         block: NonNull<u8>,
         capacity: u32,
         consumer_slots: usize,
-        payload_size: usize,
-        payload_align: usize,
+        payload_layout: Layout,
     ) -> Self {
         debug_assert!(capacity.is_power_of_two());
 
@@ -129,7 +125,7 @@ impl ProducerLane {
             LaneConsumerState::from_block(consumer_state_block, consumer_slots, capacity as usize)
         };
         let ring_offset =
-            ring_offset_for_payload(consumer_slots, payload_align).expect("validated_lane layout");
+            ring_offset_for_payload(consumer_slots, payload_layout).expect("validated_lane layout");
         // SAFETY: `block` is an initialized region - it must be large enough
         //         for ring data to fit (if init succeeded).
         let ring = unsafe { block.byte_add(ring_offset) };
@@ -138,7 +134,7 @@ impl ProducerLane {
             header,
             consumer_state,
             ring,
-            payload_size,
+            payload_size: payload_layout.size(),
             mask: (capacity as usize).wrapping_sub(1),
         }
     }
@@ -277,25 +273,14 @@ mod tests {
 
     /// Allocates and initializes a standalone lane block.
     fn lane(capacity: u32, consumer_slots: usize) -> (std::sync::Arc<Region>, ProducerLane) {
-        let size = block_size_for_payload(
-            capacity,
-            consumer_slots,
-            size_of::<Payload>(),
-            align_of::<Payload>(),
-        )
-        .unwrap();
+        let payload_layout = Layout::new::<Payload>();
+        let size = block_size_for_payload(capacity, consumer_slots, payload_layout).unwrap();
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).unwrap();
         // SAFETY: freshly allocated block, initialized once.
         unsafe { ProducerLane::init(region.addr(), consumer_slots) };
         // SAFETY: just initialized with these parameters.
         let lane = unsafe {
-            ProducerLane::from_block(
-                region.addr(),
-                capacity,
-                consumer_slots,
-                size_of::<Payload>(),
-                align_of::<Payload>(),
-            )
+            ProducerLane::from_block(region.addr(), capacity, consumer_slots, payload_layout)
         };
         (region, lane)
     }
