@@ -2,6 +2,7 @@
 //! ownership state, its reserve/publication cursors, the per-consumer reserve
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
+use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -29,16 +30,18 @@ struct LaneHeader {
 /// A single producer's lane.
 ///
 /// The lane holds ownership state, the reserve/publication cursors, the
-/// per-lane consumer reserve-limit state, and the ring of `T`. The owning
+/// per-lane consumer reserve-limit state, and the ring of fixed-size payload
+/// cells. The owning
 /// producer mutates the ring and producer cursors (`&mut self`); consumers read
 /// published payloads and publish their own progress through [`LaneConsumerState`].
 ///
 /// Block layout: `LaneHeader`, then `[CacheAlignedAtomicSize; consumer_slots]`
-/// limits (one per cache line), then `[T; capacity]`.
-pub(crate) struct ProducerLane<T> {
+/// limits (one per cache line), then the payload ring.
+pub(crate) struct ProducerLane {
     header: NonNull<LaneHeader>,
     consumer_state: LaneConsumerState,
-    ring: NonNull<T>,
+    ring: NonNull<u8>,
+    payload_size: usize,
 
     mask: usize, // capacity - 1
 }
@@ -48,35 +51,30 @@ const fn consumer_state_offset() -> usize {
     size_of::<LaneHeader>().next_multiple_of(LaneConsumerState::block_align())
 }
 
-#[inline]
-fn ring_offset<T>(consumer_slots: usize) -> Option<usize> {
-    consumer_state_offset()
-        .checked_add(LaneConsumerState::block_size(consumer_slots)?)?
-        .checked_next_multiple_of(align_of::<T>())
-}
-
-impl<T> ProducerLane<T> {
-    /// Bytes needed for one lane block of `capacity` payload cells and
-    /// `consumer_slots` consumer slots.
-    pub(crate) fn block_size(capacity: u32, consumer_slots: usize) -> Option<usize> {
-        ring_offset::<T>(consumer_slots)?
-            .checked_add((capacity as usize).checked_mul(size_of::<T>())?)
+pub(crate) fn ring_offset_for_payload(
+    consumer_slots: usize,
+    payload_layout: Layout,
+) -> Option<usize> {
+    if payload_layout.align() > ProducerLane::block_align() {
+        return None;
     }
 
-    /// Required alignment of a lane block: the `LaneHeader`'s alignment.
-    ///
-    /// The block starts with the `LaneHeader`; the trailing `[T]` ring is aligned
-    /// by its offset within the block (`ring_offset` is a multiple of
-    /// `align_of::<T>()`), so the block itself only needs the header's alignment —
-    /// as long as `T`'s alignment divides it, which holds for any normal payload
-    /// (alignment ≤ 64). Asserted so an over-aligned `T` is a clear compile error.
+    consumer_state_offset()
+        .checked_add(LaneConsumerState::block_size(consumer_slots)?)?
+        .checked_next_multiple_of(payload_layout.align())
+}
+
+pub(crate) fn block_size_for_payload(
+    capacity: u32,
+    consumer_slots: usize,
+    payload_layout: Layout,
+) -> Option<usize> {
+    ring_offset_for_payload(consumer_slots, payload_layout)?
+        .checked_add((capacity as usize).checked_mul(payload_layout.size())?)
+}
+
+impl ProducerLane {
     pub(crate) const fn block_align() -> usize {
-        const {
-            assert!(
-                align_of::<T>() <= align_of::<LaneHeader>(),
-                "payload alignment exceeds the lane header alignment",
-            );
-        }
         align_of::<LaneHeader>()
     }
 
@@ -85,17 +83,18 @@ impl<T> ProducerLane<T> {
     /// published, and read only after).
     ///
     /// # Safety
-    /// - `block` must point at a [`Self::block_size`] region for `(capacity,
-    ///   consumer_slots)` and be initialized at most once.
+    /// - `block` must point at a [`block_size_for_payload`] region for the
+    ///   queue's `(capacity, consumer_slots, payload_layout)` and be initialized
+    ///   at most once.
     pub(crate) unsafe fn init(block: NonNull<u8>, consumer_slots: usize) {
+        let header = LaneHeader {
+            state: AtomicU64::new(LANE_FREE),
+            producer_reservation: CacheAlignedAtomicSize::default(),
+            producer_publication: CacheAlignedAtomicSize::default(),
+        };
+        let header_ptr = block.cast::<LaneHeader>().as_ptr();
         // SAFETY: `block` begins with a `LaneHeader`.
-        unsafe {
-            block.cast::<LaneHeader>().as_ptr().write(LaneHeader {
-                state: AtomicU64::new(LANE_FREE),
-                producer_reservation: CacheAlignedAtomicSize::default(),
-                producer_publication: CacheAlignedAtomicSize::default(),
-            });
-        }
+        unsafe { header_ptr.write(header) };
         // SAFETY: layout reserves `consumer_slots` aligned slots here.
         let consumer_state = unsafe { block.byte_add(consumer_state_offset()) };
         // SAFETY: freshly initialized lane block; consumer slots are initialized once.
@@ -106,35 +105,36 @@ impl<T> ProducerLane<T> {
     ///
     /// # Safety
     /// - `block` must reference a block initialized by [`Self::init`] with the
-    ///   same `consumer_slots`, sized for `capacity`, alive for the view's use.
+    ///   same `consumer_slots`, sized for `(capacity, payload_layout)`, alive
+    ///   for the view's use.
     pub(crate) unsafe fn from_block(
         block: NonNull<u8>,
         capacity: u32,
         consumer_slots: usize,
+        payload_layout: Layout,
     ) -> Self {
         debug_assert!(capacity.is_power_of_two());
 
         let header = block.cast();
         // SAFETY: `block` is an initialized region - it must be large enough
         //         for consumer state to fit (if init succeeded).
+        let consumer_state_block = unsafe { block.byte_add(consumer_state_offset()) };
+        // SAFETY: `block` is an initialized region - it must be large enough
+        //         for consumer state to fit (if init succeeded).
         let consumer_state = unsafe {
-            LaneConsumerState::from_block(
-                block.byte_add(consumer_state_offset()),
-                consumer_slots,
-                capacity as usize,
-            )
+            LaneConsumerState::from_block(consumer_state_block, consumer_slots, capacity as usize)
         };
+        let ring_offset =
+            ring_offset_for_payload(consumer_slots, payload_layout).expect("validated_lane layout");
         // SAFETY: `block` is an initialized region - it must be large enough
         //         for ring data to fit (if init succeeded).
-        let ring = unsafe {
-            block.byte_add(ring_offset::<T>(consumer_slots).expect("validated_lane layout"))
-        }
-        .cast();
+        let ring = unsafe { block.byte_add(ring_offset) };
 
         Self {
             header,
             consumer_state,
             ring,
+            payload_size: payload_layout.size(),
             mask: (capacity as usize).wrapping_sub(1),
         }
     }
@@ -158,9 +158,11 @@ impl<T> ProducerLane<T> {
     /// Pointer to the ring cell holding `sequence` — used by the producer to
     /// write a reserved cell and by consumers to read a published one.
     #[inline]
-    pub(crate) fn payload_ptr(&self, sequence: usize) -> NonNull<T> {
-        // SAFETY: `sequence & mask < capacity`; the ring has `capacity` cells.
-        unsafe { self.ring.add(sequence & self.mask) }
+    pub(crate) fn payload_ptr(&self, sequence: usize) -> NonNull<u8> {
+        let offset = (sequence & self.mask).wrapping_mul(self.payload_size);
+        // SAFETY: `sequence & mask < capacity`; the ring has `capacity` cells of
+        // `payload_size` bytes. Zero-sized payloads always point at the ring base.
+        unsafe { self.ring.byte_add(offset) }
     }
 
     /// Claims the lane for a producer. Returns `false` if already owned.
@@ -270,30 +272,25 @@ mod tests {
     type Payload = u64;
 
     /// Allocates and initializes a standalone lane block.
-    fn lane(
-        capacity: u32,
-        consumer_slots: usize,
-    ) -> (std::sync::Arc<Region>, ProducerLane<Payload>) {
-        let size = ProducerLane::<Payload>::block_size(capacity, consumer_slots).unwrap();
+    fn lane(capacity: u32, consumer_slots: usize) -> (std::sync::Arc<Region>, ProducerLane) {
+        let payload_layout = Layout::new::<Payload>();
+        let size = block_size_for_payload(capacity, consumer_slots, payload_layout).unwrap();
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).unwrap();
         // SAFETY: freshly allocated block, initialized once.
-        unsafe { ProducerLane::<Payload>::init(region.addr(), consumer_slots) };
+        unsafe { ProducerLane::init(region.addr(), consumer_slots) };
         // SAFETY: just initialized with these parameters.
-        let lane =
-            unsafe { ProducerLane::<Payload>::from_block(region.addr(), capacity, consumer_slots) };
+        let lane = unsafe {
+            ProducerLane::from_block(region.addr(), capacity, consumer_slots, payload_layout)
+        };
         (region, lane)
     }
 
-    fn read(lane: &ProducerLane<Payload>, sequence: usize) -> Payload {
+    fn read(lane: &ProducerLane, sequence: usize) -> Payload {
         // SAFETY: `sequence` was published, so its cell is initialized.
-        unsafe { lane.payload_ptr(sequence).as_ptr().read() }
+        unsafe { lane.payload_ptr(sequence).cast::<Payload>().as_ptr().read() }
     }
 
-    fn join_consumer(
-        lane: &ProducerLane<Payload>,
-        consumer_index: usize,
-        from_backlog: bool,
-    ) -> usize {
+    fn join_consumer(lane: &ProducerLane, consumer_index: usize, from_backlog: bool) -> usize {
         let consumer_state = lane.consumer_state();
         consumer_state.join(consumer_index, from_backlog, lane.published(), || {
             lane.reserved()
@@ -301,13 +298,18 @@ mod tests {
     }
 
     /// Reserves, writes, and publishes one value; `false` on backpressure.
-    fn publish_value(lane: &mut ProducerLane<Payload>, value: Payload) -> bool {
+    fn publish_value(lane: &mut ProducerLane, value: Payload) -> bool {
         let one = NonZeroUsize::new(1).unwrap();
         let Some(start) = lane.try_reserve(one) else {
             return false;
         };
         // SAFETY: the cell is reserved and not yet published.
-        unsafe { lane.payload_ptr(start).as_ptr().write(value) };
+        unsafe {
+            lane.payload_ptr(start)
+                .cast::<Payload>()
+                .as_ptr()
+                .write(value)
+        };
         lane.publish(start, one);
         true
     }
@@ -345,6 +347,7 @@ mod tests {
             // SAFETY: each cell in the batch is reserved and unpublished.
             unsafe {
                 lane.payload_ptr(start.wrapping_add(offset))
+                    .cast::<Payload>()
                     .as_ptr()
                     .write((offset as u64) + 1)
             };
