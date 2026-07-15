@@ -123,8 +123,13 @@ impl<T> Producer<T> {
     /// published in order they were reserved. Holding a [`WriteGuard`] should
     /// be treated similarly to holding a lock on a critical section.
     ///
+    /// The slot is logically uninitialized when reserved. Raw writes to an
+    /// already initialized slot overwrite the previous value without running
+    /// its destructor.
+    ///
     /// # Safety
-    /// - The caller must initialize the reserved slot before the guard is dropped.
+    /// - The caller must leave the reserved slot initialized with a valid `T`
+    ///   before the guard is dropped.
     #[must_use]
     pub unsafe fn try_reserve_write(&self) -> Option<WriteGuard<'_, T>> {
         self.queue
@@ -144,8 +149,13 @@ impl<T> Producer<T> {
     /// published in the order they were reserved. Holding a [`WriteBatch`]
     /// should be treated similarly to holding a lock on a critical section.
     ///
+    /// Every slot is logically uninitialized when reserved. Raw writes to an
+    /// already initialized slot overwrite the previous value without running
+    /// its destructor.
+    ///
     /// # Safety
-    /// - The caller must initialize all reserved slots before the batch is dropped.
+    /// - The caller must leave every reserved slot initialized with a valid `T`
+    ///   before the batch is dropped.
     #[must_use]
     pub unsafe fn try_reserve_write_batch(&self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
         let start = self.queue.reserve_write_batch(count)?;
@@ -361,13 +371,16 @@ impl<T> Consumer<T> {
             .store(release, Ordering::Release);
     }
 
-    /// Drops all reserved-but-not-released reads left behind by a previous
+    /// Discards all reserved-but-not-released reads left behind by a previous
     /// consumer process.
     ///
     /// This advances `consumer_release` up to `consumer_reservation`,
     /// discarding items already claimed by the previous consumer process after
     /// their guards were lost without running `Drop` and making their capacity
     /// reusable by producers.
+    ///
+    /// Payload destructors are not run. Discarding values that own resources
+    /// may therefore leak those resources.
     ///
     /// # Safety
     /// - This must only be called when the caller can prove that no other
@@ -799,6 +812,11 @@ impl SharedQueueHeader {
 }
 
 #[must_use]
+/// A reservation for one logically uninitialized producer slot.
+///
+/// Initialize the slot with [`Self::write`] or through [`AsMut::as_mut`]
+/// before dropping the guard. Initializing it through both paths overwrites
+/// the first value without running its destructor.
 pub struct WriteGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
@@ -816,6 +834,11 @@ impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
 }
 
 impl<'a, T> WriteGuard<'a, T> {
+    /// Initializes the reserved slot.
+    ///
+    /// This performs a raw write. If the slot was already initialized through
+    /// [`AsMut::as_mut`], the previous value is overwritten without running
+    /// its destructor.
     pub fn write(self, value: T) {
         // SAFETY: The cell was reserved for writing.
         unsafe { self.cell.write(value) };
@@ -872,6 +895,11 @@ impl<'a, T> Drop for ReadGuard<'a, T> {
 }
 
 #[must_use]
+/// A reservation for logically uninitialized producer slots.
+///
+/// Every slot must contain a valid `T` before the batch is dropped. Repeatedly
+/// initializing one slot overwrites the previous value without running its
+/// destructor unless the caller first moves out or drops that value.
 pub struct WriteBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
@@ -893,10 +921,13 @@ impl<'a, T> WriteBatch<'a, T> {
 
     /// Returns a mutable reference to the reserved slot.
     ///
+    /// Writing through the returned [`MaybeUninit`] does not drop a value
+    /// already in the slot.
+    ///
     /// # Safety
-    /// - The slot is uninitialized; caller must fully initialize `T`.
-    /// - `index < count`
-    /// - `T` must be valid for any bytes.
+    /// - `index` must be less than [`Self::len`].
+    /// - The caller must leave the slot initialized with a valid `T` before
+    ///   the batch is dropped.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
@@ -906,8 +937,10 @@ impl<'a, T> WriteBatch<'a, T> {
 
     /// Writes a value into the slot at index.
     ///
+    /// This performs a raw write and does not drop a value already in the slot.
+    ///
     /// # Safety
-    /// - `index < count`
+    /// - `index` must be less than [`Self::len`].
     pub unsafe fn write(&mut self, index: usize, value: T) {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
