@@ -1206,7 +1206,7 @@ impl<T: Copy> ReadGuard<'_, T> {
     }
 }
 
-impl<T: Copy> AsRef<T> for ReadGuard<'_, T> {
+impl<T: Copy + Sync> AsRef<T> for ReadGuard<'_, T> {
     fn as_ref(&self) -> &T {
         // SAFETY: the cell is published and held by this consumer's cursor.
         unsafe { self.payload.as_ref() }
@@ -1245,7 +1245,10 @@ impl<T: Copy> ReadBatch<'_, T> {
     ///
     /// # Safety
     /// - `index < len`
-    pub unsafe fn as_ref(&self, index: usize) -> &T {
+    pub unsafe fn as_ref(&self, index: usize) -> &T
+    where
+        T: Sync,
+    {
         debug_assert!(index < self.count.get());
         let ptr = self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
