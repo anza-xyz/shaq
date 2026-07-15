@@ -494,6 +494,7 @@ pub struct Producer<T> {
     lane: ProducerLane,
     index: usize,
     _marker: PhantomData<T>,
+    _invariant: PhantomData<fn(T) -> T>,
 }
 
 impl<T> Producer<T> {
@@ -531,6 +532,7 @@ impl<T> Producer<T> {
             lane,
             index,
             _marker: PhantomData,
+            _invariant: PhantomData,
         })
     }
 
@@ -569,6 +571,7 @@ impl<T> Producer<T> {
             lane,
             index,
             _marker: PhantomData,
+            _invariant: PhantomData,
         })
     }
 
@@ -999,6 +1002,7 @@ unsafe impl Send for ConsumerCore {}
 pub struct Consumer<T> {
     core: ConsumerCore,
     _marker: PhantomData<T>,
+    _invariant: PhantomData<fn(T) -> T>,
 }
 
 impl<T> Consumer<T> {
@@ -1042,6 +1046,7 @@ impl<T> Consumer<T> {
         Ok(Self {
             core: ConsumerCore::from_queue(queue, from_backlog)?,
             _marker: PhantomData,
+            _invariant: PhantomData,
         })
     }
 
@@ -1074,6 +1079,7 @@ impl<T> Consumer<T> {
         Ok(Self {
             core: ConsumerCore::recover_in_queue(queue, index)?,
             _marker: PhantomData,
+            _invariant: PhantomData,
         })
     }
 

@@ -427,6 +427,10 @@ struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
     buffer_mask: usize,
+    // `NonNull<T>` is covariant, but paired endpoints must not be independently
+    // coerced to different payload lifetimes. The function input/output marker
+    // makes `T` invariant without affecting layout or auto traits.
+    _invariant: PhantomData<fn(T) -> T>,
 
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
@@ -439,6 +443,7 @@ impl<T> Clone for SharedQueue<T> {
             header: self.header,
             buffer: self.buffer,
             buffer_mask: self.buffer_mask,
+            _invariant: PhantomData,
             region: Arc::clone(&self.region),
         }
     }
@@ -565,8 +570,9 @@ impl<T> SharedQueue<T> {
         Ok(Self {
             header,
             buffer,
-            region,
             buffer_mask,
+            _invariant: PhantomData,
+            region,
         })
     }
 
