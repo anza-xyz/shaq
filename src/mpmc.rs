@@ -7,7 +7,12 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
 };
-use core::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, sync::atomic::Ordering};
+use core::{
+    marker::PhantomData,
+    mem::{ManuallyDrop, MaybeUninit},
+    ptr::NonNull,
+    sync::atomic::Ordering,
+};
 use std::{
     fs::File,
     num::NonZeroUsize,
@@ -279,7 +284,8 @@ impl<T> Consumer<T> {
     }
 
     /// Attempts to reserve a value from the queue, returning a guard.
-    /// The slot is released back to producers when the guard is dropped.
+    /// Reading the guard moves the value out; dropping it unread drops the
+    /// value. Either path releases the slot back to producers.
     ///
     /// Other [`Consumer`]s may read in parallel, but reads must be
     /// released in order they were reserved. Holding a [`ReadGuard`] should
@@ -859,6 +865,11 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
 }
 
 #[must_use]
+/// A reservation for one initialized consumer slot.
+///
+/// [`Self::read`] moves the value out of the queue. Dropping the guard without
+/// reading it drops the queued value. Either path releases the slot back to
+/// producers.
 pub struct ReadGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
@@ -867,9 +878,25 @@ pub struct ReadGuard<'a, T> {
 }
 
 impl<'a, T> ReadGuard<'a, T> {
+    fn release(&self) {
+        // SAFETY: A ReadGuard owns one reserved consumer slot. Both call sites
+        // invoke this helper exactly once after moving the value out.
+        unsafe {
+            SharedQueueHeader::publish_consumer_release(
+                self.header,
+                self.start,
+                NON_ZERO_USIZE_ONE,
+            );
+        }
+    }
+
+    /// Moves the reserved value out of the queue and releases its slot.
     pub fn read(self) -> T {
+        let guard = ManuallyDrop::new(self);
         // SAFETY: The cell was reserved for reading and holds an initialized value.
-        unsafe { self.cell.read() }
+        let value = unsafe { guard.cell.read() };
+        guard.release();
+        value
     }
 }
 
@@ -883,14 +910,14 @@ impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
 
 impl<'a, T> Drop for ReadGuard<'a, T> {
     fn drop(&mut self) {
-        // SAFETY: This guard owns one reserved consumer slot.
-        unsafe {
-            SharedQueueHeader::publish_consumer_release(
-                self.header,
-                self.start,
-                NON_ZERO_USIZE_ONE,
-            );
-        }
+        // SAFETY: This guard owns an initialized value that was not moved out.
+        let value = unsafe { self.cell.read() };
+        // The value now lives outside the shared cell, so the cell can be
+        // released before running its destructor. This ordering lets producers
+        // reuse the cell and prevents a panicking destructor from wedging the
+        // consumer-release cursor.
+        self.release();
+        drop(value);
     }
 }
 
