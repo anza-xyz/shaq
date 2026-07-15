@@ -24,7 +24,7 @@ use std::{
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
 
 pub struct Producer<T> {
-    queue: SharedQueue<T>,
+    queue: Arc<SharedQueue<T>>,
 }
 
 impl<T> Producer<T> {
@@ -67,7 +67,7 @@ impl<T> Producer<T> {
     /// Creates a Consumer that shares the same memory mapping.
     pub fn join_as_consumer(&self) -> Consumer<T> {
         Consumer {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 
@@ -200,7 +200,7 @@ impl<T> Producer<T> {
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         Self {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 }
@@ -209,7 +209,7 @@ unsafe impl<T: Send> Send for Producer<T> {}
 unsafe impl<T: Send> Sync for Producer<T> {}
 
 pub struct Consumer<T> {
-    queue: SharedQueue<T>,
+    queue: Arc<SharedQueue<T>>,
 }
 
 impl<T> Consumer<T> {
@@ -252,7 +252,7 @@ impl<T> Consumer<T> {
     /// Creates a Producer that shares the same memory mapping.
     pub fn join_as_producer(&self) -> Producer<T> {
         Producer {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 
@@ -449,7 +449,7 @@ impl<T> Consumer<T> {
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
         Self {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 }
@@ -472,15 +472,15 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 
 /// Creates a new in-process MPMC queue pair backed by a heap allocation.
 ///
-/// Values left buffered when the queue is dropped may be leaked instead of
-/// having their destructors run.
+/// Buffered values are dropped with the last endpoint. Values held by
+/// forgotten reservations may be leaked.
 pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
     let region_size = minimum_region_size::<T>(capacity);
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
-    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
-    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    let producer = unsafe { Producer::from_header(region, header) }?;
+    let consumer = producer.join_as_consumer();
     Ok((producer, consumer))
 }
 
@@ -493,19 +493,27 @@ struct SharedQueue<T> {
     // makes `T` invariant without affecting layout or auto traits.
     _invariant: PhantomData<fn(T) -> T>,
 
-    // NB: Region must be declared last so it is dropped last ensuring `header` and
-    // `buffer` remain valid for their entire lifetime.
+    // NB: Region must be declared last so it remains alive throughout Drop.
     region: Arc<Region>,
 }
 
-impl<T> Clone for SharedQueue<T> {
-    fn clone(&self) -> Self {
-        Self {
-            header: self.header,
-            buffer: self.buffer,
-            buffer_mask: self.buffer_mask,
-            _invariant: PhantomData,
-            region: Arc::clone(&self.region),
+impl<T> Drop for SharedQueue<T> {
+    fn drop(&mut self) {
+        if !self.region.is_heap() || !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        // SharedQueue is dropped by its Arc after the last endpoint disappears,
+        // so no endpoint can access the header or buffer during cleanup.
+        let header = unsafe { self.header.as_ref() };
+        let mut position = header.consumer_reservation.load(Ordering::Acquire);
+        let publication = header.producer_publication.load(Ordering::Acquire);
+
+        while position != publication {
+            // SAFETY: Positions from the consumer reservation cursor through
+            // producer publication contain initialized, unclaimed values.
+            unsafe { self.buffer.add(position & self.buffer_mask).drop_in_place() };
+            position = position.wrapping_add(1);
         }
     }
 }
@@ -612,7 +620,7 @@ impl<T> SharedQueue<T> {
     unsafe fn from_header(
         region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Arc<Self>, Error> {
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
@@ -628,13 +636,13 @@ impl<T> SharedQueue<T> {
         // - `header` is non-null and aligned properly.
         // - allocation at `header` is large enough to hold the header and the buffer.
         let buffer = unsafe { Self::buffer_from_header(header) };
-        Ok(Self {
+        Ok(Arc::new(Self {
             header,
             buffer,
             buffer_mask,
             _invariant: PhantomData,
             region,
-        })
+        }))
     }
 
     /// Gets a pointer to the buffer following the header.
@@ -1395,6 +1403,23 @@ mod tests {
             producer2.try_write(42).unwrap();
             assert_eq!(consumer.try_read(), Some(42));
         }
+    }
+
+    #[test]
+    fn test_heap_pair_drops_buffered_value_with_last_endpoint() {
+        let value = Arc::new(());
+        let (producer, consumer) = pair(4).expect("failed to create queue");
+        let producer2 = producer.clone();
+        let consumer2 = consumer.clone();
+
+        producer.try_write(Arc::clone(&value)).unwrap();
+        drop(producer);
+        drop(consumer);
+        drop(producer2);
+        assert_eq!(Arc::strong_count(&value), 2);
+
+        drop(consumer2);
+        assert_eq!(Arc::strong_count(&value), 1);
     }
 
     #[test]
