@@ -717,8 +717,9 @@ pub struct WriteGuard<'a, T> {
 impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
     fn as_mut(&mut self) -> &mut MaybeUninit<T> {
+        let mut ptr = self.producer.lane.payload_ptr(self.start).cast();
         // SAFETY: forwarded; the cell is reserved for this producer.
-        unsafe { &mut *self.producer.lane.payload_ptr(self.start).as_ptr().cast() }
+        unsafe { ptr.as_mut() }
     }
 }
 
@@ -767,14 +768,13 @@ impl<T> WriteBatch<'_, T> {
     /// - `index < len`.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
-        let ptr = self
+        let mut ptr = self
             .producer
             .lane
             .payload_ptr(self.start.wrapping_add(index))
-            .cast::<T>()
-            .as_ptr();
+            .cast();
         // SAFETY: forwarded; the cell is reserved for this producer.
-        unsafe { &mut *ptr.cast() }
+        unsafe { ptr.as_mut() }
     }
 
     /// Writes `value` into the reserved cell at `index`.
@@ -1247,11 +1247,10 @@ impl<T> ReadBatch<'_, T> {
         debug_assert!(index < self.count.get());
         let ptr = self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
-            .as_ptr()
             .cast();
         // SAFETY: the cell is published and held by this consumer's
         // cursor.
-        unsafe { &*ptr }
+        unsafe { ptr.as_ref() }
     }
 
     /// Copies the value at `index` out.

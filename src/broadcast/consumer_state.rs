@@ -108,7 +108,7 @@ impl ConsumerState {
     fn slot(&self, index: usize) -> &AtomicU64 {
         debug_assert!(index < self.slot_count);
         // SAFETY: `index < slot_count`; the slot was initialized.
-        unsafe { &*self.slots.add(index).as_ptr() }
+        unsafe { self.slots.add(index).as_ref() }
     }
 }
 
@@ -285,7 +285,7 @@ impl LaneConsumerState {
     fn limit(&self, consumer_index: usize) -> &CacheAlignedAtomicSize {
         debug_assert!(consumer_index < self.slot_count);
         // SAFETY: `consumer_index < slot_count`; the slot was initialized.
-        unsafe { &*self.limits.add(consumer_index).as_ptr() }
+        unsafe { self.limits.add(consumer_index).as_ref() }
     }
 }
 

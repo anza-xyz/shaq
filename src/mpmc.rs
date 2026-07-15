@@ -803,8 +803,9 @@ pub struct WriteGuard<'a, T> {
 impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
     fn as_mut(&mut self) -> &mut MaybeUninit<T> {
+        let mut cell = self.cell.cast();
         // SAFETY: The cell was reserved for writing.
-        unsafe { &mut *self.cell.as_ptr().cast() }
+        unsafe { cell.as_mut() }
     }
 }
 
