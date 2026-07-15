@@ -309,12 +309,31 @@ impl<T> Consumer<T> {
     /// Attempts to reserve up to `max` values from the queue.
     /// The slots are released back to producers when the batch is dropped.
     ///
-    ///
     /// Other [`Consumer`]s may read in parallel, but reads must be
     /// released in order they were reserved. Holding a [`ReadBatch`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
-    pub fn try_reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
+    pub fn try_reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>>
+    where
+        T: Copy,
+    {
+        // SAFETY: Copy values may be duplicated or discarded.
+        unsafe { self.try_reserve_read_batch_raw(max) }
+    }
+
+    /// Attempts to reserve up to `max` values from the queue.
+    ///
+    /// The slots are released back to producers when the batch is dropped.
+    /// For non-`Copy` `T`, the caller is responsible for moving out or dropping
+    /// every value before then; otherwise those values are leaked. Leak-free
+    /// behavior during unwinding requires the caller to arrange cleanup of the
+    /// remaining values.
+    ///
+    /// # Safety
+    /// - A non-`Copy` value may be moved out at most once.
+    /// - A slot must not be referenced after its value has been moved out.
+    #[must_use]
+    pub unsafe fn try_reserve_read_batch_raw(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         let (start, count) = self.queue.reserve_read_batch(max)?;
         Some(ReadBatch {
             header: self.queue.header,
@@ -335,8 +354,31 @@ impl<T> Consumer<T> {
         &self,
         max: NonZeroUsize,
         timeout: Duration,
-    ) -> Result<ReadBatch<'_, T>, WaitError> {
+    ) -> Result<ReadBatch<'_, T>, WaitError>
+    where
+        T: Copy,
+    {
         self.wait_for_read(timeout, || self.try_reserve_read_batch(max))
+    }
+
+    /// Attempts to reserve up to `max` values, waiting up to `timeout` for a
+    /// producer to publish data.
+    ///
+    /// Returns `Err(WaitError::Timeout)` if no values are available before the
+    /// timeout elapses.
+    ///
+    /// # Safety
+    /// - The caller must satisfy [`Self::try_reserve_read_batch_raw`]'s safety
+    ///   requirements for a successfully returned batch.
+    pub unsafe fn reserve_read_batch_raw_timeout(
+        &self,
+        max: NonZeroUsize,
+        timeout: Duration,
+    ) -> Result<ReadBatch<'_, T>, WaitError> {
+        self.wait_for_read(timeout, || {
+            // SAFETY: The caller accepts the raw batch ownership contract.
+            unsafe { self.try_reserve_read_batch_raw(max) }
+        })
     }
 
     fn wait_for_read<R>(
@@ -986,6 +1028,11 @@ impl<'a, T> Drop for WriteBatch<'a, T> {
 }
 
 #[must_use]
+/// A reservation for consecutive initialized consumer slots.
+///
+/// For batches reserved through the unsafe raw APIs, the caller is responsible
+/// for moving out or dropping every non-`Copy` value before the batch is
+/// dropped.
 pub struct ReadBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
@@ -1008,7 +1055,11 @@ impl<'a, T> ReadBatch<'a, T> {
     /// Returns a reference to the reserved slot.
     ///
     /// # Safety
-    /// - `index` must be less than `self.len()`
+    /// - `index` must be less than [`Self::len`].
+    /// - The value at `index` must not have previously been moved out or
+    ///   dropped.
+    /// - A reference returned by this method must not be used after the value
+    ///   is moved out or dropped by any means.
     pub unsafe fn as_ref(&self, index: usize) -> &T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
@@ -1016,10 +1067,13 @@ impl<'a, T> ReadBatch<'a, T> {
         unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
     }
 
-    /// Read the value at index
+    /// Reads the value at `index`.
     ///
     /// # Safety
-    /// - `index` must be less than `self.len()`
+    /// - `index` must be less than [`Self::len`].
+    /// - For non-`Copy` `T`, the value must not have previously been moved out
+    ///   or dropped. It may be moved out exactly once.
+    /// - No reference to the slot may be used after moving out its value.
     pub unsafe fn read(&self, index: usize) -> T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
