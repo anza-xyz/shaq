@@ -5,7 +5,7 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
 };
-use core::ptr::NonNull;
+use core::{marker::PhantomData, ptr::NonNull};
 use std::{
     fs::File,
     num::NonZeroUsize,
@@ -375,6 +375,10 @@ struct SharedQueue<T> {
     buffer_mask: usize,
     cached_write: usize,
     cached_read: usize,
+    // `NonNull<T>` is covariant, but paired endpoints must not be independently
+    // coerced to different payload lifetimes. The function input/output marker
+    // makes `T` invariant without affecting layout or auto traits.
+    _invariant: PhantomData<fn(T) -> T>,
 
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
@@ -411,6 +415,7 @@ impl<T> SharedQueue<T> {
             buffer_mask: size - 1,
             cached_write: 0,
             cached_read: 0,
+            _invariant: PhantomData,
         };
 
         queue.load_write();
