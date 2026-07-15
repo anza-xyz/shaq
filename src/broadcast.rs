@@ -14,11 +14,12 @@
 //! lane or consumer index can be taken over with `recover` (resuming where the
 //! dead owner was) or returned to the pool with `force_release`.
 //!
-//! Payloads are treated as shared-memory bytes, not as ordinary Rust-owned
-//! values. In practice `T` should be POD-like: no process-local pointers, no
-//! references whose provenance matters in another process, no destructor that
-//! must run, and safe to duplicate by raw reads. This is stricter than a normal
-//! queue because every broadcast consumer can read the same cell.
+//! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
+//! [`Drop`] and therefore does not require a destructor when a cell is
+//! duplicated or reused. File-backed typed construction remains unsafe because
+//! the queue cannot verify that every participant uses the same `T` and layout,
+//! or that embedded pointers and references are valid in every process that
+//! reads them.
 //!
 //! Recovery is an externally serialized operation. Do not race recovery or
 //! force-release with other recovery operations, with joins/drops for the same
@@ -489,7 +490,7 @@ unsafe impl Sync for SharedQueue {}
 ///
 /// Holds the lane view directly (stable for the producer's lifetime); the
 /// `queue` is kept for `try_clone` and to keep the region mapping alive.
-pub struct Producer<T> {
+pub struct Producer<T: Copy> {
     queue: SharedQueue,
     lane: ProducerLane,
     index: usize,
@@ -497,16 +498,15 @@ pub struct Producer<T> {
     _invariant: PhantomData<fn(T) -> T>,
 }
 
-impl<T> Producer<T> {
+impl<T: Copy> Producer<T> {
     /// Creates a broadcast queue in `file` and joins as a producer.
     ///
     /// # Safety
     /// - `file` must be initialized as a broadcast queue exactly once (by the
     ///   designated initializer), and not resized while any handle is joined.
-    /// - All producers/consumers for `file` must use the same `T`; queued values
-    ///   must be POD-like shared-memory bytes: valid in every process that reads
-    ///   them, safe to overwrite without running a destructor, and safe for every
-    ///   consumer to duplicate by raw reads.
+    /// - Every participant must use the same `T` and layout, and each queued
+    ///   value must be valid in every process that reads it. The `Copy` bound
+    ///   does not make embedded pointers or references process-portable.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
         let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
@@ -615,13 +615,20 @@ impl<T> Producer<T> {
 
     /// Joins the same queue as an untyped consumer. The consumer discovers the
     /// payload size from the queue header and reads each payload as bytes.
-    pub fn join_as_slice_consumer(&self) -> Result<SliceConsumer, Error> {
+    ///
+    /// # Safety
+    /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
+    ///   requirement.
+    pub unsafe fn join_as_slice_consumer(&self) -> Result<SliceConsumer, Error> {
         SliceConsumer::from_queue(self.queue.clone(), false)
     }
 
     /// Like [`Self::join_as_slice_consumer`], but starts up to one ring behind
     /// the frontier so the consumer reads data published before it joined.
-    pub fn join_as_slice_consumer_from_backlog(&self) -> Result<SliceConsumer, Error> {
+    ///
+    /// # Safety
+    /// - Same as [`Self::join_as_slice_consumer`].
+    pub unsafe fn join_as_slice_consumer_from_backlog(&self) -> Result<SliceConsumer, Error> {
         SliceConsumer::from_queue(self.queue.clone(), true)
     }
 
@@ -643,10 +650,7 @@ impl<T> Producer<T> {
     ///
     /// Returns `false` if there is not enough space.
     #[must_use]
-    pub fn try_write_slice(&mut self, items: &[T]) -> bool
-    where
-        T: Copy,
-    {
+    pub fn try_write_slice(&mut self, items: &[T]) -> bool {
         let Some(len) = NonZeroUsize::new(items.len()) else {
             return true;
         };
@@ -699,7 +703,7 @@ impl<T> Producer<T> {
     }
 }
 
-impl<T> Drop for Producer<T> {
+impl<T: Copy> Drop for Producer<T> {
     fn drop(&mut self) {
         self.lane.release();
     }
@@ -707,17 +711,17 @@ impl<T> Drop for Producer<T> {
 
 // SAFETY: a producer is single-threaded (write ops take `&mut self`) but may be
 // moved between threads.
-unsafe impl<T: Send> Send for Producer<T> {}
+unsafe impl<T: Copy + Send> Send for Producer<T> {}
 
 /// A reservation of one cell in a producer's lane. Write it via
 /// [`Self::write`]/[`Self::as_mut_ref`], then drop the guard to publish it.
 #[must_use]
-pub struct WriteGuard<'a, T> {
+pub struct WriteGuard<'a, T: Copy> {
     producer: &'a mut Producer<T>,
     start: usize,
 }
 
-impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
+impl<T: Copy> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
     fn as_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: forwarded; the cell is reserved for this producer.
@@ -725,7 +729,7 @@ impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     }
 }
 
-impl<T> WriteGuard<'_, T> {
+impl<T: Copy> WriteGuard<'_, T> {
     /// Writes `value` into the reserved cell; the guard publishes it on drop.
     pub fn write(self, value: T) {
         let ptr = self
@@ -739,7 +743,7 @@ impl<T> WriteGuard<'_, T> {
     }
 }
 
-impl<T> Drop for WriteGuard<'_, T> {
+impl<T: Copy> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
         self.producer.lane.publish(self.start, NonZeroUsize::MIN);
         self.producer.queue.wake();
@@ -749,13 +753,13 @@ impl<T> Drop for WriteGuard<'_, T> {
 /// A reservation of `count` cells in a producer's lane. Write every cell via
 /// [`Self::write`]/[`Self::as_mut_ref`], then drop the batch to publish them.
 #[must_use]
-pub struct WriteBatch<'a, T> {
+pub struct WriteBatch<'a, T: Copy> {
     producer: &'a mut Producer<T>,
     start: usize,
     count: NonZeroUsize,
 }
 
-impl<T> WriteBatch<'_, T> {
+impl<T: Copy> WriteBatch<'_, T> {
     pub fn len(&self) -> usize {
         self.count.get()
     }
@@ -790,7 +794,7 @@ impl<T> WriteBatch<'_, T> {
     }
 }
 
-impl<T> Drop for WriteBatch<'_, T> {
+impl<T: Copy> Drop for WriteBatch<'_, T> {
     fn drop(&mut self) {
         self.producer.lane.publish(self.start, self.count);
         self.producer.queue.wake();
@@ -999,19 +1003,20 @@ unsafe impl Send for ConsumerCore {}
 
 /// A consumer: owns one consumer index and reads every lane round-robin. Reads
 /// only items published after it joins. Single-threaded use (`&mut self`).
-pub struct Consumer<T> {
+pub struct Consumer<T: Copy> {
     core: ConsumerCore,
     _marker: PhantomData<T>,
     _invariant: PhantomData<fn(T) -> T>,
 }
 
-impl<T> Consumer<T> {
+impl<T: Copy> Consumer<T> {
     /// Creates a broadcast queue in `file` and joins as a consumer.
     ///
     /// # Safety
-    /// - Same as [`Producer::create`]: `file` initialized as a queue exactly once
-    ///   (the consumer may be the initializer), same POD-like `T` across all
-    ///   handles.
+    /// - Same as [`Producer::create`]: `file` must be initialized as a queue
+    ///   exactly once (the consumer may be the initializer), and all typed
+    ///   handles must use the same `T` and layout with values valid in every
+    ///   process that reads them.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
         let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
@@ -1102,10 +1107,7 @@ impl<T> Consumer<T> {
 
     /// Reads the next available value by copying it out, or `None` if every lane
     /// is caught up.
-    pub fn try_read(&mut self) -> Option<T>
-    where
-        T: Copy,
-    {
+    pub fn try_read(&mut self) -> Option<T> {
         let readable = self.core.next_readable()?;
         let payload = self.core.payload_ptr(readable);
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
@@ -1176,10 +1178,7 @@ impl<T> Consumer<T> {
 
     /// Blocks until any lane has an unread value or `timeout` elapses, then
     /// copies it out; `Err(Timeout)` if none arrived in time.
-    pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError>
-    where
-        T: Copy,
-    {
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
         let guard = self.reserve_read_timeout(timeout)?;
         Ok(guard.read())
     }
@@ -1187,37 +1186,34 @@ impl<T> Consumer<T> {
 
 // SAFETY: a consumer is single-threaded (read ops take `&mut self`) but may be
 // moved between threads.
-unsafe impl<T: Send> Send for Consumer<T> {}
+unsafe impl<T: Copy + Send> Send for Consumer<T> {}
 
 /// An in-place borrow of one published value. The consumer's cursor stays at
 /// this value's sequence while the guard lives (so the producer cannot overwrite
 /// it); dropping the guard advances past it.
 #[must_use]
-pub struct ReadGuard<'a, T> {
+pub struct ReadGuard<'a, T: Copy> {
     consumer: &'a mut ConsumerCore,
     lane: usize,
     payload: NonNull<T>,
 }
 
-impl<T> ReadGuard<'_, T> {
+impl<T: Copy> ReadGuard<'_, T> {
     /// Copies the value out; the guard advances past it on drop.
-    pub fn read(self) -> T
-    where
-        T: Copy,
-    {
+    pub fn read(self) -> T {
         // SAFETY: the cell is published and held by this consumer's cursor.
         unsafe { self.payload.as_ptr().read() }
     }
 }
 
-impl<T> AsRef<T> for ReadGuard<'_, T> {
+impl<T: Copy + Sync> AsRef<T> for ReadGuard<'_, T> {
     fn as_ref(&self) -> &T {
         // SAFETY: the cell is published and held by this consumer's cursor.
         unsafe { self.payload.as_ref() }
     }
 }
 
-impl<T> Drop for ReadGuard<'_, T> {
+impl<T: Copy> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
         self.consumer.advance(self.lane, NonZeroUsize::MIN);
     }
@@ -1228,7 +1224,7 @@ impl<T> Drop for ReadGuard<'_, T> {
 /// producer cannot overwrite any of them); dropping the guard advances past the
 /// whole batch.
 #[must_use]
-pub struct ReadBatch<'a, T> {
+pub struct ReadBatch<'a, T: Copy> {
     consumer: &'a mut ConsumerCore,
     lane: usize,
     start: usize,
@@ -1236,7 +1232,7 @@ pub struct ReadBatch<'a, T> {
     _marker: PhantomData<T>,
 }
 
-impl<T> ReadBatch<'_, T> {
+impl<T: Copy> ReadBatch<'_, T> {
     pub fn len(&self) -> usize {
         self.count.get()
     }
@@ -1249,7 +1245,10 @@ impl<T> ReadBatch<'_, T> {
     ///
     /// # Safety
     /// - `index < len`
-    pub unsafe fn as_ref(&self, index: usize) -> &T {
+    pub unsafe fn as_ref(&self, index: usize) -> &T
+    where
+        T: Sync,
+    {
         debug_assert!(index < self.count.get());
         let ptr = self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
@@ -1264,10 +1263,7 @@ impl<T> ReadBatch<'_, T> {
     ///
     /// # Safety
     /// - `index < len`
-    pub unsafe fn read(&self, index: usize) -> T
-    where
-        T: Copy,
-    {
+    pub unsafe fn read(&self, index: usize) -> T {
         debug_assert!(index < self.count.get());
         let ptr = self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
@@ -1279,7 +1275,7 @@ impl<T> ReadBatch<'_, T> {
     }
 }
 
-impl<T> Drop for ReadBatch<'_, T> {
+impl<T: Copy> Drop for ReadBatch<'_, T> {
     fn drop(&mut self) {
         self.consumer.advance(self.lane, self.count);
     }
@@ -1291,6 +1287,13 @@ impl<T> Drop for ReadBatch<'_, T> {
 /// type. The payload size is discovered from the queue header, and every read
 /// returns a guard exposing the payload bytes. Dropping the guard advances the
 /// consumer cursor, just like [`ReadGuard`].
+///
+/// # Safety
+///
+/// Every byte in each published payload must be initialized before it is
+/// exposed as a byte slice. Ordinary typed writes guarantee this for types
+/// without padding, such as `[u8; N]`, but not for arbitrary `Copy` structs
+/// with implicit padding.
 pub struct SliceConsumer {
     core: ConsumerCore,
 }
@@ -1301,6 +1304,8 @@ impl SliceConsumer {
     ///
     /// # Safety
     /// - `file` must refer to a live broadcast queue, not resized while joined.
+    /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
+    ///   requirement.
     /// - Payload bytes must be meaningful to the caller without relying on Rust
     ///   type validation.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
@@ -1746,7 +1751,8 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         });
-        let mut consumer = producer.join_as_slice_consumer().unwrap();
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
         assert_eq!(consumer.payload_size(), size_of::<Payload>());
 
         let value = 0x0102_0304_0506_0708u64;
@@ -1767,7 +1773,8 @@ mod tests {
             producer_slots: 1,
             consumer_slots: 1,
         });
-        let mut consumer = producer.join_as_slice_consumer().unwrap();
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
 
         assert!(producer.try_write_slice(&[11, 12, 13]));
         {
