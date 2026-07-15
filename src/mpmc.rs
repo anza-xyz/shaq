@@ -191,7 +191,7 @@ impl<T> Clone for Producer<T> {
 }
 
 unsafe impl<T: Send> Send for Producer<T> {}
-unsafe impl<T: Sync> Sync for Producer<T> {}
+unsafe impl<T: Send> Sync for Producer<T> {}
 
 pub struct Consumer<T> {
     queue: SharedQueue<T>,
@@ -394,7 +394,7 @@ impl<T> Clone for Consumer<T> {
 }
 
 unsafe impl<T: Send> Send for Consumer<T> {}
-unsafe impl<T: Sync> Sync for Consumer<T> {}
+unsafe impl<T: Send> Sync for Consumer<T> {}
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
@@ -981,6 +981,7 @@ mod tests {
     use super::*;
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
+    use core::cell::Cell;
 
     type Item = u64;
     const BUFFER_CAPACITY: usize = 512;
@@ -1015,6 +1016,14 @@ mod tests {
             Ok(value) => value,
             Err(WaitError::Timeout) => panic!("wait timed out"),
         }
+    }
+
+    #[test]
+    fn endpoints_are_send_and_sync_for_send_not_sync_items() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+
+        assert_send_and_sync::<Producer<Cell<u64>>>();
+        assert_send_and_sync::<Consumer<Cell<u64>>>();
     }
 
     #[test]
