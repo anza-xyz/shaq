@@ -221,7 +221,7 @@ mod imp {
     /// Only the kernel reads through this pointer; never materialize an
     /// `&AtomicU32` over the cursor in Rust code (see module docs).
     fn futex_word(cursor: &AtomicUsize) -> *mut u32 {
-        let ptr = cursor.as_ptr().cast::<u32>();
+        let ptr = cursor.as_ptr().cast();
         // The low half lives at byte offset 4 on big-endian targets.
         #[cfg(target_endian = "big")]
         // SAFETY: in bounds; the low half of the 8-byte cursor is at offset 4.

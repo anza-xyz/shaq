@@ -29,7 +29,7 @@ impl Region {
             NonNull::new(addr).ok_or(Error::Allocation(layout))?
         };
 
-        assert_eq!(addr.as_ptr().align_offset(MINIMUM_REGION_ALIGNMENT), 0);
+        assert_eq!(addr.align_offset(MINIMUM_REGION_ALIGNMENT), 0);
 
         Ok(Arc::new(Self {
             addr,
@@ -73,7 +73,7 @@ unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
 
 fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
-    let actual = addr.as_ptr().align_offset(MINIMUM_REGION_ALIGNMENT);
+    let actual = addr.align_offset(MINIMUM_REGION_ALIGNMENT);
     if actual != 0 {
         return Err(Error::InvalidRegionAlignment {
             minimum: MINIMUM_REGION_ALIGNMENT,
@@ -218,26 +218,14 @@ mod tests {
             .expect("set len");
 
         let region = Region::map_file(&file, MINIMUM_REGION_ALIGNMENT).expect("map file");
-        assert_eq!(
-            region
-                .addr()
-                .as_ptr()
-                .align_offset(MINIMUM_REGION_ALIGNMENT),
-            0
-        );
+        assert_eq!(region.addr().align_offset(MINIMUM_REGION_ALIGNMENT), 0);
     }
 
     #[test]
     fn test_alloc_region_is_4096_aligned() {
         let region = Region::alloc(NonZeroUsize::new(MINIMUM_REGION_ALIGNMENT * 2).unwrap())
             .expect("allocation failed");
-        assert_eq!(
-            region
-                .addr()
-                .as_ptr()
-                .align_offset(MINIMUM_REGION_ALIGNMENT),
-            0
-        );
+        assert_eq!(region.addr().align_offset(MINIMUM_REGION_ALIGNMENT), 0);
         assert_eq!(region.size(), MINIMUM_REGION_ALIGNMENT * 2);
     }
 
@@ -245,13 +233,7 @@ mod tests {
     fn test_alloc_region_accepts_non_4096_multiple() {
         let region = Region::alloc(NonZeroUsize::new(MINIMUM_REGION_ALIGNMENT + 1).unwrap())
             .expect("allocation failed");
-        assert_eq!(
-            region
-                .addr()
-                .as_ptr()
-                .align_offset(MINIMUM_REGION_ALIGNMENT),
-            0
-        );
+        assert_eq!(region.addr().align_offset(MINIMUM_REGION_ALIGNMENT), 0);
         assert_eq!(region.size(), MINIMUM_REGION_ALIGNMENT + 1);
     }
 }

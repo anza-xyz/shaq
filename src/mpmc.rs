@@ -649,7 +649,7 @@ impl SharedQueueHeader {
     /// - This function must be called at most once for a given `region`.
     unsafe fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
-        let header = region.addr().cast::<Self>();
+        let header = region.addr().cast();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
@@ -809,15 +809,16 @@ pub struct WriteGuard<'a, T> {
 impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
     fn as_mut(&mut self) -> &mut MaybeUninit<T> {
+        let mut cell = self.cell.cast();
         // SAFETY: The cell was reserved for writing.
-        unsafe { &mut *self.cell.as_ptr().cast() }
+        unsafe { cell.as_mut() }
     }
 }
 
 impl<'a, T> WriteGuard<'a, T> {
     pub fn write(self, value: T) {
         // SAFETY: The cell was reserved for writing.
-        unsafe { self.cell.as_ptr().write(value) };
+        unsafe { self.cell.write(value) };
     }
 }
 
@@ -845,7 +846,7 @@ pub struct ReadGuard<'a, T> {
 impl<'a, T> ReadGuard<'a, T> {
     pub fn read(self) -> T {
         // SAFETY: The cell was reserved for reading and holds an initialized value.
-        unsafe { self.cell.as_ptr().read() }
+        unsafe { self.cell.read() }
     }
 }
 

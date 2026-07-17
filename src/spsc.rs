@@ -511,7 +511,7 @@ impl SharedQueueHeader {
     /// - This function must be called at most once for a given `region`.
     unsafe fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
         let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
-        let header = region.addr().cast::<Self>();
+        let header = region.addr().cast();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because mmap ensures that the
         //         memory is aligned to the page size, which is sufficient for the
@@ -796,7 +796,7 @@ mod tests {
                 Err(WaitError::Timeout) => panic!("read timed out after commit"),
             };
             // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
-            assert_eq!(unsafe { *ptr.as_ptr() }, 42);
+            assert_eq!(unsafe { ptr.read() }, 42);
             consumer.finalize();
         }
     }
@@ -841,7 +841,7 @@ mod tests {
                 Err(WaitError::Timeout) => panic!("read timed out after commit"),
             };
             // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
-            assert_eq!(unsafe { *ptr.as_ptr() }, 9);
+            assert_eq!(unsafe { ptr.read() }, 9);
             consumer.finalize();
         }
     }

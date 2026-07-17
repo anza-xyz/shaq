@@ -37,7 +37,6 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
 use std::mem::MaybeUninit;
@@ -103,9 +102,8 @@ impl SharedQueueHeader {
             waiters: Waiters::default(),
             wake_seq: CacheAlignedAtomicSize::default(),
         };
-        let header_ptr = header.as_ptr();
         // SAFETY: caller guarantees valid, uniquely-owned storage for the header.
-        unsafe { header_ptr.write(value) };
+        unsafe { header.write(value) };
 
         // Publish initialization last.
         // SAFETY: the header was initialized by the write above.
@@ -319,7 +317,7 @@ impl SharedQueue {
 
         // Header initialization publishes the queue, so it runs after every
         // other region section is initialized.
-        let header = base.cast::<SharedQueueHeader>();
+        let header = base.cast();
         // SAFETY: region is page-aligned, large enough for the header, uniquely
         // initialized here, and all non-header sections are initialized above.
         unsafe { SharedQueueHeader::init(header, layout) };
@@ -327,7 +325,7 @@ impl SharedQueue {
 
     fn from_region(region: Arc<Region>, layout: QueueLayout) -> Self {
         let base = region.addr();
-        let header = base.cast::<SharedQueueHeader>();
+        let header = base.cast();
         // SAFETY: offsets lie within the region.
         let consumer_state_block = unsafe { base.byte_add(layout.consumer_state_offset) };
         // SAFETY: offsets lie within the region.
@@ -724,20 +722,16 @@ pub struct WriteGuard<'a, T: Copy> {
 impl<T: Copy> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
     fn as_mut(&mut self) -> &mut MaybeUninit<T> {
+        let mut ptr = self.producer.lane.payload_ptr(self.start).cast();
         // SAFETY: forwarded; the cell is reserved for this producer.
-        unsafe { &mut *self.producer.lane.payload_ptr(self.start).as_ptr().cast() }
+        unsafe { ptr.as_mut() }
     }
 }
 
 impl<T: Copy> WriteGuard<'_, T> {
     /// Writes `value` into the reserved cell; the guard publishes it on drop.
     pub fn write(self, value: T) {
-        let ptr = self
-            .producer
-            .lane
-            .payload_ptr(self.start)
-            .cast::<T>()
-            .as_ptr();
+        let ptr = self.producer.lane.payload_ptr(self.start).cast();
         // SAFETY: the cell is reserved and not yet published; `T` is moved in.
         unsafe { ptr.write(value) };
     }
@@ -774,14 +768,13 @@ impl<T: Copy> WriteBatch<'_, T> {
     /// - `index < len`.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
-        let ptr = self
+        let mut ptr = self
             .producer
             .lane
             .payload_ptr(self.start.wrapping_add(index))
-            .cast::<T>()
-            .as_ptr();
+            .cast();
         // SAFETY: forwarded; the cell is reserved for this producer.
-        unsafe { &mut *ptr.cast() }
+        unsafe { ptr.as_mut() }
     }
 
     /// Writes `value` into the reserved cell at `index`.
@@ -1113,7 +1106,7 @@ impl<T: Copy> Consumer<T> {
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
         // advance below. The copy happens before the cursor advances.
-        let value = unsafe { payload.cast::<T>().as_ptr().read() };
+        let value = unsafe { payload.cast().read() };
         self.core.advance(readable.lane, NonZeroUsize::MIN);
         Some(value)
     }
@@ -1202,7 +1195,7 @@ impl<T: Copy> ReadGuard<'_, T> {
     /// Copies the value out; the guard advances past it on drop.
     pub fn read(self) -> T {
         // SAFETY: the cell is published and held by this consumer's cursor.
-        unsafe { self.payload.as_ptr().read() }
+        unsafe { self.payload.read() }
     }
 }
 
@@ -1252,11 +1245,10 @@ impl<T: Copy> ReadBatch<'_, T> {
         debug_assert!(index < self.count.get());
         let ptr = self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
-            .as_ptr()
             .cast();
         // SAFETY: the cell is published and held by this consumer's
         // cursor.
-        unsafe { &*ptr }
+        unsafe { ptr.as_ref() }
     }
 
     /// Copies the value at `index` out.
@@ -1267,8 +1259,7 @@ impl<T: Copy> ReadBatch<'_, T> {
         debug_assert!(index < self.count.get());
         let ptr = self.consumer.lanes[self.lane]
             .payload_ptr(self.start.wrapping_add(index))
-            .as_ptr()
-            .cast::<T>();
+            .cast();
         // SAFETY: the cell is published and held by this consumer's
         // cursor.
         unsafe { ptr.read() }
@@ -1471,8 +1462,9 @@ impl SliceReadGuard<'_> {
 
     /// Returns the payload bytes.
     pub fn as_slice(&self) -> &[u8] {
+        let payload = NonNull::slice_from_raw_parts(self.payload, self.len);
         // SAFETY: the cell is published and held by this consumer's cursor.
-        unsafe { slice::from_raw_parts(self.payload.as_ptr(), self.len) }
+        unsafe { payload.as_ref() }
     }
 }
 
@@ -1518,14 +1510,14 @@ impl SliceReadBatch<'_> {
     /// - `index < len`.
     pub unsafe fn as_slice(&self, index: usize) -> &[u8] {
         debug_assert!(index < self.count.get());
-        let ptr = self
+        let payload = self
             .consumer
             .lane(self.lane)
-            .payload_ptr(self.start.wrapping_add(index))
-            .as_ptr();
+            .payload_ptr(self.start.wrapping_add(index));
+        let payload = NonNull::slice_from_raw_parts(payload, self.payload_size);
         // SAFETY: forwarded; the cell is published and held by this consumer's
         // cursor until the batch is dropped.
-        unsafe { slice::from_raw_parts(ptr, self.payload_size) }
+        unsafe { payload.as_ref() }
     }
 }
 

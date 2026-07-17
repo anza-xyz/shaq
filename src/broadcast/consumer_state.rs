@@ -5,7 +5,6 @@
 
 use core::mem::{align_of, size_of, MaybeUninit};
 use core::ptr::NonNull;
-use core::slice;
 use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::Error;
@@ -47,11 +46,11 @@ impl ConsumerState {
     /// - `block` must point at a [`Self::block_size`] region for `slot_count`
     ///   slots and be initialized at most once.
     pub(crate) unsafe fn init(block: NonNull<u8>, slot_count: usize) {
+        let mut slots =
+            NonNull::slice_from_raw_parts(block.cast::<MaybeUninit<AtomicU64>>(), slot_count);
         // SAFETY: layout reserves `slot_count` AtomicU64s here; init runs once
         // with no other handle joined, so &mut is exclusive.
-        let slots: &mut [MaybeUninit<AtomicU64>] = unsafe {
-            slice::from_raw_parts_mut(block.cast::<MaybeUninit<AtomicU64>>().as_ptr(), slot_count)
-        };
+        let slots = unsafe { slots.as_mut() };
         for slot in slots {
             slot.write(AtomicU64::new(CONSUMER_FREE));
         }
@@ -108,7 +107,7 @@ impl ConsumerState {
     fn slot(&self, index: usize) -> &AtomicU64 {
         debug_assert!(index < self.slot_count);
         // SAFETY: `index < slot_count`; the slot was initialized.
-        unsafe { &*self.slots.add(index).as_ptr() }
+        unsafe { self.slots.add(index).as_ref() }
     }
 }
 
@@ -140,14 +139,13 @@ impl LaneConsumerState {
     /// - `block` must point at a [`Self::block_size`] region for `slot_count`
     ///   slots and be initialized at most once.
     pub(crate) unsafe fn init(block: NonNull<u8>, slot_count: usize) {
+        let mut slots = NonNull::slice_from_raw_parts(
+            block.cast::<MaybeUninit<CacheAlignedAtomicSize>>(),
+            slot_count,
+        );
         // SAFETY: layout reserves `slot_count` aligned slots here; init runs
         // once with no other handle joined, so &mut is exclusive.
-        let slots: &mut [MaybeUninit<CacheAlignedAtomicSize>] = unsafe {
-            slice::from_raw_parts_mut(
-                block.cast::<MaybeUninit<CacheAlignedAtomicSize>>().as_ptr(),
-                slot_count,
-            )
-        };
+        let slots = unsafe { slots.as_mut() };
         for slot in slots {
             slot.write(CacheAlignedAtomicSize {
                 inner: AtomicUsize::new(UNCLAIMED),
@@ -275,8 +273,9 @@ impl LaneConsumerState {
 
     #[inline]
     fn limits(&self) -> &[CacheAlignedAtomicSize] {
+        let limits = NonNull::slice_from_raw_parts(self.limits, self.slot_count);
         // SAFETY: layout reserves `slot_count` aligned slots here.
-        unsafe { slice::from_raw_parts(self.limits.as_ptr(), self.slot_count) }
+        unsafe { limits.as_ref() }
     }
 
     /// The slot holding consumer `consumer_index`'s reserve limit
@@ -285,7 +284,7 @@ impl LaneConsumerState {
     fn limit(&self, consumer_index: usize) -> &CacheAlignedAtomicSize {
         debug_assert!(consumer_index < self.slot_count);
         // SAFETY: `consumer_index < slot_count`; the slot was initialized.
-        unsafe { &*self.limits.add(consumer_index).as_ptr() }
+        unsafe { self.limits.add(consumer_index).as_ref() }
     }
 }
 
