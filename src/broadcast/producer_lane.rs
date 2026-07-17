@@ -92,9 +92,8 @@ impl ProducerLane {
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
         };
-        let header_ptr = block.cast::<LaneHeader>().as_ptr();
         // SAFETY: `block` begins with a `LaneHeader`.
-        unsafe { header_ptr.write(header) };
+        unsafe { block.cast().write(header) };
         // SAFETY: layout reserves `consumer_slots` aligned slots here.
         let consumer_state = unsafe { block.byte_add(consumer_state_offset()) };
         // SAFETY: freshly initialized lane block; consumer slots are initialized once.
@@ -287,7 +286,7 @@ mod tests {
 
     fn read(lane: &ProducerLane, sequence: usize) -> Payload {
         // SAFETY: `sequence` was published, so its cell is initialized.
-        unsafe { lane.payload_ptr(sequence).cast::<Payload>().as_ptr().read() }
+        unsafe { lane.payload_ptr(sequence).cast().read() }
     }
 
     fn join_consumer(lane: &ProducerLane, consumer_index: usize, from_backlog: bool) -> usize {
@@ -304,12 +303,7 @@ mod tests {
             return false;
         };
         // SAFETY: the cell is reserved and not yet published.
-        unsafe {
-            lane.payload_ptr(start)
-                .cast::<Payload>()
-                .as_ptr()
-                .write(value)
-        };
+        unsafe { lane.payload_ptr(start).cast().write(value) };
         lane.publish(start, one);
         true
     }
@@ -347,8 +341,7 @@ mod tests {
             // SAFETY: each cell in the batch is reserved and unpublished.
             unsafe {
                 lane.payload_ptr(start.wrapping_add(offset))
-                    .cast::<Payload>()
-                    .as_ptr()
+                    .cast()
                     .write((offset as u64) + 1)
             };
         }
