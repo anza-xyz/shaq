@@ -22,5 +22,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+# msrv is too low to use std::assert_matches
+assert_matches = "1.5.0"
 core_affinity = "0.8.3"
 ctrlc = "3.5.1"
