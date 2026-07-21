@@ -8,6 +8,7 @@ use common::{
 use shaq::{
     broadcast::{
         Broadcast, BroadcastConfig, Consumer as BroadcastConsumer, Producer as BroadcastProducer,
+        ProducerId,
     },
     error::WaitError,
     mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
@@ -437,9 +438,11 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
                         core_affinity::set_for_current(core_id);
                     }
 
+                    let producer_id = ProducerId::new(idx as u64 + 1);
+
                     // Each thread mints its own producer lane from the one
                     // shared `Broadcast` handle created above.
-                    let producer = broadcast.producer().unwrap();
+                    let producer = broadcast.producer(producer_id).unwrap();
                     run_broadcast_producer(
                         producer,
                         exit,

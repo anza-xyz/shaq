@@ -31,6 +31,12 @@
 //! per-lane state always describes a single producer. Replacing producers
 //! means recreating the queue.
 //!
+//! Each lane carries advisory producer metadata: a producer-supplied [`ProducerId`]
+//! and a rejected-items counter (events refused by backpressure). A read guard
+//! exposes the publishing lane's metadata via [`ReadGuard::metadata`]. To
+//! poll metadata by lane index, borrow [`LaneMetadata`] with
+//! [`Broadcast::lane_metadata`].
+//!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
 //! [`Drop`] and therefore does not require a destructor when a cell is
 //! duplicated or reused. File-backed typed construction remains unsafe because
@@ -49,6 +55,8 @@
 mod consumer_state;
 mod producer_lane;
 
+pub use producer_lane::LaneMetadata;
+
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -66,7 +74,7 @@ use crate::shmem::Region;
 use crate::{CacheAlignedAtomicSize, VERSION};
 
 use consumer_state::{ConsumerRecoveryMode, ConsumerState};
-use producer_lane::ProducerLane;
+use producer_lane::{LaneHeader, ProducerLane};
 
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 
@@ -142,8 +150,8 @@ where
     }
 
     /// Creates a new [`Producer`] if there is a free producer slot.
-    pub fn producer(&self) -> Result<Producer<T>, Error> {
-        Producer::from_queue(self.shared_queue.clone())
+    pub fn producer(&self, producer_id: ProducerId) -> Result<Producer<T>, Error> {
+        Producer::from_queue(self.shared_queue.clone(), producer_id)
     }
 
     /// Creates a new [`Consumer`] if there is a free consumer slot.
@@ -211,7 +219,7 @@ impl Broadcast<UnknownType> {
     /// from a broadcast that is joined untyped.
     ///
     /// ```compile_fail
-    /// # use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
+    /// # use shaq::broadcast::{Broadcast, BroadcastConfig, ProducerId, UnknownType};
     /// # use std::fs::OpenOptions;
     /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-producer", std::process::id()));
     /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
@@ -219,7 +227,7 @@ impl Broadcast<UnknownType> {
     /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
     /// #
     /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
-    /// let _ = broadcast.producer(); // Untyped broadcast can not create typed producer
+    /// let _ = broadcast.producer(ProducerId::new(1)); // Untyped broadcast can not create typed producer
     /// ```
     ///
     /// ```compile_fail
@@ -292,6 +300,36 @@ impl<T> Broadcast<T> {
     ///   as [`Self::recover_consumer`]/[`Self::recover_slice_consumer`].
     pub unsafe fn force_release(&self, index: usize) -> Result<(), Error> {
         ConsumerCore::force_release(&self.shared_queue, index)
+    }
+
+    /// Number of producer lanes on the queue
+    pub fn producer_slots(&self) -> usize {
+        self.shared_queue.producer_slots()
+    }
+
+    /// Returns borrowed [`LaneMetadata`] for the lane at `lane_index`.
+    ///
+    /// Returns [`None`] if the index is out of range or no producer has
+    /// completed acquisition of the lane. Once acquired, a lane retains its
+    /// metadata after retirement.
+    pub fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata<'_>> {
+        self.shared_queue.lane_metadata(lane_index)
+    }
+}
+
+/// An advisory identifier for [`Producer`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProducerId(u64);
+
+impl ProducerId {
+    /// Callers of this constructor are responsible for choosing unique IDs
+    /// if producer-level attribution is desired.
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -585,24 +623,48 @@ impl SharedQueue {
         self.producer_slots
     }
 
-    /// A view over producer lane `lane`.
-    fn lane(&self, lane: usize) -> ProducerLane {
+    /// Pointer to producer lane block `lane`.
+    fn lane_block(&self, lane: usize) -> NonNull<u8> {
         debug_assert!(lane < self.producer_slots);
         // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
-        let block = unsafe {
+        unsafe {
             self.producer_blocks
                 .byte_add(lane.wrapping_mul(self.block_stride))
-        };
+        }
+    }
+
+    /// Borrows the header at producer lane `lane`.
+    fn lane_header(&self, lane: usize) -> &LaneHeader {
+        let block = self.lane_block(lane);
+        // SAFETY: every producer block begins with an initialized `LaneHeader`,
+        // and the returned reference is tied to `&self`, whose `Arc<Region>`
+        // keeps the mapping alive.
+        unsafe { block.cast::<LaneHeader>().as_ref() }
+    }
+
+    /// A view over producer lane `lane`.
+    fn lane(&self, lane: usize) -> ProducerLane {
+        let block = self.lane_block(lane);
         // SAFETY: the block was initialized with these parameters.
         unsafe {
             ProducerLane::from_block(block, self.capacity, self.consumer_slots(), self.payload)
         }
     }
 
+    /// Borrows metadata for the given `lane_index`.
+    /// Returns [`None`] if `lane_index` is out of range or no producer has completed
+    /// an acquisition of that lane.
+    fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata<'_>> {
+        if lane_index >= self.producer_slots() {
+            return None;
+        }
+        LaneMetadata::try_new(self.lane_header(lane_index), lane_index)
+    }
+
     /// Claims a free producer lane, returning its index.
-    fn acquire_producer_lane(&self) -> Result<usize, Error> {
+    fn acquire_producer_lane(&self, producer_id: ProducerId) -> Result<usize, Error> {
         for lane in 0..self.producer_slots {
-            if self.lane(lane).try_acquire() {
+            if self.lane(lane).try_acquire(producer_id) {
                 return Ok(lane);
             }
         }
@@ -734,6 +796,7 @@ pub struct Producer<T: Copy> {
     queue: SharedQueue,
     lane: ProducerLane,
     index: usize,
+    producer_id: ProducerId,
     _marker: PhantomData<T>,
     _invariant: PhantomData<fn(T) -> T>,
 }
@@ -747,10 +810,14 @@ impl<T: Copy> Producer<T> {
     /// - Every participant must use the same `T` and layout, and each queued
     ///   value must be valid in every process that reads it. The `Copy` bound
     ///   does not make embedded pointers or references process-portable.
-    pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
+    pub unsafe fn create(
+        file: &File,
+        config: BroadcastConfig,
+        producer_id: ProducerId,
+    ) -> Result<Self, Error> {
         // SAFETY: the caller upholds the Broadcast::create requirements.
         let broadcast = unsafe { Broadcast::<T>::create(file, config) }?;
-        broadcast.producer()
+        broadcast.producer(producer_id)
     }
 
     /// Joins an existing broadcast queue in `file` as a producer.
@@ -758,10 +825,10 @@ impl<T: Copy> Producer<T> {
     /// # Safety
     /// - `file` must refer to a live broadcast queue (not resized while joined),
     ///   with the same `T` as every other handle (see [`Self::create`]).
-    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+    pub unsafe fn join(file: &File, producer_id: ProducerId) -> Result<Self, Error> {
         // SAFETY: the caller upholds the Broadcast::join requirements.
         let broadcast = unsafe { Broadcast::<T>::join(file) }?;
-        broadcast.producer()
+        broadcast.producer(producer_id)
     }
 
     /// Returns a lane-free handle that shares this producer's queue mapping.
@@ -769,23 +836,28 @@ impl<T: Copy> Producer<T> {
         Broadcast::from_queue(self.queue.clone())
     }
 
-    fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
-        let index = queue.acquire_producer_lane()?;
+    fn from_queue(queue: SharedQueue, producer_id: ProducerId) -> Result<Self, Error> {
+        let index = queue.acquire_producer_lane(producer_id)?;
         let lane = queue.lane(index);
+
         Ok(Self {
             queue,
             lane,
             index,
+            producer_id,
             _marker: PhantomData,
             _invariant: PhantomData,
         })
     }
 
-    /// The lane this producer owns. A lane binds to at most one producer for
-    /// the queue's lifetime, so the index uniquely identifies this producer to
-    /// consumers.
+    /// The lane this producer owns.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// The [`ProducerId`] of this producer.
+    pub fn producer_id(&self) -> ProducerId {
+        self.producer_id
     }
 
     /// Publishes one value, or returns it on backpressure (the slowest consumer
@@ -1063,6 +1135,17 @@ impl ConsumerCore {
 
     fn payload_size(&self) -> usize {
         self.queue.payload.size()
+    }
+
+    /// Returns metadata for a lane whose publication has been acquired.
+    ///
+    /// # Safety
+    /// - `lane_index` must identify the lane of a [`ReadableLane`] returned by
+    ///   this consumer. Its publication acquire makes the producer id visible.
+    #[inline]
+    unsafe fn metadata(&self, lane_index: usize) -> LaneMetadata<'_> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.lane(lane_index).published_metadata(lane_index) }
     }
 
     #[inline]
@@ -1359,6 +1442,13 @@ pub struct ReadGuard<'a, T: Copy> {
 }
 
 impl<T: Copy> ReadGuard<'_, T> {
+    /// Metadata for the producer lane this value was published on.
+    pub fn metadata(&self) -> LaneMetadata<'_> {
+        // SAFETY: guards are only built from `ReadableLane`, whose publication
+        // was observed with an acquire load.
+        unsafe { self.consumer.metadata(self.lane) }
+    }
+
     /// Copies the value out; the guard advances past it on drop.
     pub fn read(self) -> T {
         // SAFETY: the cell is published and held by this consumer's cursor.
@@ -1393,6 +1483,13 @@ pub struct ReadBatch<'a, T: Copy> {
 }
 
 impl<T: Copy> ReadBatch<'_, T> {
+    /// Metadata for the producer lane every value in this batch was published on.
+    pub fn metadata(&self) -> LaneMetadata<'_> {
+        // SAFETY: batches are only built from `ReadableLane`, whose publication
+        // was observed with an acquire load.
+        unsafe { self.consumer.metadata(self.lane) }
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
@@ -1645,6 +1742,13 @@ pub struct SliceReadGuard<'a> {
 }
 
 impl SliceReadGuard<'_> {
+    /// Metadata for the producer lane this payload was published on.
+    pub fn metadata(&self) -> LaneMetadata<'_> {
+        // SAFETY: guards are only built from `ReadableLane`, whose publication
+        // was observed with an acquire load.
+        unsafe { self.consumer.metadata(self.lane) }
+    }
+
     /// Byte length of the payload.
     pub fn len(&self) -> usize {
         self.len
@@ -1685,6 +1789,13 @@ pub struct SliceReadBatch<'a> {
 }
 
 impl SliceReadBatch<'_> {
+    /// Metadata for the producer lane every payload in this batch was published on.
+    pub fn metadata(&self) -> LaneMetadata<'_> {
+        // SAFETY: batches are only built from `ReadableLane`, whose publication
+        // was observed with an acquire load.
+        unsafe { self.consumer.metadata(self.lane) }
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
@@ -1725,24 +1836,47 @@ mod tests {
     use crate::shmem::create_temp_shmem_file;
 
     type Payload = u64;
-    type CreateProducer = fn(BroadcastConfig) -> Producer<Payload>;
 
-    /// In-process (heap-backed) producer. The `Producer` keeps the region alive
-    /// via its `SharedQueue`'s `Arc<Region>`.
-    fn create_heap_producer(config: BroadcastConfig) -> Producer<Payload> {
+    /// Placeholder id for tests that don't assert on producer metadata.
+    const BOGUS_ID: ProducerId = ProducerId::new(1111);
+
+    type CreateProducer = fn(BroadcastConfig) -> Producer<Payload>;
+    type CreateIdentifiedProducer = fn(BroadcastConfig, ProducerId) -> Producer<Payload>;
+
+    /// In-process (heap-backed) producer with a caller-chosen id. The
+    /// `Producer` keeps the region alive via its `SharedQueue`'s `Arc<Region>`.
+    fn create_identified_heap_producer(
+        config: BroadcastConfig,
+        id: ProducerId,
+    ) -> Producer<Payload> {
         let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once here.
         let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
-        Producer::from_queue(queue).unwrap()
+        Producer::from_queue(queue, id).unwrap()
     }
 
-    /// File-backed producer (mmap). Not run under miri (no mmap).
+    /// Heap-backed producer with a placeholder id.
+    fn create_heap_producer(config: BroadcastConfig) -> Producer<Payload> {
+        create_identified_heap_producer(config, BOGUS_ID)
+    }
+
+    /// File-backed producer (mmap) with a caller-chosen id. Not run
+    /// under miri (no mmap).
     #[cfg(not(miri))]
-    fn create_file_backed_producer(config: BroadcastConfig) -> Producer<Payload> {
+    fn create_identified_file_backed_producer(
+        config: BroadcastConfig,
+        id: ProducerId,
+    ) -> Producer<Payload> {
         let file = create_temp_shmem_file().expect("temp file");
         // SAFETY: a fresh temp file, initialized exactly once here.
-        unsafe { Producer::create(&file, config) }.expect("create")
+        unsafe { Producer::create(&file, config, id) }.expect("create")
+    }
+
+    /// File-backed producer with a placeholder id.
+    #[cfg(not(miri))]
+    fn create_file_backed_producer(config: BroadcastConfig) -> Producer<Payload> {
+        create_identified_file_backed_producer(config, BOGUS_ID)
     }
 
     /// Every behavioral test runs against both backings (heap always; file-backed
@@ -1752,6 +1886,15 @@ mod tests {
             create_heap_producer,
             #[cfg(not(miri))]
             create_file_backed_producer,
+        ]
+    }
+
+    /// Backings for tests that pin a specific producer id at creation.
+    fn identified_producer_creators() -> &'static [CreateIdentifiedProducer] {
+        &[
+            create_identified_heap_producer,
+            #[cfg(not(miri))]
+            create_identified_file_backed_producer,
         ]
     }
 
@@ -1766,15 +1909,15 @@ mod tests {
             let broadcast = p0.broadcast_handle();
             // Two lanes total: the original plus one binding from a cloned
             // broadcast exhausts them.
-            let p1 = broadcast.producer().unwrap();
+            let p1 = broadcast.producer(BOGUS_ID).unwrap();
             assert!(matches!(
-                broadcast.producer(),
+                broadcast.producer(BOGUS_ID),
                 Err(Error::ProducerSlotsExhausted)
             ));
             drop(p1);
             // The dropped lane is retired, not returned to the pool.
             assert!(matches!(
-                broadcast.producer(),
+                broadcast.producer(BOGUS_ID),
                 Err(Error::ProducerSlotsExhausted)
             ));
         }
@@ -1994,7 +2137,7 @@ mod tests {
         };
         let file = create_temp_shmem_file().expect("temp file");
         // SAFETY: a fresh temp file, initialized exactly once here.
-        let mut producer = unsafe { Producer::<Payload>::create(&file, config) }.unwrap();
+        let mut producer = unsafe { Producer::<Payload>::create(&file, config, BOGUS_ID) }.unwrap();
         // SAFETY: the file now contains a live broadcast queue.
         let mut consumer = unsafe { SliceConsumer::join(&file) }.unwrap();
         assert_eq!(consumer.payload_size(), size_of::<Payload>());
@@ -2331,7 +2474,7 @@ mod tests {
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
-        let mut producer = Producer::from_queue(queue.clone()).unwrap();
+        let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
 
         // SAFETY: the reserved slot is initialized before the guard is dropped.
         let mut guard = unsafe { producer.try_reserve_write() }.unwrap();
@@ -2428,6 +2571,465 @@ mod tests {
         }
     }
 
+    #[test]
+    fn broadcast_reports_the_configured_lane_count() {
+        for create in producer_creators() {
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+
+            let producer_slots = producer.broadcast_handle().producer_slots();
+
+            assert_eq!(producer_slots, 2);
+        }
+    }
+
+    #[test]
+    fn producer_reports_its_configured_id() {
+        for create in identified_producer_creators() {
+            let producer_id = ProducerId::new(42);
+            let producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                producer_id,
+            );
+
+            let reported_id = producer.producer_id();
+
+            assert_eq!(reported_id, producer_id);
+        }
+    }
+
+    #[test]
+    fn owned_lane_metadata_reports_the_producer_id() {
+        for create in identified_producer_creators() {
+            let producer_id = ProducerId::new(42);
+            let producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                producer_id,
+            );
+            let broadcast = producer.broadcast_handle();
+
+            let metadata = broadcast
+                .lane_metadata(producer.index())
+                .expect("owned lane has metadata");
+            let producer_id = metadata.producer_id();
+
+            assert_eq!(producer_id, producer_id);
+        }
+    }
+
+    #[test]
+    fn owned_lane_metadata_reports_the_lane() {
+        for create in identified_producer_creators() {
+            let producer_id = ProducerId::new(42);
+            let producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                producer_id,
+            );
+            let broadcast = producer.broadcast_handle();
+            let producer_lane = producer.index();
+
+            let metadata = broadcast
+                .lane_metadata(producer.index())
+                .expect("owned lane has metadata");
+
+            assert_eq!(metadata.lane(), producer_lane);
+        }
+    }
+
+    #[test]
+    fn owned_lane_metadata_starts_with_no_rejected_items() {
+        for create in producer_creators() {
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+
+            let rejected_items = broadcast
+                .lane_metadata(producer.index())
+                .expect("owned lane has metadata")
+                .rejected_items();
+
+            assert_eq!(rejected_items, 0);
+        }
+    }
+
+    #[test]
+    fn never_owned_lane_has_no_metadata() {
+        for create in producer_creators() {
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+
+            let metadata = broadcast.lane_metadata(1 - producer.index());
+
+            assert!(metadata.is_none());
+        }
+    }
+
+    #[test]
+    fn rejected_items_count_writes_refused_by_backpressure() {
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+            let _consumer = broadcast.consumer().unwrap();
+            for value in 0..4u64 {
+                producer.try_write(value).expect("ring has capacity");
+            }
+
+            let _ = producer.try_write(99);
+            let _ = producer.try_write_slice(&[1, 2]);
+
+            assert_eq!(
+                broadcast
+                    .lane_metadata(producer.index())
+                    .unwrap()
+                    .rejected_items(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn read_guard_reports_the_source_lane() {
+        for create in identified_producer_creators() {
+            let idle_producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 2,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = idle_producer.broadcast_handle();
+            let mut publishing_producer = broadcast.producer(ProducerId::new(42)).unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            publishing_producer.try_write(7).expect("ring has capacity");
+
+            let guard = consumer.try_reserve_read().expect("readable");
+            let source_lane = guard.metadata().lane();
+            drop(guard);
+
+            assert_eq!(source_lane, publishing_producer.index());
+        }
+    }
+
+    #[test]
+    fn read_guard_reports_the_source_producer_id() {
+        for create in identified_producer_creators() {
+            let idle_producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 2,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = idle_producer.broadcast_handle();
+            let mut publishing_producer = broadcast.producer(ProducerId::new(42)).unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            publishing_producer.try_write(7).expect("ring has capacity");
+
+            let guard = consumer.try_reserve_read().expect("readable");
+            let source_producer_id = guard.metadata().producer_id();
+            drop(guard);
+
+            assert_eq!(source_producer_id, publishing_producer.producer_id());
+        }
+    }
+
+    #[test]
+    fn lane_metadata_is_none_for_an_out_of_range_index() {
+        for create in producer_creators() {
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+
+            let metadata = broadcast.lane_metadata(2);
+
+            assert!(metadata.is_none());
+        }
+    }
+
+    #[test]
+    fn lane_metadata_remains_available_after_producer_drop() {
+        for create in identified_producer_creators() {
+            let producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(42),
+            );
+            let broadcast = producer.broadcast_handle();
+            let lane = producer.index();
+
+            drop(producer);
+
+            assert!(broadcast.lane_metadata(lane).is_some());
+        }
+    }
+
+    #[test]
+    fn borrowed_lane_metadata_keeps_the_producer_id_after_drop() {
+        for create in identified_producer_creators() {
+            let producer_id = ProducerId::new(42);
+            let producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                producer_id,
+            );
+            let broadcast = producer.broadcast_handle();
+            let metadata = broadcast
+                .lane_metadata(producer.index())
+                .expect("owned lane has metadata");
+
+            drop(producer);
+
+            assert_eq!(metadata.producer_id(), producer_id);
+        }
+    }
+
+    #[test]
+    fn retired_lane_metadata_keeps_the_rejected_items_count() {
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+            let _consumer = broadcast.consumer().unwrap();
+            for value in 0..4u64 {
+                producer.try_write(value).expect("ring has capacity");
+            }
+            let _ = producer.try_write(99);
+            let lane = producer.index();
+
+            drop(producer);
+
+            let metadata = broadcast
+                .lane_metadata(lane)
+                .expect("retired lane retains metadata");
+            assert_eq!(metadata.rejected_items(), 1);
+        }
+    }
+
+    #[test]
+    fn borrowed_lane_metadata_remains_usable_after_a_read() {
+        for create in identified_producer_creators() {
+            let idle_producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 2,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = idle_producer.broadcast_handle();
+            let mut publishing_producer = broadcast.producer(ProducerId::new(42)).unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            let metadata = broadcast
+                .lane_metadata(publishing_producer.index())
+                .expect("owned lane has metadata");
+            publishing_producer.try_write(7).expect("ring has capacity");
+
+            let guard = consumer.try_reserve_read().expect("readable");
+            drop(guard);
+
+            assert_eq!(metadata.producer_id(), publishing_producer.producer_id());
+        }
+    }
+
+    #[test]
+    fn read_batch_reports_the_source_lane() {
+        for create in identified_producer_creators() {
+            let idle_producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 2,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = idle_producer.broadcast_handle();
+            let mut publishing_producer = broadcast.producer(ProducerId::new(42)).unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            let _ = publishing_producer.try_write_slice(&[8, 9]);
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("readable batch");
+            let source_lane = batch.metadata().lane();
+            drop(batch);
+
+            assert_eq!(source_lane, publishing_producer.index());
+        }
+    }
+
+    #[test]
+    fn read_batch_reports_the_source_producer_id() {
+        for create in identified_producer_creators() {
+            let idle_producer = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 2,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = idle_producer.broadcast_handle();
+            let mut publishing_producer = broadcast.producer(ProducerId::new(42)).unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            let _ = publishing_producer.try_write_slice(&[8, 9]);
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("readable batch");
+            let source_producer_id = batch.metadata().producer_id();
+            drop(batch);
+
+            assert_eq!(source_producer_id, publishing_producer.producer_id());
+        }
+    }
+
+    #[test]
+    fn untyped_broadcast_exposes_lane_metadata() {
+        let producer = create_identified_heap_producer(
+            BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            },
+            ProducerId::new(42),
+        );
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
+        let broadcast: Broadcast<UnknownType> = consumer.broadcast_handle();
+
+        let metadata = broadcast.lane_metadata(producer.index());
+
+        assert!(metadata.is_some());
+    }
+
+    #[test]
+    fn slice_read_guard_reports_the_source_lane() {
+        let mut producer = create_identified_heap_producer(
+            BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            },
+            ProducerId::new(42),
+        );
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
+        producer.try_write(1).expect("ring has capacity");
+
+        let guard = consumer.try_read().expect("readable");
+        let source_lane = guard.metadata().lane();
+        drop(guard);
+
+        assert_eq!(source_lane, producer.index());
+    }
+
+    #[test]
+    fn slice_read_guard_reports_the_source_producer_id() {
+        let mut producer = create_identified_heap_producer(
+            BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            },
+            ProducerId::new(42),
+        );
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
+        producer.try_write(1).expect("ring has capacity");
+
+        let guard = consumer.try_read().expect("readable");
+        let source_producer_id = guard.metadata().producer_id();
+        drop(guard);
+
+        assert_eq!(source_producer_id, producer.producer_id());
+    }
+
+    #[test]
+    fn slice_read_batch_reports_the_source_lane() {
+        let mut producer = create_identified_heap_producer(
+            BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            },
+            ProducerId::new(42),
+        );
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
+        let _ = producer.try_write_slice(&[2, 3]);
+
+        let batch = consumer
+            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+            .expect("readable batch");
+        let source_lane = batch.metadata().lane();
+        drop(batch);
+
+        assert_eq!(source_lane, producer.index());
+    }
+
+    #[test]
+    fn slice_read_batch_reports_the_source_producer_id() {
+        let mut producer = create_identified_heap_producer(
+            BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            },
+            ProducerId::new(42),
+        );
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
+        let _ = producer.try_write_slice(&[2, 3]);
+
+        let batch = consumer
+            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+            .expect("readable batch");
+        let source_producer_id = batch.metadata().producer_id();
+        drop(batch);
+
+        assert_eq!(source_producer_id, producer.producer_id());
+    }
+
     /// Allocates a heap-backed queue and returns the shared handle (recovery
     /// tests need the queue directly to simulate a crashed handle).
     fn recovery_queue(config: &BroadcastConfig) -> SharedQueue {
@@ -2449,14 +3051,14 @@ mod tests {
 
         // A producer publishes two items and drops, retiring its lane.
         {
-            let mut producer = Producer::from_queue(queue.clone()).unwrap();
+            let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
             assert!(producer.try_write(1).is_ok());
             assert!(producer.try_write(2).is_ok());
         }
 
         // The retired lane is never handed to a new producer.
         assert!(matches!(
-            Producer::<Payload>::from_queue(queue.clone()),
+            Producer::<Payload>::from_queue(queue.clone(), BOGUS_ID),
             Err(Error::ProducerSlotsExhausted)
         ));
 
@@ -2483,7 +3085,7 @@ mod tests {
         ConsumerCore::join_lane(&lane, index);
         queue.activate_consumer_index(index);
 
-        let mut producer = Producer::from_queue(queue.clone()).unwrap();
+        let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
         }
@@ -2508,7 +3110,7 @@ mod tests {
         let queue = recovery_queue(&config);
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        let mut producer = Producer::from_queue(queue.clone()).unwrap();
+        let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
 
         // The consumer sampled reservation 0, then the producer filled the ring
         // before the consumer published its initial limit. Simulate a crash after
@@ -2544,7 +3146,7 @@ mod tests {
         let lane = queue.lane(0);
         ConsumerCore::join_lane(&lane, index);
         queue.activate_consumer_index(index);
-        let mut producer = Producer::from_queue(queue.clone()).unwrap();
+        let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
         }
@@ -2597,12 +3199,12 @@ mod tests {
         // SAFETY: a fresh temp file, initialized exactly once here.
         let creator = unsafe { Broadcast::<Payload>::create(&file, config) }.unwrap();
 
-        let mut p0 = creator.producer().unwrap();
+        let mut p0 = creator.producer(ProducerId::new(1)).unwrap();
         // SAFETY: the file now holds a live queue with the same `T` and layout.
         let joiner = unsafe { Broadcast::<Payload>::join(&file) }.unwrap();
-        let mut p1 = joiner.producer().unwrap();
+        let mut p1 = joiner.producer(ProducerId::new(2)).unwrap();
         assert!(matches!(
-            creator.producer(),
+            creator.producer(ProducerId::new(3)),
             Err(Error::ProducerSlotsExhausted)
         ));
 
@@ -2621,7 +3223,7 @@ mod tests {
             consumer_slots: 2,
         });
         let mut consumer = p0.broadcast_handle().consumer().unwrap();
-        let mut p1 = consumer.broadcast_handle().producer().unwrap();
+        let mut p1 = consumer.broadcast_handle().producer(BOGUS_ID).unwrap();
         // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
         let mut slice_consumer = unsafe { p1.broadcast_handle().slice_consumer() }.unwrap();
 
