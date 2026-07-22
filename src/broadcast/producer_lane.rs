@@ -226,8 +226,12 @@ impl ProducerLane {
         }
         let start = self.header().producer_reservation.load(Ordering::Acquire);
         // Producer half of the join handshake: order the previous reserve's
-        // `producer_reservation` store before this reserve's limit loads, so a
-        // racing consumer join either sees our advance or we see its limit.
+        // `producer_reservation` store before this reserve's limit loads. A
+        // racing consumer publishes a limit from its first reservation sample,
+        // fences, then samples again. Either this reserve observes that limit or
+        // the consumer observes our committed frontier. If both race with this
+        // reserve's later store, the consumer starts at `start`, making this
+        // reservation future data rather than an overwrite.
         fence(Ordering::SeqCst);
         // Each slot already stores `next_to_read + capacity`, so the gate is a
         // plain comparison: rejecting once the batch would reach a sequence a
@@ -289,11 +293,9 @@ mod tests {
         unsafe { lane.payload_ptr(sequence).cast().read() }
     }
 
-    fn join_consumer(lane: &ProducerLane, consumer_index: usize, from_backlog: bool) -> usize {
+    fn join_consumer(lane: &ProducerLane, consumer_index: usize) -> usize {
         let consumer_state = lane.consumer_state();
-        consumer_state.join(consumer_index, from_backlog, lane.published(), || {
-            lane.reserved()
-        })
+        consumer_state.join(consumer_index, || lane.reserved())
     }
 
     /// Reserves, writes, and publishes one value; `false` on backpressure.
@@ -383,7 +385,7 @@ mod tests {
         let (_region, mut lane) = lane(4, 1);
         assert!(lane.try_acquire());
         // Join consumer 0; nothing published yet, so it starts at sequence 0.
-        assert_eq!(join_consumer(&lane, 0, false), 0);
+        assert_eq!(join_consumer(&lane, 0), 0);
 
         // Fill the ring; the consumer has read nothing, so the next reserve laps.
         for value in 0..4u64 {
@@ -408,7 +410,7 @@ mod tests {
     fn released_consumer_no_longer_constrains() {
         let (_region, mut lane) = lane(4, 1);
         assert!(lane.try_acquire());
-        assert_eq!(join_consumer(&lane, 0, false), 0);
+        assert_eq!(join_consumer(&lane, 0), 0);
         for value in 0..4u64 {
             assert!(publish_value(&mut lane, value));
         }

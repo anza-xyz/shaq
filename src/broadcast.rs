@@ -9,10 +9,10 @@
 //! [`WriteGuard`], or a [`WriteBatch`]; [`Consumer`] reads via
 //! [`Consumer::try_read`], a [`ReadGuard`], or a [`ReadBatch`], with blocking
 //! `*_timeout` variants that park on the queue's futex when idle. A consumer
-//! joins at the current frontier, or with the `*_from_backlog` variants up to one
-//! ring behind it to also read data published before it joined. After a crash, a
-//! lane or consumer index can be taken over with `recover` (resuming where the
-//! dead owner was) or returned to the pool with `force_release`.
+//! joins at each lane's reservation frontier, skipping values that were already
+//! reserved. After a crash, a lane or consumer index can be taken over with
+//! `recover` (resuming where the dead owner was) or returned to the pool with
+//! `force_release`.
 //!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
 //! [`Drop`] and therefore does not require a destructor when a cell is
@@ -598,17 +598,10 @@ impl<T: Copy> Producer<T> {
     }
 
     /// Joins the same queue as a consumer (sharing the mapping). The consumer
-    /// starts at each lane's current publication, so it only observes items
-    /// published after it joins.
+    /// starts at each lane's reservation frontier, skipping values that were
+    /// already reserved.
     pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
-        Consumer::from_queue(self.queue.clone(), false)
-    }
-
-    /// Like [`Self::join_as_consumer`], but starts up to one ring behind the
-    /// frontier so the consumer reads data published before it joined (see
-    /// [`Consumer::join_from_backlog`]).
-    pub fn join_as_consumer_from_backlog(&self) -> Result<Consumer<T>, Error> {
-        Consumer::from_queue(self.queue.clone(), true)
+        Consumer::from_queue(self.queue.clone())
     }
 
     /// Joins the same queue as an untyped consumer. The consumer discovers the
@@ -618,16 +611,7 @@ impl<T: Copy> Producer<T> {
     /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
     ///   requirement.
     pub unsafe fn join_as_slice_consumer(&self) -> Result<SliceConsumer, Error> {
-        SliceConsumer::from_queue(self.queue.clone(), false)
-    }
-
-    /// Like [`Self::join_as_slice_consumer`], but starts up to one ring behind
-    /// the frontier so the consumer reads data published before it joined.
-    ///
-    /// # Safety
-    /// - Same as [`Self::join_as_slice_consumer`].
-    pub unsafe fn join_as_slice_consumer_from_backlog(&self) -> Result<SliceConsumer, Error> {
-        SliceConsumer::from_queue(self.queue.clone(), true)
+        SliceConsumer::from_queue(self.queue.clone())
     }
 
     /// Publishes one value, or returns it on backpressure (the slowest consumer
@@ -829,16 +813,16 @@ struct ConsumerCore {
 }
 
 impl ConsumerCore {
-    fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
+    fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         let index = queue.acquire_consumer_index()?;
-        // Cache a view per lane (independent of `queue`), and join each at the
-        // frontier, or up to one ring behind it when `from_backlog`.
+        // Cache a view per lane (independent of `queue`) and join each at its
+        // reservation frontier.
         let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
             .map(|lane| queue.lane(lane))
             .collect();
         let next_by_lane = lanes
             .iter()
-            .map(|lane| Self::join_lane(lane, index, from_backlog))
+            .map(|lane| Self::join_lane(lane, index))
             .collect();
         Ok(Self {
             queue,
@@ -882,14 +866,14 @@ impl ConsumerCore {
         Ok(())
     }
 
-    fn join_lane(lane: &ProducerLane, index: usize, from_backlog: bool) -> usize {
+    fn join_lane(lane: &ProducerLane, index: usize) -> usize {
         let consumer_state = lane.consumer_state();
-        consumer_state.join(index, from_backlog, lane.published(), || lane.reserved())
+        consumer_state.join(index, || lane.reserved())
     }
 
     fn recover_lane(lane: &ProducerLane, index: usize) -> usize {
         let consumer_state = lane.consumer_state();
-        consumer_state.recover(index, lane.published(), || lane.reserved())
+        consumer_state.recover(index, || lane.reserved())
     }
 
     fn index(&self) -> usize {
@@ -994,8 +978,9 @@ impl Drop for ConsumerCore {
 // may be moved between threads.
 unsafe impl Send for ConsumerCore {}
 
-/// A consumer: owns one consumer index and reads every lane round-robin. Reads
-/// only items published after it joins. Single-threaded use (`&mut self`).
+/// A consumer: owns one consumer index and reads every lane round-robin,
+/// starting at each lane's reservation frontier. Single-threaded use (`&mut
+/// self`).
 pub struct Consumer<T: Copy> {
     core: ConsumerCore,
     _marker: PhantomData<T>,
@@ -1013,36 +998,24 @@ impl<T: Copy> Consumer<T> {
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
         let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
-        Self::from_queue(queue, false)
+        Self::from_queue(queue)
     }
 
-    /// Joins an existing broadcast queue in `file` as a consumer, starting at the
-    /// current frontier (only items published after the join).
+    /// Joins an existing broadcast queue in `file` as a consumer, starting at
+    /// each lane's reservation frontier. Values already reserved are skipped,
+    /// even if they have not yet been published.
     ///
     /// # Safety
     /// - Same as [`Producer::join`]: live queue, same `T` across all handles.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::from_queue(queue, false)
+        Self::from_queue(queue)
     }
 
-    /// Like [`Self::join`], but starts up to one ring behind the frontier so the
-    /// consumer reads data published before it joined. Best for slow queues; on a
-    /// fast one that has already lapped, it falls back to the frontier (see
-    /// [`Self::join`]).
-    ///
-    /// # Safety
-    /// - Same as [`Self::join`].
-    pub unsafe fn join_from_backlog(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::from_queue(queue, true)
-    }
-
-    fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
+    fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         Ok(Self {
-            core: ConsumerCore::from_queue(queue, from_backlog)?,
+            core: ConsumerCore::from_queue(queue)?,
             _marker: PhantomData,
             _invariant: PhantomData,
         })
@@ -1082,10 +1055,9 @@ impl<T: Copy> Consumer<T> {
     }
 
     /// Force-releases a consumer index whose owner died, returning it to the free
-    /// pool: the lanes are un-wedged and a later [`join`](Self::join) /
-    /// [`join_from_backlog`](Self::join_from_backlog) can reclaim it fresh. Use this
-    /// (rather than [`recover`](Self::recover)) when you want to drop the dead
-    /// consumer's backlog and choose a new start position.
+    /// pool: the lanes are un-wedged and a later [`join`](Self::join) can reclaim
+    /// it fresh. Use this (rather than [`recover`](Self::recover)) when you want
+    /// to drop the dead consumer's unread values and choose a new start position.
     ///
     /// # Safety
     /// - As [`Self::join`], plus: the consumer that owned `index` must be dead and
@@ -1291,7 +1263,8 @@ pub struct SliceConsumer {
 
 impl SliceConsumer {
     /// Joins an existing broadcast queue in `file` as an untyped consumer,
-    /// starting at the current frontier.
+    /// starting at each lane's reservation frontier. Values already reserved
+    /// are skipped, even if they have not yet been published.
     ///
     /// # Safety
     /// - `file` must refer to a live broadcast queue, not resized while joined.
@@ -1302,23 +1275,12 @@ impl SliceConsumer {
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::join_untyped(file) }?;
-        Self::from_queue(queue, false)
+        Self::from_queue(queue)
     }
 
-    /// Like [`Self::join`], but starts up to one ring behind the frontier so the
-    /// consumer reads data published before it joined.
-    ///
-    /// # Safety
-    /// - Same as [`Self::join`].
-    pub unsafe fn join_from_backlog(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join_untyped(file) }?;
-        Self::from_queue(queue, true)
-    }
-
-    fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
+    fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         Ok(Self {
-            core: ConsumerCore::from_queue(queue, from_backlog)?,
+            core: ConsumerCore::from_queue(queue)?,
         })
     }
 
@@ -2088,7 +2050,7 @@ mod tests {
             for value in 0..3u64 {
                 assert!(p.try_write(value).is_ok());
             }
-            // Joins at the current publication (3), so it sees only later items.
+            // Joins at the current reservation (3), so it sees only later items.
             let mut c = p.join_as_consumer().unwrap();
             assert!(p.try_write(99).is_ok());
             assert_eq!(c.try_read(), Some(99));
@@ -2097,7 +2059,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_joining_during_unpublished_reservation_waits_for_publication() {
+    fn consumer_joining_during_unpublished_reservation_skips_it() {
         let config = BroadcastConfig {
             capacity: 4,
             producer_slots: 1,
@@ -2108,39 +2070,17 @@ mod tests {
 
         // SAFETY: the reserved slot is initialized before the guard is dropped.
         let mut guard = unsafe { producer.try_reserve_write() }.unwrap();
-        let mut consumer = Consumer::from_queue(queue.clone(), false).unwrap();
+        let mut consumer = Consumer::from_queue(queue.clone()).unwrap();
 
         assert!(consumer.try_reserve_read().is_none());
         guard.as_mut().write(42);
         drop(guard);
 
-        assert_eq!(consumer.try_read(), Some(42));
         assert_eq!(consumer.try_read(), None);
-    }
 
-    #[test]
-    fn from_backlog_consumer_reads_old_data_on_a_slow_queue() {
-        for create in producer_creators() {
-            // The queue has capacity to spare and has not wrapped, so the backlog
-            // is fully retained.
-            let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
-                consumer_slots: 1,
-            });
-            for value in 0..3u64 {
-                assert!(p.try_write(value).is_ok());
-            }
-            // A from-backlog join starts at the oldest retained item (sequence 0),
-            // so it reads data published before it joined, then keeps up.
-            let mut c = p.join_as_consumer_from_backlog().unwrap();
-            for value in 0..3u64 {
-                assert_eq!(c.try_read(), Some(value));
-            }
-            assert!(p.try_write(99).is_ok());
-            assert_eq!(c.try_read(), Some(99));
-            assert_eq!(c.try_read(), None);
-        }
+        assert!(producer.try_write(99).is_ok());
+        assert_eq!(consumer.try_read(), Some(99));
+        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
@@ -2240,7 +2180,7 @@ mod tests {
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
-        let mut consumer = Consumer::from_queue(queue.clone(), false).unwrap();
+        let mut consumer = Consumer::from_queue(queue.clone()).unwrap();
 
         // A producer publishes two items, then its process "crashes". A clean
         // drop would free the lane, so re-mark it ACTIVE to mimic a dead owner
@@ -2307,7 +2247,7 @@ mod tests {
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        ConsumerCore::join_lane(&lane, index, false);
+        ConsumerCore::join_lane(&lane, index);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
@@ -2315,7 +2255,7 @@ mod tests {
         }
         lane.consumer_state().set_cursor(index, 1);
 
-        // Recovery resumes at the recorded position: it reads the unread backlog
+        // Recovery resumes at the recorded position: it reads the unread values
         // (items 1, 2), never re-reading item 0.
         let mut recovered = Consumer::recover_in_queue(queue.clone(), index).unwrap();
         assert_eq!(recovered.index(), index);
@@ -2337,7 +2277,7 @@ mod tests {
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        ConsumerCore::join_lane(&lane, index, false);
+        ConsumerCore::join_lane(&lane, index);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
@@ -2346,21 +2286,22 @@ mod tests {
 
         // A fresh join can't proceed — the index is still owned.
         assert!(matches!(
-            Consumer::<Payload>::from_queue(queue.clone(), false),
+            Consumer::<Payload>::from_queue(queue.clone()),
             Err(Error::ConsumerSlotsExhausted)
         ));
 
-        // Force-release frees it (clear limits + free the index); a catch-up join
-        // then reclaims it and reads the still-present backlog from the start.
+        // Force-release frees it (clear limits + free the index); a fresh join
+        // then reclaims it at the current reservation frontier.
         for lane in 0..queue.producer_slots() {
             queue.lane(lane).consumer_state().release(index);
         }
         queue.release_consumer_index(index);
-        let mut fresh = Consumer::from_queue(queue.clone(), true).unwrap();
+        let mut fresh = Consumer::from_queue(queue.clone()).unwrap();
         assert_eq!(fresh.index(), index);
-        for value in 0..3u64 {
-            assert_eq!(fresh.try_read(), Some(value));
-        }
+        assert_eq!(fresh.try_read(), None);
+
+        assert!(producer.try_write(99).is_ok());
+        assert_eq!(fresh.try_read(), Some(99));
         assert_eq!(fresh.try_read(), None);
     }
 
