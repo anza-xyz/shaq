@@ -11,6 +11,7 @@ use core::{
     iter::FusedIterator,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
+    ops::Index,
     ptr::NonNull,
     sync::atomic::Ordering,
 };
@@ -275,13 +276,14 @@ impl<T> Consumer<T> {
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
     pub fn try_read(&self) -> Option<T> {
-        self.try_reserve_read().map(ReadGuard::read)
+        self.try_reserve_read().map(ReadGuard::into_inner)
     }
 
     /// Attempts to read a value from the queue, waiting up to `timeout` for
     /// a producer to publish data.
     pub fn read_timeout(&self, timeout: Duration) -> Result<T, WaitError> {
-        self.reserve_read_timeout(timeout).map(ReadGuard::read)
+        self.reserve_read_timeout(timeout)
+            .map(ReadGuard::into_inner)
     }
 
     /// Attempts to reserve a value from the queue, returning a guard.
@@ -917,9 +919,9 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
 #[must_use]
 /// A reservation for one initialized consumer slot.
 ///
-/// [`Self::read`] moves the value out of the queue. Dropping the guard without
-/// reading it drops the queued value. Either path releases the slot back to
-/// producers.
+/// [`Self::into_inner`] moves the value out of the queue. Dropping the guard
+/// without taking it drops the queued value. Either path releases the slot
+/// back to producers.
 pub struct ReadGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
@@ -941,7 +943,7 @@ impl<'a, T> ReadGuard<'a, T> {
     }
 
     /// Moves the reserved value out of the queue and releases its slot.
-    pub fn read(self) -> T {
+    pub fn into_inner(self) -> T {
         let guard = ManuallyDrop::new(self);
         // SAFETY: The cell was reserved for reading and holds an initialized value.
         let value = unsafe { guard.cell.read() };
@@ -1068,7 +1070,7 @@ impl<'a, T> RawReadBatch<'a, T> {
     ///   dropped.
     /// - A reference returned by this method must not be used after the value
     ///   is moved out or dropped by any means.
-    pub unsafe fn as_ref(&self, index: usize) -> &T {
+    pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading and is initialized.
@@ -1082,7 +1084,7 @@ impl<'a, T> RawReadBatch<'a, T> {
     /// - For non-`Copy` `T`, the value must not have previously been moved out
     ///   or dropped. It may be moved out exactly once.
     /// - No reference to the slot may be used after moving out its value.
-    pub unsafe fn read(&self, index: usize) -> T {
+    pub unsafe fn get_owned_unchecked(&self, index: usize) -> T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
@@ -1123,6 +1125,17 @@ impl<'a, T> ReadBatch<'a, T> {
         false
     }
 
+    /// Returns a shared reference to the value at `index`, or `None` if it is
+    /// outside the batch.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            return None;
+        }
+        // SAFETY: The bounds check establishes that the initialized slot is in
+        // the reservation, and a safe batch has not moved out any values.
+        Some(unsafe { self.raw().get_unchecked(index) })
+    }
+
     /// Iterates over shared references without consuming any values.
     ///
     /// The batch reservation remains held for the iterator's lifetime.
@@ -1132,7 +1145,7 @@ impl<'a, T> ReadBatch<'a, T> {
         (0..self.len()).map(|index| {
             // SAFETY: The safe batch has not moved out any values, and the
             // range only produces indices within the reservation.
-            unsafe { self.raw().as_ref(index) }
+            unsafe { self.raw().get_unchecked(index) }
         })
     }
 
@@ -1149,23 +1162,18 @@ impl<'a, T> ReadBatch<'a, T> {
 }
 
 impl<'a, T: Copy> ReadBatch<'a, T> {
-    /// Returns a shared reference to the value at `index`.
-    ///
-    /// # Panics
-    /// Panics if `index` is outside the batch.
-    pub fn as_ref(&self, index: usize) -> &T {
-        assert!(index < self.len(), "read batch index out of bounds");
-        // SAFETY: The bounds check establishes that the initialized slot is in
-        // the reservation. Copy values remain valid after repeated reads.
-        unsafe { self.raw().as_ref(index) }
+    /// Copies the value at `index`, or returns `None` if it is outside the
+    /// batch.
+    pub fn get_owned(&self, index: usize) -> Option<T> {
+        self.get(index).copied()
     }
+}
 
-    /// Copies the value at `index` without consuming it.
-    ///
-    /// # Panics
-    /// Panics if `index` is outside the batch.
-    pub fn read(&self, index: usize) -> T {
-        *self.as_ref(index)
+impl<T> Index<usize> for ReadBatch<'_, T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("read batch index out of bounds")
     }
 }
 
@@ -1177,7 +1185,7 @@ impl<T> Drop for ReadBatch<'_, T> {
 
         for index in 0..self.raw.len() {
             // SAFETY: An intact safe batch has not moved out any values.
-            let value = unsafe { self.raw.read(index) };
+            let value = unsafe { self.raw.get_owned_unchecked(index) };
             drop(value);
         }
     }
@@ -1205,7 +1213,7 @@ impl<T> Iterator for ReadBatchDrain<'_, T> {
         // Advance before returning ownership so Drop only considers the suffix.
         self.next += 1;
         // SAFETY: The cursor visits every reserved index at most once.
-        Some(unsafe { self.raw.read(index) })
+        Some(unsafe { self.raw.get_owned_unchecked(index) })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1227,7 +1235,7 @@ impl<T> Drop for ReadBatchDrain<'_, T> {
             let index = self.next;
             self.next += 1;
             // SAFETY: The cursor visits every reserved index at most once.
-            let value = unsafe { self.raw.read(index) };
+            let value = unsafe { self.raw.get_owned_unchecked(index) };
             drop(value);
         }
     }
@@ -1356,7 +1364,7 @@ mod tests {
             );
             assert_eq!(batch.len(), 3);
             for (index, expected) in [1, 2, 3].into_iter().enumerate() {
-                assert_eq!(batch.read(index), expected);
+                assert_eq!(batch.get_owned(index), Some(expected));
             }
         }
     }
@@ -1372,7 +1380,7 @@ mod tests {
 
             let guard = consumer.try_reserve_read().expect("try_read_ptr failed");
             assert_eq!(*guard.as_ref(), 42);
-            assert_eq!(guard.read(), 42);
+            assert_eq!(guard.into_inner(), 42);
         }
     }
 
@@ -1395,9 +1403,12 @@ mod tests {
                 .try_reserve_read_batch(batch_size)
                 .expect("try_read_batch failed");
             for index in 0..batch.len() {
-                assert_eq!(*batch.as_ref(index), index as u64);
-                assert_eq!(batch.read(index), index as u64);
+                assert_eq!(batch.get(index), Some(&(index as u64)));
+                assert_eq!(batch[index], index as u64);
+                assert_eq!(batch.get_owned(index), Some(index as u64));
             }
+            assert_eq!(batch.get(batch.len()), None);
+            assert_eq!(batch.get_owned(batch.len()), None);
         }
     }
 
@@ -1420,7 +1431,7 @@ mod tests {
                 .expect("try_read_batch up-to failed");
             assert_eq!(batch.len(), 4);
             for index in 0..batch.len() {
-                assert_eq!(*batch.as_ref(index), index as u64);
+                assert_eq!(batch[index], index as u64);
             }
         }
     }
@@ -1461,6 +1472,9 @@ mod tests {
                 batch.iter().map(|item| item.value).collect::<Vec<_>>(),
                 vec![0, 1, 2]
             );
+            assert_eq!(batch.get(1).map(|item| item.value), Some(1));
+            assert_eq!(batch[2].value, 2);
+            assert!(batch.get(3).is_none());
             drop(batch);
 
             assert_eq!(drops.load(Ordering::Relaxed), 3);
@@ -1519,9 +1533,9 @@ mod tests {
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
                 .expect("wrapped read batch");
-            assert_eq!(batch.read(3), 5);
-            assert_eq!(batch.read(0), 2);
-            assert_eq!(batch.read(3), 5);
+            assert_eq!(batch.get_owned(3), Some(5));
+            assert_eq!(batch.get_owned(0), Some(2));
+            assert_eq!(batch.get_owned(3), Some(5));
             assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
             assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
         }
@@ -1542,10 +1556,10 @@ mod tests {
                     .try_reserve_read_batch_raw(NonZeroUsize::new(4).unwrap())
                     .expect("raw read batch")
             };
-            assert_eq!(unsafe { batch.as_ref(2) }.value, 2);
+            assert_eq!(unsafe { batch.get_unchecked(2) }.value, 2);
             for index in [2, 0, 1] {
                 // SAFETY: Each in-bounds index is moved out exactly once.
-                drop(unsafe { batch.read(index) });
+                drop(unsafe { batch.get_owned_unchecked(index) });
             }
             drop(batch);
 
