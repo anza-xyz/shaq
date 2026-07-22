@@ -12,6 +12,20 @@ use crate::CacheAlignedAtomicSize;
 
 const CONSUMER_FREE: u64 = 0;
 const CONSUMER_ACTIVE: u64 = 1;
+const CONSUMER_JOINING: u64 = 2;
+
+pub(crate) enum ConsumerRecoveryMode {
+    /// The global ownership slot was active, which proves the previous join
+    /// installed a final cursor on every lane. Recovery can reconstruct those
+    /// cursors from the surviving reserve limits and continue from them.
+    Resume,
+
+    /// The global ownership slot was free or still joining, so its per-lane
+    /// limits may be absent or may only be provisional handshake values.
+    /// Recovery must join every lane again at its reservation frontier before
+    /// marking the consumer active.
+    RestartJoin,
+}
 
 /// Value stored in a lane consumer slot that no consumer owns.
 ///
@@ -23,8 +37,8 @@ const UNCLAIMED: usize = usize::MAX;
 
 /// Global consumer-index ownership table.
 ///
-/// The table is a contiguous `[AtomicU64; consumer_slots]` block. It only tracks
-/// whether a consumer index is owned.
+/// The table is a contiguous `[AtomicU64; consumer_slots]` block. Each slot is
+/// free, joining its lanes, or active.
 #[derive(Clone, Copy)]
 pub(crate) struct ConsumerState {
     slots: NonNull<AtomicU64>,
@@ -72,14 +86,15 @@ impl ConsumerState {
         self.slot_count
     }
 
-    /// Claims a free consumer index in the global ownership table.
+    /// Claims a free consumer index in the global ownership table. The index
+    /// remains in the joining phase until every lane has installed its cursor.
     pub(crate) fn acquire(&self) -> Result<usize, Error> {
         for index in 0..self.slot_count {
             if self
                 .slot(index)
                 .compare_exchange(
                     CONSUMER_FREE,
-                    CONSUMER_ACTIVE,
+                    CONSUMER_JOINING,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -91,15 +106,31 @@ impl ConsumerState {
         Err(Error::ConsumerSlotsExhausted)
     }
 
+    /// Marks a joining consumer active after all of its lane cursors have been
+    /// installed.
+    pub(crate) fn activate(&self, index: usize) {
+        self.slot(index).store(CONSUMER_ACTIVE, Ordering::Release);
+    }
+
     /// Releases a consumer index back to free.
     pub(crate) fn release(&self, index: usize) {
         self.slot(index).store(CONSUMER_FREE, Ordering::Release);
     }
 
-    /// Force-owns a consumer index whose previous owner died (no CAS). The
-    /// caller guarantees that owner is dead and no live handle uses the index.
-    pub(crate) fn recover(&self, index: usize) {
-        self.slot(index).store(CONSUMER_ACTIVE, Ordering::Release);
+    /// Begins recovery of an index whose previous owner died. An active consumer
+    /// has complete lane cursors and can resume them. A free or joining index is
+    /// kept in the joining phase so recovery can restart every lane safely.
+    ///
+    /// The caller guarantees that no live handle uses the index and serializes
+    /// recovery with joins, drops, and other recovery operations.
+    pub(crate) fn begin_recovery(&self, index: usize) -> ConsumerRecoveryMode {
+        let slot = self.slot(index);
+        if slot.load(Ordering::Acquire) == CONSUMER_ACTIVE {
+            ConsumerRecoveryMode::Resume
+        } else {
+            slot.store(CONSUMER_JOINING, Ordering::Release);
+            ConsumerRecoveryMode::RestartJoin
+        }
     }
 
     /// The global ownership word for consumer index `index`.
@@ -309,11 +340,24 @@ mod tests {
             Err(Error::ConsumerSlotsExhausted)
         ));
 
+        assert!(matches!(
+            state.begin_recovery(0),
+            ConsumerRecoveryMode::RestartJoin
+        ));
+        state.activate(0);
+        assert!(matches!(
+            state.begin_recovery(0),
+            ConsumerRecoveryMode::Resume
+        ));
+
         state.release(0);
         assert_eq!(state.acquire().unwrap(), 0);
 
         state.release(1);
-        state.recover(1);
+        assert!(matches!(
+            state.begin_recovery(1),
+            ConsumerRecoveryMode::RestartJoin
+        ));
         assert!(matches!(
             state.acquire(),
             Err(Error::ConsumerSlotsExhausted)

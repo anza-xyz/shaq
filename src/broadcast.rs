@@ -11,8 +11,9 @@
 //! `*_timeout` variants that park on the queue's futex when idle. A consumer
 //! joins at each lane's reservation frontier, skipping values that were already
 //! reserved. After a crash, a lane or consumer index can be taken over with
-//! `recover` (resuming where the dead owner was) or returned to the pool with
-//! `force_release`.
+//! `recover` or returned to the pool with `force_release`. A fully joined
+//! consumer resumes where the dead owner was; an interrupted join restarts at
+//! each lane's current reservation frontier.
 //!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
 //! [`Drop`] and therefore does not require a destructor when a cell is
@@ -48,7 +49,7 @@ use crate::futex::{Waiters, SPIN_ATTEMPTS};
 use crate::shmem::Region;
 use crate::{CacheAlignedAtomicSize, VERSION};
 
-use consumer_state::ConsumerState;
+use consumer_state::{ConsumerRecoveryMode, ConsumerState};
 use producer_lane::ProducerLane;
 
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
@@ -415,15 +416,20 @@ impl SharedQueue {
         self.consumer_state.acquire()
     }
 
+    /// Marks a consumer index active after every lane cursor is installed.
+    fn activate_consumer_index(&self, index: usize) {
+        self.consumer_state.activate(index);
+    }
+
     /// Releases a consumer index back to free.
     fn release_consumer_index(&self, index: usize) {
         self.consumer_state.release(index);
     }
 
-    /// Force-owns a consumer index whose previous owner died (no CAS). The
-    /// caller guarantees that owner is dead and no live handle uses the index.
-    fn recover_consumer_index(&self, index: usize) {
-        self.consumer_state.recover(index);
+    /// Determines whether recovery can resume complete lane cursors or must
+    /// restart an interrupted join.
+    fn begin_consumer_recovery(&self, index: usize) -> ConsumerRecoveryMode {
+        self.consumer_state.begin_recovery(index)
     }
 
     /// Maps `file`, initializing it as a broadcast queue.
@@ -824,6 +830,7 @@ impl ConsumerCore {
             .iter()
             .map(|lane| Self::join_lane(lane, index))
             .collect();
+        queue.activate_consumer_index(index);
         Ok(Self {
             queue,
             index,
@@ -837,15 +844,24 @@ impl ConsumerCore {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
-        queue.recover_consumer_index(index);
-        // Resume each lane at the dead owner's recorded position.
+        let recovery_mode = queue.begin_consumer_recovery(index);
         let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
             .map(|lane| queue.lane(lane))
             .collect();
-        let next_by_lane = lanes
-            .iter()
-            .map(|lane| Self::recover_lane(lane, index))
-            .collect();
+        let next_by_lane = match recovery_mode {
+            ConsumerRecoveryMode::Resume => lanes
+                .iter()
+                .map(|lane| Self::recover_lane(lane, index))
+                .collect(),
+            ConsumerRecoveryMode::RestartJoin => {
+                let next_by_lane = lanes
+                    .iter()
+                    .map(|lane| Self::join_lane(lane, index))
+                    .collect();
+                queue.activate_consumer_index(index);
+                next_by_lane
+            }
+        };
         Ok(Self {
             queue,
             index,
@@ -1027,11 +1043,12 @@ impl<T: Copy> Consumer<T> {
         self.core.index()
     }
 
-    /// Takes over a consumer index whose owner died, without the usual ownership
-    /// handshake, **resuming where the dead owner left off** on each lane — its
-    /// unread items are still pinned by its reserve limit, so they are delivered.
-    /// To instead restart fresh, [`force_release`](Self::force_release) the index
-    /// and `join` it however you like.
+    /// Takes over a consumer index whose owner died. A fully joined consumer
+    /// **resumes where the dead owner left off** on each lane — its unread items
+    /// are still pinned by its reserve limit, so they are delivered. If the
+    /// owner died before joining every lane, recovery instead restarts every
+    /// lane at its current reservation frontier. To unconditionally restart
+    /// fresh, [`force_release`](Self::force_release) the index and `join` it.
     ///
     /// # Safety
     /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
@@ -1295,8 +1312,10 @@ impl SliceConsumer {
         self.core.payload_size()
     }
 
-    /// Takes over a consumer index whose owner died, resuming where the dead
-    /// owner left off on each lane.
+    /// Takes over a consumer index whose owner died. A fully joined consumer
+    /// resumes where the dead owner left off on each lane. If the owner died
+    /// before joining every lane, recovery instead restarts every lane at its
+    /// current reservation frontier.
     ///
     /// # Safety
     /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
@@ -2248,6 +2267,7 @@ mod tests {
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
         ConsumerCore::join_lane(&lane, index);
+        queue.activate_consumer_index(index);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
@@ -2265,6 +2285,37 @@ mod tests {
     }
 
     #[test]
+    fn recover_consumer_restarts_an_interrupted_join() {
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        let queue = recovery_queue(&config);
+        let index = queue.acquire_consumer_index().unwrap();
+        let lane = queue.lane(0);
+        let mut producer = Producer::from_queue(queue.clone()).unwrap();
+
+        // The consumer sampled reservation 0, then the producer filled the ring
+        // before the consumer published its initial limit. Simulate a crash after
+        // that initial limit store but before the second reservation sample. The
+        // global ownership slot deliberately remains JOINING.
+        for value in 0..4u64 {
+            assert!(producer.try_write(value).is_ok());
+        }
+        lane.consumer_state().set_cursor(index, 0);
+
+        // Recovery must restart the incomplete join at reservation 4 rather than
+        // interpreting the temporary limit as a completed cursor at sequence 0.
+        let mut recovered = Consumer::recover_in_queue(queue.clone(), index).unwrap();
+        assert_eq!(recovered.try_read(), None);
+
+        assert!(producer.try_write(99).is_ok());
+        assert_eq!(recovered.try_read(), Some(99));
+        assert_eq!(recovered.try_read(), None);
+    }
+
+    #[test]
     fn force_release_consumer_frees_the_index_for_a_fresh_join() {
         let config = BroadcastConfig {
             capacity: 8,
@@ -2278,6 +2329,7 @@ mod tests {
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
         ConsumerCore::join_lane(&lane, index);
+        queue.activate_consumer_index(index);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
