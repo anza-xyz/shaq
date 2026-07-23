@@ -21,10 +21,11 @@
 //! per-lane state always describes a single producer. Replacing producers
 //! means recreating the queue.
 //!
-//! Each lane carries advisory producer metadata: a queue-assigned identifier,
-//! unique per lane acquisition ([`Producer::identifier`]), and a
-//! rejected-items counter that automatically counts events refused by
-//! backpressure ([`LaneMetadata::rejected_items`]). Guards report the lane a
+//! Each lane carries advisory producer metadata: a producer-supplied
+//! identifier — an arbitrary `u64`, e.g. a thread id, installed via
+//! [`Producer::set_identifier`] — and a rejected-items counter that
+//! automatically counts events refused by backpressure
+//! ([`LaneMetadata::rejected_items`]). Guards report the lane a
 //! value came from ([`ReadGuard::lane`]), and any handle can snapshot a lane's
 //! metadata by index ([`Consumer::lane_metadata`]), so per-message attribution
 //! costs nothing on the payload itself.
@@ -84,13 +85,15 @@ pub struct BroadcastConfig {
 /// not atomic with respect to ownership changes or the other fields; treat it
 /// as diagnostic data, not as a synchronization primitive.
 ///
-/// Acquisition installs the owner's identifier; the rejected-items counter
-/// starts at zero from queue initialization. A lane binds to at most one
-/// producer, so after its producer drops (or dies) the identifier and
-/// rejected-items count remain readable for the queue's lifetime.
+/// The owning producer supplies the identifier ([`Producer::set_identifier`]);
+/// the rejected-items counter starts at zero from queue initialization. A lane
+/// binds to at most one producer, so after its producer drops (or dies) the
+/// identifier and rejected-items count remain readable for the queue's
+/// lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneMetadata {
-    /// Queue-assigned identifier of the lane's producer.
+    /// Producer-supplied identifier of the lane's producer, `0` until the
+    /// producer sets one.
     pub identifier: u64,
     /// Count of messages refused by backpressure on this lane.
     pub rejected_items: u64,
@@ -110,7 +113,6 @@ struct SharedQueueHeader {
     consumer_slots: u32,
     payload_size: usize,
     payload_align: usize,
-    next_producer_lane_identifier: AtomicU64,
     /// Count of consumers blocked waiting for any lane to publish.
     waiters: Waiters,
     /// Futex word for blocked consumers: bumped only when a publish wakes one
@@ -135,7 +137,6 @@ impl SharedQueueHeader {
             consumer_slots: layout.consumer_slots as u32,
             payload_size: layout.payload_layout.size(),
             payload_align: layout.payload_layout.align(),
-            next_producer_lane_identifier: AtomicU64::new(1),
             waiters: Waiters::default(),
             wake_seq: CacheAlignedAtomicSize::default(),
         };
@@ -404,14 +405,8 @@ impl SharedQueue {
 
     /// Claims a free producer lane, returning its index.
     fn acquire_producer_lane(&self) -> Result<usize, Error> {
-        // failed attempt skips an identifier value, which is fine,
-        // as only uniqueness is needed.
-        let producer_lane_identifier = self
-            .header()
-            .next_producer_lane_identifier
-            .fetch_add(1, Ordering::Relaxed);
         for lane in 0..self.producer_slots {
-            if self.lane(lane).try_acquire(producer_lane_identifier) {
+            if self.lane(lane).try_acquire() {
                 return Ok(lane);
             }
         }
@@ -590,10 +585,17 @@ impl<T: Copy> Producer<T> {
         self.index
     }
 
-    /// This producer's queue-assigned identifier: unique per lane acquisition
-    /// across every process on the queue. Lanes bind to at most one producer,
-    /// so the identifier is fixed for the lane's lifetime. Other handles read
-    /// it via [`lane_metadata`](Consumer::lane_metadata).
+    /// Sets this producer's advisory identifier — an arbitrary caller-chosen
+    /// value (e.g. the id of the thread that publishes on this lane), readable
+    /// by every handle via [`lane_metadata`](Consumer::lane_metadata). The
+    /// queue does not interpret it or enforce uniqueness; it reports `0` until
+    /// one is set.
+    pub fn set_identifier(&mut self, identifier: u64) {
+        self.lane.set_identifier(identifier);
+    }
+
+    /// This producer's advisory identifier, `0` until
+    /// [`set_identifier`](Self::set_identifier) installs one.
     pub fn identifier(&self) -> u64 {
         self.lane.identifier()
     }
@@ -1596,7 +1598,7 @@ mod tests {
     use super::*;
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
-    use assert_matches::assert_matches;
+    use std::assert_matches;
 
     type Payload = u64;
     type CreateProducer = fn(BroadcastConfig) -> Producer<Payload>;
@@ -2306,14 +2308,16 @@ mod tests {
     #[test]
     fn owned_lane_reports_its_producer_metadata() {
         for create in producer_creators() {
-            // Given a fresh queue whose first lane acquisition is assigned
-            // identifier 1.
-            let producer = create(BroadcastConfig {
+            // Given a producer that reports the `0` sentinel until it supplies
+            // its own identifier (e.g. a thread id).
+            let mut producer = create(BroadcastConfig {
                 capacity: 4,
                 producer_slots: 2,
                 consumer_slots: 1,
             });
-            assert_eq!(producer.identifier(), 1);
+            assert_eq!(producer.identifier(), 0);
+            producer.set_identifier(7);
+            assert_eq!(producer.identifier(), 7);
 
             // When a consumer snapshots the producer's lane.
             let consumer = producer.join_as_consumer().unwrap();
@@ -2323,7 +2327,7 @@ mod tests {
             assert_eq!(
                 consumer.lane_metadata(producer.index()),
                 Some(LaneMetadata {
-                    identifier: 1,
+                    identifier: 7,
                     rejected_items: 0,
                     is_active: true,
                 })
@@ -2398,7 +2402,7 @@ mod tests {
             let consumer = first_producer.join_as_consumer().unwrap();
             let mut second_producer = first_producer.try_clone().unwrap();
             let lane_index = second_producer.index();
-            let identifier = second_producer.identifier();
+            second_producer.set_identifier(42);
             for value in 0..4u64 {
                 assert_matches!(second_producer.try_write(value), Ok(()));
             }
@@ -2412,7 +2416,7 @@ mod tests {
             assert_eq!(
                 consumer.lane_metadata(lane_index),
                 Some(LaneMetadata {
-                    identifier,
+                    identifier: 42,
                     rejected_items: 1,
                     is_active: false,
                 })
@@ -2430,6 +2434,7 @@ mod tests {
                 consumer_slots: 1,
             });
             let mut publishing_producer = idle_producer.try_clone().unwrap();
+            publishing_producer.set_identifier(42);
             let mut consumer = idle_producer.join_as_consumer().unwrap();
             assert_matches!(publishing_producer.try_write(7), Ok(()));
 
@@ -2474,11 +2479,12 @@ mod tests {
     #[test]
     fn slice_consumer_exposes_lane_metadata() {
         // Given a typed producer on a single-lane queue.
-        let producer = create_heap_producer(BroadcastConfig {
+        let mut producer = create_heap_producer(BroadcastConfig {
             capacity: 4,
             producer_slots: 1,
             consumer_slots: 1,
         });
+        producer.set_identifier(42);
 
         // When an untyped consumer joins it.
         // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
