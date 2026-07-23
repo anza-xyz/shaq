@@ -10,10 +10,16 @@
 //! [`Consumer::try_read`], a [`ReadGuard`], or a [`ReadBatch`], with blocking
 //! `*_timeout` variants that park on the queue's futex when idle. A consumer
 //! joins at each lane's reservation frontier, skipping values that were already
-//! reserved. After a crash, a lane or consumer index can be taken over with
-//! `recover` or returned to the pool with `force_release`. A fully joined
-//! consumer resumes where the dead owner was; an interrupted join restarts at
-//! each lane's current reservation frontier.
+//! reserved. After a crash, a consumer index can be taken over with `recover`
+//! or returned to the pool with `force_release`. A fully joined consumer
+//! resumes where the dead owner was; an interrupted join restarts at each
+//! lane's current reservation frontier.
+//!
+//! Producer lanes bind to at most one producer for the queue's lifetime: a lane
+//! is claimed on join and permanently retired when its producer drops; a
+//! crashed producer's lane stays claimed. Neither returns to the free pool, so
+//! per-lane state always describes a single producer. Replacing producers
+//! means recreating the queue.
 //!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
 //! [`Drop`] and therefore does not require a destructor when a cell is
@@ -24,7 +30,7 @@
 //!
 //! Recovery is an externally serialized operation. Do not race recovery or
 //! force-release with other recovery operations, with joins/drops for the same
-//! queue, or with a still-live owner of the index/lane being recovered.
+//! queue, or with a still-live owner of the index being recovered.
 //!
 //! The region is a fixed header (magic/version, the global consumer-ownership
 //! table, and the blocked-consumer wake counter) followed by one lane block per
@@ -540,62 +546,11 @@ impl<T: Copy> Producer<T> {
         })
     }
 
-    /// The lane this producer owns. Record it so a replacement can
-    /// [`recover`](Self::recover) the lane if this producer's process dies.
+    /// The lane this producer owns. A lane binds to at most one producer for
+    /// the queue's lifetime, so the index uniquely identifies this producer to
+    /// consumers.
     pub fn index(&self) -> usize {
         self.index
-    }
-
-    /// Takes over a lane whose producer died, without the usual ownership
-    /// handshake. The recovered producer continues publishing from the lane's
-    /// last published sequence; any cells the dead producer reserved but never
-    /// published are discarded.
-    ///
-    /// # Safety
-    /// - All of [`Self::join`]'s requirements, plus: the producer that owned
-    ///   `index` must be dead and no other live handle may use that lane — two
-    ///   producers on one lane corrupts it.
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
-    pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::recover_in_queue(queue, index)
-    }
-
-    fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
-        if index >= queue.producer_slots() {
-            return Err(Error::InvalidIndex);
-        }
-        let lane = queue.lane(index);
-        lane.recover();
-        Ok(Self {
-            queue,
-            lane,
-            index,
-            _marker: PhantomData,
-            _invariant: PhantomData,
-        })
-    }
-
-    /// Force-releases a lane whose producer died, returning it to the free pool
-    /// (rewinding its reservation first) so a later [`join`](Self::join) /
-    /// [`try_clone`](Self::try_clone) can reclaim it.
-    ///
-    /// # Safety
-    /// - As [`Self::join`], plus: the producer that owned `index` must be dead and
-    ///   no other live handle may use that lane.
-    /// - Force-release must be serialized externally, with the same restrictions
-    ///   as [`Self::recover`].
-    pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        if index >= queue.producer_slots() {
-            return Err(Error::InvalidIndex);
-        }
-        queue.lane(index).force_release();
-        Ok(())
     }
 
     /// Claims another free lane on the same queue.
@@ -693,7 +648,7 @@ impl<T: Copy> Producer<T> {
 
 impl<T: Copy> Drop for Producer<T> {
     fn drop(&mut self) {
-        self.lane.release();
+        self.lane.retire();
     }
 }
 
@@ -1557,8 +1512,8 @@ mod tests {
             let p1 = p0.try_clone().unwrap();
             assert!(matches!(p0.try_clone(), Err(Error::ProducerSlotsExhausted)));
             drop(p1);
-            // The freed lane can be reclaimed.
-            assert!(p0.try_clone().is_ok());
+            // The dropped lane is retired, not returned to the pool.
+            assert!(matches!(p0.try_clone(), Err(Error::ProducerSlotsExhausted)));
         }
     }
 
@@ -2192,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_producer_takes_over_a_wedged_lane() {
+    fn dropped_producer_lane_stays_readable() {
         let config = BroadcastConfig {
             capacity: 8,
             producer_slots: 1,
@@ -2201,55 +2156,23 @@ mod tests {
         let queue = recovery_queue(&config);
         let mut consumer = Consumer::from_queue(queue.clone()).unwrap();
 
-        // A producer publishes two items, then its process "crashes". A clean
-        // drop would free the lane, so re-mark it ACTIVE to mimic a dead owner
-        // that never released it.
+        // A producer publishes two items and drops, retiring its lane.
         {
             let mut producer = Producer::from_queue(queue.clone()).unwrap();
             assert!(producer.try_write(1).is_ok());
             assert!(producer.try_write(2).is_ok());
         }
-        assert!(queue.lane(0).try_acquire());
 
-        // The only lane is held, so a normal join is refused.
+        // The retired lane is never handed to a new producer.
         assert!(matches!(
             Producer::<Payload>::from_queue(queue.clone()),
             Err(Error::ProducerSlotsExhausted)
         ));
 
-        // Recover the lane and keep publishing where the dead producer stopped.
-        let mut recovered = Producer::<Payload>::recover_in_queue(queue.clone(), 0).unwrap();
-        assert_eq!(recovered.index(), 0);
-        assert!(recovered.try_write(3).is_ok());
-
-        // The consumer (joined before the crash) sees every item in order.
-        for value in 1..=3u64 {
-            assert_eq!(consumer.try_read(), Some(value));
-        }
+        // The consumer still drains what the dead producer published.
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
         assert_eq!(consumer.try_read(), None);
-    }
-
-    #[test]
-    fn recover_producer_rewinds_unpublished_reservation() {
-        let config = BroadcastConfig {
-            capacity: 8,
-            producer_slots: 1,
-            consumer_slots: 1,
-        };
-        let queue = recovery_queue(&config);
-
-        // Mimic a producer that reserved a batch but crashed before publishing:
-        // the reservation runs ahead of the publication.
-        let mut lane = queue.lane(0);
-        assert!(lane.try_acquire());
-        lane.try_reserve(NonZeroUsize::new(3).unwrap());
-        assert_eq!(lane.reserved(), 3);
-        assert_eq!(lane.published(), 0);
-
-        // Recovery rewinds the reservation back to the publication.
-        let recovered = Producer::<Payload>::recover_in_queue(queue.clone(), 0).unwrap();
-        assert_eq!(recovered.lane.reserved(), 0);
-        assert_eq!(recovered.lane.published(), 0);
     }
 
     #[test]
@@ -2365,10 +2288,6 @@ mod tests {
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
-        assert!(matches!(
-            Producer::<Payload>::recover_in_queue(queue.clone(), 1),
-            Err(Error::InvalidIndex)
-        ));
         assert!(matches!(
             Consumer::<Payload>::recover_in_queue(queue.clone(), 1),
             Err(Error::InvalidIndex)
