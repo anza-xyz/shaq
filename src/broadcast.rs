@@ -21,6 +21,15 @@
 //! per-lane state always describes a single producer. Replacing producers
 //! means recreating the queue.
 //!
+//! Each lane carries advisory producer metadata: a producer-supplied
+//! identifier — an arbitrary `u64`, e.g. a thread id, installed via
+//! [`Producer::set_identifier`] — and a rejected-items counter that
+//! automatically counts events refused by backpressure
+//! ([`LaneMetadata::rejected_items`]). Guards report the lane a
+//! value came from ([`ReadGuard::lane`]), and any handle can snapshot a lane's
+//! metadata by index ([`Consumer::lane_metadata`]), so per-message attribution
+//! costs nothing on the payload itself.
+//!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
 //! [`Drop`] and therefore does not require a destructor when a cell is
 //! duplicated or reused. File-backed typed construction remains unsafe because
@@ -68,6 +77,28 @@ pub struct BroadcastConfig {
     pub capacity: usize,
     pub producer_slots: usize,
     pub consumer_slots: usize,
+}
+
+/// Advisory snapshot of one producer lane's metadata.
+///
+/// Each field is a separate atomic load from shared memory, so the snapshot is
+/// not atomic with respect to ownership changes or the other fields; treat it
+/// as diagnostic data, not as a synchronization primitive.
+///
+/// The owning producer supplies the identifier ([`Producer::set_identifier`]);
+/// the rejected-items counter starts at zero from queue initialization. A lane
+/// binds to at most one producer, so after its producer drops (or dies) the
+/// identifier and rejected-items count remain readable for the queue's
+/// lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneMetadata {
+    /// Producer-supplied identifier of the lane's producer, `0` until the
+    /// producer sets one.
+    pub identifier: u64,
+    /// Count of messages refused by backpressure on this lane.
+    pub rejected_items: u64,
+    /// Whether a producer currently owns the lane.
+    pub is_active: bool,
 }
 
 /// Shared header at the start of the region. The producer-lane cursors and the
@@ -358,6 +389,7 @@ impl SharedQueue {
     }
 
     /// A view over producer lane `lane`.
+    // TODO(#110)
     fn lane(&self, lane: usize) -> ProducerLane {
         debug_assert!(lane < self.producer_slots);
         // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
@@ -551,6 +583,42 @@ impl<T: Copy> Producer<T> {
     /// consumers.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Sets this producer's advisory identifier — an arbitrary caller-chosen
+    /// value (e.g. the id of the thread that publishes on this lane), readable
+    /// by every handle via [`lane_metadata`](Consumer::lane_metadata). The
+    /// queue does not interpret it or enforce uniqueness; it reports `0` until
+    /// one is set.
+    pub fn set_identifier(&mut self, identifier: u64) {
+        self.lane.set_identifier(identifier);
+    }
+
+    /// This producer's advisory identifier, `0` until
+    /// [`set_identifier`](Self::set_identifier) installs one.
+    pub fn identifier(&self) -> u64 {
+        self.lane.identifier()
+    }
+
+    /// Number of producer lanes on the queue; lane indexes are
+    /// `0..producer_slots`.
+    pub fn producer_slots(&self) -> usize {
+        self.queue.producer_slots()
+    }
+
+    /// Advisory [`LaneMetadata`] snapshot for the lane at `lane_index` (the
+    /// index guards report).
+    ///
+    /// Returns [`None`] if `lane_index` is out of range.
+    pub fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata> {
+        if lane_index >= self.queue.producer_slots() {
+            return None;
+        }
+
+        let lane = self.queue.lane(lane_index);
+        let lane_metadata = lane.metadata();
+
+        Some(lane_metadata)
     }
 
     /// Claims another free lane on the same queue.
@@ -855,6 +923,18 @@ impl ConsumerCore {
         self.queue.payload.size()
     }
 
+    fn producer_slots(&self) -> usize {
+        self.lanes.len()
+    }
+
+    fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata> {
+        if lane_index >= self.lanes.len() {
+            return None;
+        }
+        let lane_metadata = self.lane(lane_index).metadata();
+        Some(lane_metadata)
+    }
+
     #[inline]
     fn lane(&self, lane: usize) -> &ProducerLane {
         debug_assert!(lane < self.lanes.len());
@@ -1042,6 +1122,19 @@ impl<T: Copy> Consumer<T> {
         ConsumerCore::force_release(queue, index)
     }
 
+    /// Number of producer lanes on the queue; lane indexes are
+    /// `0..producer_slots`.
+    pub fn producer_slots(&self) -> usize {
+        self.core.producer_slots()
+    }
+
+    /// Advisory [`LaneMetadata`] snapshot for the lane at `lane_index`.
+    ///
+    /// Returns [`None`] if `lane_index` is out of range.
+    pub fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata> {
+        self.core.lane_metadata(lane_index)
+    }
+
     /// Reads the next available value by copying it out, or `None` if every lane
     /// is caught up.
     pub fn try_read(&mut self) -> Option<T> {
@@ -1136,6 +1229,12 @@ pub struct ReadGuard<'a, T: Copy> {
 }
 
 impl<T: Copy> ReadGuard<'_, T> {
+    /// The producer lane this value was published on; look up its producer's
+    /// metadata with [`Consumer::lane_metadata`].
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+
     /// Copies the value out; the guard advances past it on drop.
     pub fn read(self) -> T {
         // SAFETY: the cell is published and held by this consumer's cursor.
@@ -1170,6 +1269,12 @@ pub struct ReadBatch<'a, T: Copy> {
 }
 
 impl<T: Copy> ReadBatch<'_, T> {
+    /// The producer lane every value in this batch was published on; look up
+    /// its producer's metadata with [`Consumer::lane_metadata`].
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+
     pub fn len(&self) -> usize {
         self.count.get()
     }
@@ -1265,6 +1370,19 @@ impl SliceConsumer {
     /// Number of bytes in each payload cell, discovered from the queue header.
     pub fn payload_size(&self) -> usize {
         self.core.payload_size()
+    }
+
+    /// Number of producer lanes on the queue; lane indexes are
+    /// `0..producer_slots`.
+    pub fn producer_slots(&self) -> usize {
+        self.core.producer_slots()
+    }
+
+    /// Advisory [`LaneMetadata`] snapshot for the lane at `lane_index`.
+    ///
+    /// Returns [`None`] if `lane_index` is out of range.
+    pub fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata> {
+        self.core.lane_metadata(lane_index)
     }
 
     /// Takes over a consumer index whose owner died. A fully joined consumer
@@ -1387,6 +1505,12 @@ pub struct SliceReadGuard<'a> {
 }
 
 impl SliceReadGuard<'_> {
+    /// The producer lane this payload was published on; look up its producer's
+    /// metadata with [`SliceConsumer::lane_metadata`].
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+
     /// Byte length of the payload.
     pub fn len(&self) -> usize {
         self.len
@@ -1427,6 +1551,12 @@ pub struct SliceReadBatch<'a> {
 }
 
 impl SliceReadBatch<'_> {
+    /// The producer lane every payload in this batch was published on; look up
+    /// its producer's metadata with [`SliceConsumer::lane_metadata`].
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+
     pub fn len(&self) -> usize {
         self.count.get()
     }
@@ -1468,6 +1598,7 @@ mod tests {
     use super::*;
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
+    use std::assert_matches;
 
     type Payload = u64;
     type CreateProducer = fn(BroadcastConfig) -> Producer<Payload>;
@@ -2135,6 +2266,282 @@ mod tests {
                 Err(WaitError::Timeout)
             ));
         }
+    }
+
+    #[test]
+    fn producer_slots_reports_the_configured_lane_count() {
+        for create in producer_creators() {
+            // Given a queue configured with two producer lanes.
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+
+            // When a consumer joins it.
+            let consumer = producer.join_as_consumer().unwrap();
+
+            // Then both handles report the configured lane count.
+            assert_eq!(producer.producer_slots(), 2);
+            assert_eq!(consumer.producer_slots(), 2);
+        }
+    }
+
+    #[test]
+    fn lane_metadata_is_none_for_an_out_of_range_index() {
+        for create in producer_creators() {
+            // Given a queue with two producer lanes.
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let consumer = producer.join_as_consumer().unwrap();
+
+            // When a lane index at `producer_slots` is queried.
+            // Then no snapshot is returned, from either handle.
+            assert_matches!(producer.lane_metadata(2), None);
+            assert_matches!(consumer.lane_metadata(2), None);
+        }
+    }
+
+    #[test]
+    fn owned_lane_reports_its_producer_metadata() {
+        for create in producer_creators() {
+            // Given a producer that reports the `0` sentinel until it supplies
+            // its own identifier (e.g. a thread id).
+            let mut producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            assert_eq!(producer.identifier(), 0);
+            producer.set_identifier(7);
+            assert_eq!(producer.identifier(), 7);
+
+            // When a consumer snapshots the producer's lane.
+            let consumer = producer.join_as_consumer().unwrap();
+
+            // Then the lane reports an active owner under that identifier with
+            // a clean rejected-items counter.
+            assert_eq!(
+                consumer.lane_metadata(producer.index()),
+                Some(LaneMetadata {
+                    identifier: 7,
+                    rejected_items: 0,
+                    is_active: true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn never_owned_lane_reports_the_zero_identifier_sentinel() {
+        for create in producer_creators() {
+            // Given a queue with two lanes, only one of which was acquired.
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let consumer = producer.join_as_consumer().unwrap();
+
+            // When the unowned lane is snapshotted.
+            // Then it is inactive with the `0` identifier sentinel.
+            assert_eq!(
+                consumer.lane_metadata(1 - producer.index()),
+                Some(LaneMetadata {
+                    identifier: 0,
+                    rejected_items: 0,
+                    is_active: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_items_counts_writes_refused_by_backpressure() {
+        for create in producer_creators() {
+            // Given a producer whose ring is full against an idle consumer.
+            let mut producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let consumer = producer.join_as_consumer().unwrap();
+            for value in 0..4u64 {
+                assert_matches!(producer.try_write(value), Ok(()));
+            }
+
+            // When a single write and a two-item batch are refused.
+            assert_matches!(producer.try_write(99), Err(99));
+            assert!(!producer.try_write_slice(&[1, 2]));
+
+            // Then every refused item is counted, visible from both handles.
+            let lane_index = producer.index();
+            assert_eq!(
+                producer.lane_metadata(lane_index).unwrap().rejected_items,
+                3
+            );
+            assert_eq!(
+                consumer.lane_metadata(lane_index).unwrap().rejected_items,
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn retired_lane_keeps_the_previous_owner_metadata() {
+        for create in producer_creators() {
+            // Given a second producer with one write refused by backpressure.
+            let first_producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let consumer = first_producer.join_as_consumer().unwrap();
+            let mut second_producer = first_producer.try_clone().unwrap();
+            let lane_index = second_producer.index();
+            second_producer.set_identifier(42);
+            for value in 0..4u64 {
+                assert_matches!(second_producer.try_write(value), Ok(()));
+            }
+            assert_matches!(second_producer.try_write(99), Err(99));
+
+            // When the producer drops, retiring its lane.
+            drop(second_producer);
+
+            // Then the retired lane still exposes the previous owner's
+            // metadata (post-mortem visibility).
+            assert_eq!(
+                consumer.lane_metadata(lane_index),
+                Some(LaneMetadata {
+                    identifier: 42,
+                    rejected_items: 1,
+                    is_active: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn read_guard_reports_the_source_lane() {
+        for create in producer_creators() {
+            // Given two producers, of which only the second publishes.
+            let idle_producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let mut publishing_producer = idle_producer.try_clone().unwrap();
+            publishing_producer.set_identifier(42);
+            let mut consumer = idle_producer.join_as_consumer().unwrap();
+            assert_matches!(publishing_producer.try_write(7), Ok(()));
+
+            // When the consumer reserves the value in place.
+            let guard = consumer.try_reserve_read().expect("readable");
+            let source_lane = guard.lane();
+            assert_eq!(guard.read(), 7);
+
+            // Then the guard names the publishing lane, whose metadata
+            // attributes the message to that producer.
+            assert_eq!(source_lane, publishing_producer.index());
+            assert_eq!(
+                consumer.lane_metadata(source_lane).unwrap().identifier,
+                publishing_producer.identifier()
+            );
+        }
+    }
+
+    #[test]
+    fn read_batch_reports_the_source_lane() {
+        for create in producer_creators() {
+            // Given two producers, of which only the second publishes a batch.
+            let idle_producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let mut publishing_producer = idle_producer.try_clone().unwrap();
+            let mut consumer = idle_producer.join_as_consumer().unwrap();
+            assert!(publishing_producer.try_write_slice(&[8, 9]));
+
+            // When the consumer reserves the batch.
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("readable batch");
+
+            // Then the batch names the publishing lane.
+            assert_eq!(batch.lane(), publishing_producer.index());
+        }
+    }
+
+    #[test]
+    fn slice_consumer_exposes_lane_metadata() {
+        // Given a typed producer on a single-lane queue.
+        let mut producer = create_heap_producer(BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        });
+        producer.set_identifier(42);
+
+        // When an untyped consumer joins it.
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
+
+        // Then it reports the lane count, refuses an out-of-range index, and
+        // snapshots the producer's lane.
+        assert_eq!(consumer.producer_slots(), 1);
+        assert_matches!(consumer.lane_metadata(1), None);
+        assert_eq!(
+            consumer.lane_metadata(producer.index()),
+            Some(LaneMetadata {
+                identifier: producer.identifier(),
+                rejected_items: 0,
+                is_active: true,
+            })
+        );
+    }
+
+    #[test]
+    fn slice_read_guard_reports_the_source_lane() {
+        // Given a producer that published one value.
+        let mut producer = create_heap_producer(BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        });
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
+        assert_matches!(producer.try_write(1), Ok(()));
+
+        // When the consumer reads it in place.
+        let guard = consumer.try_read().expect("readable");
+
+        // Then the guard names the publishing lane.
+        assert_eq!(guard.lane(), producer.index());
+    }
+
+    #[test]
+    fn slice_read_batch_reports_the_source_lane() {
+        // Given a producer that published a two-item batch.
+        let mut producer = create_heap_producer(BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        });
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
+        assert!(producer.try_write_slice(&[2, 3]));
+
+        // When the consumer reserves the batch.
+        let batch = consumer
+            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+            .expect("readable batch");
+
+        // Then the batch names the publishing lane.
+        assert_eq!(batch.lane(), producer.index());
     }
 
     /// Allocates a heap-backed queue and returns the shared handle (recovery
