@@ -7,7 +7,14 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
 };
-use core::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, sync::atomic::Ordering};
+use core::{
+    iter::FusedIterator,
+    marker::PhantomData,
+    mem::{ManuallyDrop, MaybeUninit},
+    ops::Index,
+    ptr::NonNull,
+    sync::atomic::Ordering,
+};
 use std::{
     fs::File,
     num::NonZeroUsize,
@@ -19,7 +26,7 @@ use std::{
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
 
 pub struct Producer<T> {
-    queue: SharedQueue<T>,
+    queue: Arc<SharedQueue<T>>,
 }
 
 impl<T> Producer<T> {
@@ -62,7 +69,7 @@ impl<T> Producer<T> {
     /// Creates a Consumer that shares the same memory mapping.
     pub fn join_as_consumer(&self) -> Consumer<T> {
         Consumer {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 
@@ -123,8 +130,13 @@ impl<T> Producer<T> {
     /// published in order they were reserved. Holding a [`WriteGuard`] should
     /// be treated similarly to holding a lock on a critical section.
     ///
+    /// The slot is logically uninitialized when reserved. Raw writes to an
+    /// already initialized slot overwrite the previous value without running
+    /// its destructor.
+    ///
     /// # Safety
-    /// - The caller must initialize the reserved slot before the guard is dropped.
+    /// - The caller must leave the reserved slot initialized with a valid `T`
+    ///   before the guard is dropped.
     #[must_use]
     pub unsafe fn try_reserve_write(&self) -> Option<WriteGuard<'_, T>> {
         self.queue
@@ -144,8 +156,13 @@ impl<T> Producer<T> {
     /// published in the order they were reserved. Holding a [`WriteBatch`]
     /// should be treated similarly to holding a lock on a critical section.
     ///
+    /// Every slot is logically uninitialized when reserved. Raw writes to an
+    /// already initialized slot overwrite the previous value without running
+    /// its destructor.
+    ///
     /// # Safety
-    /// - The caller must initialize all reserved slots before the batch is dropped.
+    /// - The caller must leave every reserved slot initialized with a valid `T`
+    ///   before the batch is dropped.
     #[must_use]
     pub unsafe fn try_reserve_write_batch(&self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
         let start = self.queue.reserve_write_batch(count)?;
@@ -185,7 +202,7 @@ impl<T> Producer<T> {
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         Self {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 }
@@ -194,7 +211,7 @@ unsafe impl<T: Send> Send for Producer<T> {}
 unsafe impl<T: Send> Sync for Producer<T> {}
 
 pub struct Consumer<T> {
-    queue: SharedQueue<T>,
+    queue: Arc<SharedQueue<T>>,
 }
 
 impl<T> Consumer<T> {
@@ -237,7 +254,7 @@ impl<T> Consumer<T> {
     /// Creates a Producer that shares the same memory mapping.
     pub fn join_as_producer(&self) -> Producer<T> {
         Producer {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 
@@ -259,17 +276,19 @@ impl<T> Consumer<T> {
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
     pub fn try_read(&self) -> Option<T> {
-        self.try_reserve_read().map(ReadGuard::read)
+        self.try_reserve_read().map(ReadGuard::into_inner)
     }
 
     /// Attempts to read a value from the queue, waiting up to `timeout` for
     /// a producer to publish data.
     pub fn read_timeout(&self, timeout: Duration) -> Result<T, WaitError> {
-        self.reserve_read_timeout(timeout).map(ReadGuard::read)
+        self.reserve_read_timeout(timeout)
+            .map(ReadGuard::into_inner)
     }
 
     /// Attempts to reserve a value from the queue, returning a guard.
-    /// The slot is released back to producers when the guard is dropped.
+    /// Reading the guard moves the value out; dropping it unread drops the
+    /// value. Either path releases the slot back to producers.
     ///
     /// Other [`Consumer`]s may read in parallel, but reads must be
     /// released in order they were reserved. Holding a [`ReadGuard`] should
@@ -293,14 +312,35 @@ impl<T> Consumer<T> {
     /// Attempts to reserve up to `max` values from the queue.
     /// The slots are released back to producers when the batch is dropped.
     ///
-    ///
     /// Other [`Consumer`]s may read in parallel, but reads must be
     /// released in order they were reserved. Holding a [`ReadBatch`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
     pub fn try_reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
+        // SAFETY: ReadBatch drops all values that are not moved out through its
+        // sequential drain before the raw reservation is released.
+        let raw = unsafe { self.try_reserve_read_batch_raw(max) }?;
+        Some(ReadBatch { raw })
+    }
+
+    /// Attempts to reserve up to `max` values from the queue.
+    ///
+    /// The slots are released back to producers when the batch is dropped.
+    /// For non-`Copy` `T`, the caller is responsible for moving out or dropping
+    /// every value before then; otherwise those values are leaked. Leak-free
+    /// behavior during unwinding requires the caller to arrange cleanup of the
+    /// remaining values.
+    ///
+    /// # Safety
+    /// - A non-`Copy` value may be moved out at most once.
+    /// - A slot must not be referenced after its value has been moved out.
+    #[must_use]
+    pub unsafe fn try_reserve_read_batch_raw(
+        &self,
+        max: NonZeroUsize,
+    ) -> Option<RawReadBatch<'_, T>> {
         let (start, count) = self.queue.reserve_read_batch(max)?;
-        Some(ReadBatch {
+        Some(RawReadBatch {
             header: self.queue.header,
             buffer: self.queue.buffer,
             start,
@@ -321,6 +361,26 @@ impl<T> Consumer<T> {
         timeout: Duration,
     ) -> Result<ReadBatch<'_, T>, WaitError> {
         self.wait_for_read(timeout, || self.try_reserve_read_batch(max))
+    }
+
+    /// Attempts to reserve up to `max` values, waiting up to `timeout` for a
+    /// producer to publish data.
+    ///
+    /// Returns `Err(WaitError::Timeout)` if no values are available before the
+    /// timeout elapses.
+    ///
+    /// # Safety
+    /// - The caller must satisfy [`Self::try_reserve_read_batch_raw`]'s safety
+    ///   requirements for a successfully returned batch.
+    pub unsafe fn reserve_read_batch_raw_timeout(
+        &self,
+        max: NonZeroUsize,
+        timeout: Duration,
+    ) -> Result<RawReadBatch<'_, T>, WaitError> {
+        self.wait_for_read(timeout, || {
+            // SAFETY: The caller accepts the raw batch ownership contract.
+            unsafe { self.try_reserve_read_batch_raw(max) }
+        })
     }
 
     fn wait_for_read<R>(
@@ -361,13 +421,16 @@ impl<T> Consumer<T> {
             .store(release, Ordering::Release);
     }
 
-    /// Drops all reserved-but-not-released reads left behind by a previous
+    /// Discards all reserved-but-not-released reads left behind by a previous
     /// consumer process.
     ///
     /// This advances `consumer_release` up to `consumer_reservation`,
     /// discarding items already claimed by the previous consumer process after
     /// their guards were lost without running `Drop` and making their capacity
     /// reusable by producers.
+    ///
+    /// Payload destructors are not run. Discarding values that own resources
+    /// may therefore leak those resources.
     ///
     /// # Safety
     /// - This must only be called when the caller can prove that no other
@@ -388,7 +451,7 @@ impl<T> Consumer<T> {
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
         Self {
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 }
@@ -411,15 +474,15 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 
 /// Creates a new in-process MPMC queue pair backed by a heap allocation.
 ///
-/// Values left buffered when the queue is dropped may be leaked instead of
-/// having their destructors run.
+/// Buffered values are dropped with the last endpoint. Values held by
+/// forgotten reservations may be leaked.
 pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
     let region_size = minimum_region_size::<T>(capacity);
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
-    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
-    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    let producer = unsafe { Producer::from_header(region, header) }?;
+    let consumer = producer.join_as_consumer();
     Ok((producer, consumer))
 }
 
@@ -432,19 +495,27 @@ struct SharedQueue<T> {
     // makes `T` invariant without affecting layout or auto traits.
     _invariant: PhantomData<fn(T) -> T>,
 
-    // NB: Region must be declared last so it is dropped last ensuring `header` and
-    // `buffer` remain valid for their entire lifetime.
+    // NB: Region must be declared last so it remains alive throughout Drop.
     region: Arc<Region>,
 }
 
-impl<T> Clone for SharedQueue<T> {
-    fn clone(&self) -> Self {
-        Self {
-            header: self.header,
-            buffer: self.buffer,
-            buffer_mask: self.buffer_mask,
-            _invariant: PhantomData,
-            region: Arc::clone(&self.region),
+impl<T> Drop for SharedQueue<T> {
+    fn drop(&mut self) {
+        if !self.region.is_heap() || !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        // SharedQueue is dropped by its Arc after the last endpoint disappears,
+        // so no endpoint can access the header or buffer during cleanup.
+        let header = unsafe { self.header.as_ref() };
+        let mut position = header.consumer_reservation.load(Ordering::Acquire);
+        let publication = header.producer_publication.load(Ordering::Acquire);
+
+        while position != publication {
+            // SAFETY: Positions from the consumer reservation cursor through
+            // producer publication contain initialized, unclaimed values.
+            unsafe { self.buffer.add(position & self.buffer_mask).drop_in_place() };
+            position = position.wrapping_add(1);
         }
     }
 }
@@ -551,7 +622,7 @@ impl<T> SharedQueue<T> {
     unsafe fn from_header(
         region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Arc<Self>, Error> {
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
@@ -567,13 +638,13 @@ impl<T> SharedQueue<T> {
         // - `header` is non-null and aligned properly.
         // - allocation at `header` is large enough to hold the header and the buffer.
         let buffer = unsafe { Self::buffer_from_header(header) };
-        Ok(Self {
+        Ok(Arc::new(Self {
             header,
             buffer,
             buffer_mask,
             _invariant: PhantomData,
             region,
-        })
+        }))
     }
 
     /// Gets a pointer to the buffer following the header.
@@ -799,6 +870,11 @@ impl SharedQueueHeader {
 }
 
 #[must_use]
+/// A reservation for one logically uninitialized producer slot.
+///
+/// Initialize the slot with [`Self::write`] or through [`AsMut::as_mut`]
+/// before dropping the guard. Initializing it through both paths overwrites
+/// the first value without running its destructor.
 pub struct WriteGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
@@ -816,6 +892,11 @@ impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
 }
 
 impl<'a, T> WriteGuard<'a, T> {
+    /// Initializes the reserved slot.
+    ///
+    /// This performs a raw write. If the slot was already initialized through
+    /// [`AsMut::as_mut`], the previous value is overwritten without running
+    /// its destructor.
     pub fn write(self, value: T) {
         // SAFETY: The cell was reserved for writing.
         unsafe { self.cell.write(value) };
@@ -836,6 +917,11 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
 }
 
 #[must_use]
+/// A reservation for one initialized consumer slot.
+///
+/// [`Self::into_inner`] moves the value out of the queue. Dropping the guard
+/// without taking it drops the queued value. Either path releases the slot
+/// back to producers.
 pub struct ReadGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
@@ -844,9 +930,25 @@ pub struct ReadGuard<'a, T> {
 }
 
 impl<'a, T> ReadGuard<'a, T> {
-    pub fn read(self) -> T {
+    fn release(&self) {
+        // SAFETY: A ReadGuard owns one reserved consumer slot. Both call sites
+        // invoke this helper exactly once after moving the value out.
+        unsafe {
+            SharedQueueHeader::publish_consumer_release(
+                self.header,
+                self.start,
+                NON_ZERO_USIZE_ONE,
+            );
+        }
+    }
+
+    /// Moves the reserved value out of the queue and releases its slot.
+    pub fn into_inner(self) -> T {
+        let guard = ManuallyDrop::new(self);
         // SAFETY: The cell was reserved for reading and holds an initialized value.
-        unsafe { self.cell.read() }
+        let value = unsafe { guard.cell.read() };
+        guard.release();
+        value
     }
 }
 
@@ -860,18 +962,23 @@ impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
 
 impl<'a, T> Drop for ReadGuard<'a, T> {
     fn drop(&mut self) {
-        // SAFETY: This guard owns one reserved consumer slot.
-        unsafe {
-            SharedQueueHeader::publish_consumer_release(
-                self.header,
-                self.start,
-                NON_ZERO_USIZE_ONE,
-            );
-        }
+        // SAFETY: This guard owns an initialized value that was not moved out.
+        let value = unsafe { self.cell.read() };
+        // The value now lives outside the shared cell, so the cell can be
+        // released before running its destructor. This ordering lets producers
+        // reuse the cell and prevents a panicking destructor from wedging the
+        // consumer-release cursor.
+        self.release();
+        drop(value);
     }
 }
 
 #[must_use]
+/// A reservation for logically uninitialized producer slots.
+///
+/// Every slot must contain a valid `T` before the batch is dropped. Repeatedly
+/// initializing one slot overwrites the previous value without running its
+/// destructor unless the caller first moves out or drops that value.
 pub struct WriteBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
@@ -893,10 +1000,13 @@ impl<'a, T> WriteBatch<'a, T> {
 
     /// Returns a mutable reference to the reserved slot.
     ///
+    /// Writing through the returned [`MaybeUninit`] does not drop a value
+    /// already in the slot.
+    ///
     /// # Safety
-    /// - The slot is uninitialized; caller must fully initialize `T`.
-    /// - `index < count`
-    /// - `T` must be valid for any bytes.
+    /// - `index` must be less than [`Self::len`].
+    /// - The caller must leave the slot initialized with a valid `T` before
+    ///   the batch is dropped.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
@@ -906,8 +1016,10 @@ impl<'a, T> WriteBatch<'a, T> {
 
     /// Writes a value into the slot at index.
     ///
+    /// This performs a raw write and does not drop a value already in the slot.
+    ///
     /// # Safety
-    /// - `index < count`
+    /// - `index` must be less than [`Self::len`].
     pub unsafe fn write(&mut self, index: usize, value: T) {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
@@ -926,7 +1038,12 @@ impl<'a, T> Drop for WriteBatch<'a, T> {
 }
 
 #[must_use]
-pub struct ReadBatch<'a, T> {
+/// A raw reservation for consecutive initialized consumer slots.
+///
+/// The caller is responsible for moving out or dropping every non-`Copy` value
+/// before the batch is dropped. Dropping this guard only releases the slots; it
+/// does not run payload destructors.
+pub struct RawReadBatch<'a, T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
     start: usize,
@@ -935,7 +1052,7 @@ pub struct ReadBatch<'a, T> {
     _marker: PhantomData<&'a T>,
 }
 
-impl<'a, T> ReadBatch<'a, T> {
+impl<'a, T> RawReadBatch<'a, T> {
     pub fn len(&self) -> usize {
         self.count.get()
     }
@@ -948,19 +1065,26 @@ impl<'a, T> ReadBatch<'a, T> {
     /// Returns a reference to the reserved slot.
     ///
     /// # Safety
-    /// - `index` must be less than `self.len()`
-    pub unsafe fn as_ref(&self, index: usize) -> &T {
+    /// - `index` must be less than [`Self::len`].
+    /// - The value at `index` must not have previously been moved out or
+    ///   dropped.
+    /// - A reference returned by this method must not be used after the value
+    ///   is moved out or dropped by any means.
+    pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading and is initialized.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
     }
 
-    /// Read the value at index
+    /// Reads the value at `index`.
     ///
     /// # Safety
-    /// - `index` must be less than `self.len()`
-    pub unsafe fn read(&self, index: usize) -> T {
+    /// - `index` must be less than [`Self::len`].
+    /// - For non-`Copy` `T`, the value must not have previously been moved out
+    ///   or dropped. It may be moved out exactly once.
+    /// - No reference to the slot may be used after moving out its value.
+    pub unsafe fn get_owned_unchecked(&self, index: usize) -> T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
@@ -968,11 +1092,151 @@ impl<'a, T> ReadBatch<'a, T> {
     }
 }
 
-impl<'a, T> Drop for ReadBatch<'a, T> {
+impl<'a, T> Drop for RawReadBatch<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This batch owns `count` reserved consumer slots.
         unsafe {
             SharedQueueHeader::publish_consumer_release(self.header, self.start, self.count);
+        }
+    }
+}
+
+#[must_use]
+/// A destructor-safe reservation for consecutive initialized consumer slots.
+///
+/// The batch keeps all of its slots reserved while it lives. It may be
+/// inspected without consuming values, and [`Self::drain`] converts it into a
+/// sequential consuming iterator. Dropping the batch without draining it drops
+/// every value before releasing the reservation.
+pub struct ReadBatch<'a, T> {
+    raw: RawReadBatch<'a, T>,
+}
+
+impl<'a, T> ReadBatch<'a, T> {
+    fn raw(&self) -> &RawReadBatch<'a, T> {
+        &self.raw
+    }
+
+    pub fn len(&self) -> usize {
+        self.raw().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Returns a shared reference to the value at `index`, or `None` if it is
+    /// outside the batch.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            return None;
+        }
+        // SAFETY: The bounds check establishes that the initialized slot is in
+        // the reservation, and a safe batch has not moved out any values.
+        Some(unsafe { self.raw().get_unchecked(index) })
+    }
+
+    /// Iterates over shared references without consuming any values.
+    ///
+    /// The batch reservation remains held for the iterator's lifetime.
+    pub fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + FusedIterator + '_ {
+        (0..self.len()).map(|index| {
+            // SAFETY: The safe batch has not moved out any values, and the
+            // range only produces indices within the reservation.
+            unsafe { self.raw().get_unchecked(index) }
+        })
+    }
+
+    /// Converts the batch into a sequential consuming iterator.
+    ///
+    /// The returned drain keeps the complete batch reservation held. Dropping
+    /// it before exhaustion drops all values that have not yet been yielded.
+    pub fn drain(self) -> ReadBatchDrain<'a, T> {
+        let batch = ManuallyDrop::new(self);
+        // SAFETY: `batch` is not dropped, so this moves its raw guard exactly once.
+        let raw = unsafe { core::ptr::read(&batch.raw) };
+        ReadBatchDrain { raw, next: 0 }
+    }
+}
+
+impl<'a, T: Copy> ReadBatch<'a, T> {
+    /// Copies the value at `index`, or returns `None` if it is outside the
+    /// batch.
+    pub fn get_owned(&self, index: usize) -> Option<T> {
+        self.get(index).copied()
+    }
+}
+
+impl<T> Index<usize> for ReadBatch<'_, T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("read batch index out of bounds")
+    }
+}
+
+impl<T> Drop for ReadBatch<'_, T> {
+    fn drop(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        for index in 0..self.raw.len() {
+            // SAFETY: An intact safe batch has not moved out any values.
+            let value = unsafe { self.raw.get_owned_unchecked(index) };
+            drop(value);
+        }
+    }
+}
+
+#[must_use]
+/// A sequential consuming iterator over a reserved read batch.
+///
+/// This iterator keeps the complete batch reservation held until it is
+/// dropped. Dropping it before exhaustion drops the unconsumed suffix before
+/// releasing the reservation.
+pub struct ReadBatchDrain<'a, T> {
+    raw: RawReadBatch<'a, T>,
+    next: usize,
+}
+
+impl<T> Iterator for ReadBatchDrain<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.raw.len() {
+            return None;
+        }
+        let index = self.next;
+        // Advance before returning ownership so Drop only considers the suffix.
+        self.next += 1;
+        // SAFETY: The cursor visits every reserved index at most once.
+        Some(unsafe { self.raw.get_owned_unchecked(index) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.raw.len() - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for ReadBatchDrain<'_, T> {}
+impl<T> FusedIterator for ReadBatchDrain<'_, T> {}
+
+impl<T> Drop for ReadBatchDrain<'_, T> {
+    fn drop(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        while self.next < self.raw.len() {
+            let index = self.next;
+            self.next += 1;
+            // SAFETY: The cursor visits every reserved index at most once.
+            let value = unsafe { self.raw.get_owned_unchecked(index) };
+            drop(value);
         }
     }
 }
@@ -983,6 +1247,10 @@ mod tests {
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
     use core::cell::Cell;
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::atomic::AtomicUsize,
+    };
 
     type Item = u64;
     const BUFFER_CAPACITY: usize = 512;
@@ -1096,7 +1364,7 @@ mod tests {
             );
             assert_eq!(batch.len(), 3);
             for (index, expected) in [1, 2, 3].into_iter().enumerate() {
-                assert_eq!(unsafe { batch.read(index) }, expected);
+                assert_eq!(batch.get_owned(index), Some(expected));
             }
         }
     }
@@ -1112,7 +1380,7 @@ mod tests {
 
             let guard = consumer.try_reserve_read().expect("try_read_ptr failed");
             assert_eq!(*guard.as_ref(), 42);
-            assert_eq!(guard.read(), 42);
+            assert_eq!(guard.into_inner(), 42);
         }
     }
 
@@ -1135,11 +1403,12 @@ mod tests {
                 .try_reserve_read_batch(batch_size)
                 .expect("try_read_batch failed");
             for index in 0..batch.len() {
-                unsafe {
-                    assert_eq!(*batch.as_ref(index), index as u64);
-                }
-                assert_eq!(unsafe { batch.read(index) }, index as u64);
+                assert_eq!(batch.get(index), Some(&(index as u64)));
+                assert_eq!(batch[index], index as u64);
+                assert_eq!(batch.get_owned(index), Some(index as u64));
             }
+            assert_eq!(batch.get(batch.len()), None);
+            assert_eq!(batch.get_owned(batch.len()), None);
         }
     }
 
@@ -1162,11 +1431,169 @@ mod tests {
                 .expect("try_read_batch up-to failed");
             assert_eq!(batch.len(), 4);
             for index in 0..batch.len() {
-                // SAFETY: `batch` has exactly 4 readable items.
-                unsafe {
-                    assert_eq!(*batch.as_ref(index), index as u64);
-                }
+                assert_eq!(batch[index], index as u64);
             }
+        }
+    }
+
+    struct CountedItem {
+        value: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountedItem {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn write_counted(producer: &Producer<CountedItem>, value: u64, drops: &Arc<AtomicUsize>) {
+        assert!(producer
+            .try_write(CountedItem {
+                value,
+                drops: Arc::clone(drops),
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn safe_read_batch_drop_drops_all_values() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (producer, consumer) = create_queue(4);
+            for value in 0..3 {
+                write_counted(&producer, value, &drops);
+            }
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                .expect("read batch");
+            assert_eq!(
+                batch.iter().map(|item| item.value).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(batch.get(1).map(|item| item.value), Some(1));
+            assert_eq!(batch[2].value, 2);
+            assert!(batch.get(3).is_none());
+            drop(batch);
+
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+            for value in 3..7 {
+                write_counted(&producer, value, &drops);
+            }
+            for _ in 3..7 {
+                drop(consumer.try_read().expect("replacement value"));
+            }
+            assert_eq!(drops.load(Ordering::Relaxed), 7);
+        }
+    }
+
+    #[test]
+    fn read_batch_drain_drop_drops_only_unconsumed_values() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (producer, consumer) = create_queue(4);
+            for value in 0..3 {
+                write_counted(&producer, value, &drops);
+            }
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                .expect("read batch");
+            let mut drain = batch.drain();
+            assert_eq!(drain.len(), 3);
+            let first = drain.next().expect("first value");
+            assert_eq!(first.value, 0);
+            assert_eq!(drain.len(), 2);
+            drop(first);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+            drop(drain);
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+            assert!(consumer.try_read().is_none());
+            for value in 3..7 {
+                write_counted(&producer, value, &drops);
+            }
+            for _ in 3..7 {
+                drop(consumer.try_read().expect("replacement value"));
+            }
+            assert_eq!(drops.load(Ordering::Relaxed), 7);
+        }
+    }
+
+    #[test]
+    fn copy_read_batch_supports_wrapped_random_access_and_drain() {
+        for create_queue in test_queue_creators::<Item>() {
+            let (producer, consumer) = create_queue(4);
+            assert!(producer.try_write_slice(&[0, 1, 2]));
+            assert_eq!(consumer.try_read(), Some(0));
+            assert_eq!(consumer.try_read(), Some(1));
+            assert!(producer.try_write_slice(&[3, 4, 5]));
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                .expect("wrapped read batch");
+            assert_eq!(batch.get_owned(3), Some(5));
+            assert_eq!(batch.get_owned(0), Some(2));
+            assert_eq!(batch.get_owned(3), Some(5));
+            assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+        }
+    }
+
+    #[test]
+    fn raw_read_batch_supports_manual_random_access_cleanup() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (producer, consumer) = create_queue(4);
+            for value in 0..3 {
+                write_counted(&producer, value, &drops);
+            }
+
+            // SAFETY: Every value is read and dropped exactly once below.
+            let batch = unsafe {
+                consumer
+                    .try_reserve_read_batch_raw(NonZeroUsize::new(4).unwrap())
+                    .expect("raw read batch")
+            };
+            assert_eq!(unsafe { batch.get_unchecked(2) }.value, 2);
+            for index in [2, 0, 1] {
+                // SAFETY: Each in-bounds index is moved out exactly once.
+                drop(unsafe { batch.get_owned_unchecked(index) });
+            }
+            drop(batch);
+
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+            assert!(consumer.try_read().is_none());
+        }
+    }
+
+    struct PanicOnDrop(bool);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            assert!(!self.0, "requested drop panic");
+        }
+    }
+
+    #[test]
+    fn panicking_batch_element_drop_still_releases_reservation() {
+        for create_queue in test_queue_creators::<PanicOnDrop>() {
+            let (producer, consumer) = create_queue(2);
+            assert!(producer.try_write(PanicOnDrop(true)).is_ok());
+            assert!(producer.try_write(PanicOnDrop(false)).is_ok());
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("read batch");
+
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(batch))).is_err());
+
+            assert!(producer.try_write(PanicOnDrop(false)).is_ok());
+            assert!(producer.try_write(PanicOnDrop(false)).is_ok());
+            let replacement = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("replacement read batch");
+            drop(replacement);
         }
     }
 
@@ -1281,6 +1708,23 @@ mod tests {
             producer2.try_write(42).unwrap();
             assert_eq!(consumer.try_read(), Some(42));
         }
+    }
+
+    #[test]
+    fn test_heap_pair_drops_buffered_value_with_last_endpoint() {
+        let value = Arc::new(());
+        let (producer, consumer) = pair(4).expect("failed to create queue");
+        let producer2 = producer.clone();
+        let consumer2 = consumer.clone();
+
+        producer.try_write(Arc::clone(&value)).unwrap();
+        drop(producer);
+        drop(consumer);
+        drop(producer2);
+        assert_eq!(Arc::strong_count(&value), 2);
+
+        drop(consumer2);
+        assert_eq!(Arc::strong_count(&value), 1);
     }
 
     #[test]

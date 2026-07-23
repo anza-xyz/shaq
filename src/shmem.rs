@@ -45,6 +45,10 @@ impl Region {
     pub(crate) fn size(&self) -> usize {
         self.size
     }
+
+    pub(crate) fn is_heap(&self) -> bool {
+        matches!(self.backing, RegionBacking::Heap(_))
+    }
 }
 
 impl Drop for Region {
