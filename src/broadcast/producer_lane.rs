@@ -14,11 +14,12 @@ use super::consumer_state::LaneConsumerState;
 
 const LANE_FREE: u64 = 0;
 const LANE_ACTIVE: u64 = 1;
+const LANE_RETIRED: u64 = 2;
 
 /// Fixed-size head of a producer-lane block.
 #[repr(C)]
 struct LaneHeader {
-    /// Lane ownership: `LANE_FREE` or `LANE_ACTIVE`.
+    /// Lane ownership: `LANE_FREE`, `LANE_ACTIVE`, or `LANE_RETIRED`.
     state: AtomicU64,
     /// Claimed-up-to sequence: advanced before a ring cell is written.
     producer_reservation: CacheAlignedAtomicSize,
@@ -173,44 +174,15 @@ impl ProducerLane {
             .is_ok()
     }
 
-    /// Releases the lane back to free.
-    pub(crate) fn release(&self) {
+    /// Permanently retires the lane. A retired lane never returns to the free
+    /// pool, so a lane binds to at most one producer for the queue's lifetime.
+    pub(crate) fn retire(&self) {
         let _ = self.header().state.compare_exchange(
             LANE_ACTIVE,
-            LANE_FREE,
+            LANE_RETIRED,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-    }
-
-    /// Rewinds the reservation back to the publication. A dead producer may have
-    /// reserved cells it never published; those were never visible to a consumer,
-    /// so they are safely discarded, restoring the `reservation == publication`
-    /// invariant the next owner continues from.
-    fn rewind_reservation(&self) {
-        let header = self.header();
-        let published = header.producer_publication.load(Ordering::Acquire);
-        header
-            .producer_reservation
-            .store(published, Ordering::Release);
-    }
-
-    /// Force-claims a lane whose previous producer died and rewinds its
-    /// reservation, so the recovered producer resumes publishing from the last
-    /// published sequence.
-    ///
-    /// The caller must guarantee (via the global ownership contract) that the
-    /// previous owner is dead and no other producer holds this lane.
-    pub(crate) fn recover(&self) {
-        self.header().state.store(LANE_ACTIVE, Ordering::Release);
-        self.rewind_reservation();
-    }
-
-    /// Force-releases a dead producer's lane back to free (rewinding its
-    /// reservation first) so the normal acquire path can reclaim it.
-    pub(crate) fn force_release(&self) {
-        self.rewind_reservation();
-        self.header().state.store(LANE_FREE, Ordering::Release);
     }
 
     /// Reserves `count` consecutive sequences for writing, returning the first.
@@ -315,8 +287,14 @@ mod tests {
         let (_region, lane) = lane(4, 1);
         assert!(lane.try_acquire());
         assert!(!lane.try_acquire());
-        lane.release();
+    }
+
+    #[test]
+    fn retired_lane_is_never_reclaimed() {
+        let (_region, lane) = lane(4, 1);
         assert!(lane.try_acquire());
+        lane.retire();
+        assert!(!lane.try_acquire());
     }
 
     #[test]
