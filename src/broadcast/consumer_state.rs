@@ -12,6 +12,20 @@ use crate::CacheAlignedAtomicSize;
 
 const CONSUMER_FREE: u64 = 0;
 const CONSUMER_ACTIVE: u64 = 1;
+const CONSUMER_JOINING: u64 = 2;
+
+pub(crate) enum ConsumerRecoveryMode {
+    /// The global ownership slot was active, which proves the previous join
+    /// installed a final cursor on every lane. Recovery can reconstruct those
+    /// cursors from the surviving reserve limits and continue from them.
+    Resume,
+
+    /// The global ownership slot was free or still joining, so its per-lane
+    /// limits may be absent or may only be provisional handshake values.
+    /// Recovery must join every lane again at its reservation frontier before
+    /// marking the consumer active.
+    RestartJoin,
+}
 
 /// Value stored in a lane consumer slot that no consumer owns.
 ///
@@ -23,8 +37,8 @@ const UNCLAIMED: usize = usize::MAX;
 
 /// Global consumer-index ownership table.
 ///
-/// The table is a contiguous `[AtomicU64; consumer_slots]` block. It only tracks
-/// whether a consumer index is owned.
+/// The table is a contiguous `[AtomicU64; consumer_slots]` block. Each slot is
+/// free, joining its lanes, or active.
 #[derive(Clone, Copy)]
 pub(crate) struct ConsumerState {
     slots: NonNull<AtomicU64>,
@@ -72,14 +86,15 @@ impl ConsumerState {
         self.slot_count
     }
 
-    /// Claims a free consumer index in the global ownership table.
+    /// Claims a free consumer index in the global ownership table. The index
+    /// remains in the joining phase until every lane has installed its cursor.
     pub(crate) fn acquire(&self) -> Result<usize, Error> {
         for index in 0..self.slot_count {
             if self
                 .slot(index)
                 .compare_exchange(
                     CONSUMER_FREE,
-                    CONSUMER_ACTIVE,
+                    CONSUMER_JOINING,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -91,15 +106,31 @@ impl ConsumerState {
         Err(Error::ConsumerSlotsExhausted)
     }
 
+    /// Marks a joining consumer active after all of its lane cursors have been
+    /// installed.
+    pub(crate) fn activate(&self, index: usize) {
+        self.slot(index).store(CONSUMER_ACTIVE, Ordering::Release);
+    }
+
     /// Releases a consumer index back to free.
     pub(crate) fn release(&self, index: usize) {
         self.slot(index).store(CONSUMER_FREE, Ordering::Release);
     }
 
-    /// Force-owns a consumer index whose previous owner died (no CAS). The
-    /// caller guarantees that owner is dead and no live handle uses the index.
-    pub(crate) fn recover(&self, index: usize) {
-        self.slot(index).store(CONSUMER_ACTIVE, Ordering::Release);
+    /// Begins recovery of an index whose previous owner died. An active consumer
+    /// has complete lane cursors and can resume them. A free or joining index is
+    /// kept in the joining phase so recovery can restart every lane safely.
+    ///
+    /// The caller guarantees that no live handle uses the index and serializes
+    /// recovery with joins, drops, and other recovery operations.
+    pub(crate) fn begin_recovery(&self, index: usize) -> ConsumerRecoveryMode {
+        let slot = self.slot(index);
+        if slot.load(Ordering::Acquire) == CONSUMER_ACTIVE {
+            ConsumerRecoveryMode::Resume
+        } else {
+            slot.store(CONSUMER_JOINING, Ordering::Release);
+            ConsumerRecoveryMode::RestartJoin
+        }
     }
 
     /// The global ownership word for consumer index `index`.
@@ -182,56 +213,35 @@ impl LaneConsumerState {
             .unwrap_or(UNCLAIMED)
     }
 
-    /// Joins `consumer_index` to this lane and returns the sequence it starts
-    /// reading from.
+    /// Joins `consumer_index` to this lane at the current reservation frontier.
     ///
     /// The caller must already own `consumer_index` through the broadcast's
     /// global consumer-ownership state, so this slot has a single writer (the
     /// owning consumer): no CAS is needed — a release store publishes the limit.
     ///
-    /// The start is normally the lane's **current publication**: the next value
-    /// to become visible after this join. With `from_backlog`, the start is
-    /// instead up to one ring behind the publication (the oldest published item
-    /// still guaranteed to be in the ring, floored at the first sequence), so a
-    /// consumer on a slow queue can read data published before it joined. If the
-    /// producer has already lapped that point, the handshake below fast-forwards
-    /// to the reservation frontier — you cannot read cells already being
-    /// recycled.
-    ///
-    /// The limit is published with a single release store, so the slot never
-    /// passes through [`UNCLAIMED`]. This also makes the call usable for
-    /// recovery: re-joining a dead owner's index overwrites its stale limit
-    /// directly, never dropping this consumer's backpressure mid-claim.
-    pub(crate) fn join(
-        &self,
-        consumer_index: usize,
-        from_backlog: bool,
-        published: usize,
-        read_reserved: impl FnOnce() -> usize,
-    ) -> usize {
-        let start = if from_backlog {
-            // Up to one ring behind the frontier (floored at the first
-            // sequence): the oldest item still guaranteed to be in the ring.
-            published.saturating_sub(self.capacity)
-        } else {
-            published
-        };
+    /// The first reservation sample supplies an initial limit that permits a
+    /// full ring of producer progress. After publishing that limit, the consumer
+    /// fences and samples the reservation again. The producer either observes
+    /// the initial limit or the second sample observes its previously committed
+    /// frontier. A reservation racing after the second sample starts at that
+    /// frontier, so it is future data for this consumer rather than an overwrite
+    /// of a cell the consumer may read.
+    pub(crate) fn join(&self, consumer_index: usize, read_reserved: impl Fn() -> usize) -> usize {
+        let initial_start = read_reserved();
+        let initial_limit = initial_start.wrapping_add(self.capacity);
+        debug_assert!(initial_limit != UNCLAIMED);
+        self.limit(consumer_index)
+            .store(initial_limit, Ordering::Release);
+
+        // Consumer half of the join handshake: order the initial limit before
+        // re-reading the reservation frontier. This pairs with the producer's
+        // fence before it reads reserve limits.
+        fence(Ordering::SeqCst);
+
+        let start = read_reserved();
         let limit = start.wrapping_add(self.capacity);
         debug_assert!(limit != UNCLAIMED);
         self.limit(consumer_index).store(limit, Ordering::Release);
-
-        // Consumer half of the join handshake: order publishing this limit
-        // before re-reading the producer reservation. This pairs with the
-        // producer's matching fence before it reads the reserve limit, so one
-        // side observes the other's advance.
-        fence(Ordering::SeqCst);
-
-        let reserved = read_reserved();
-        if reserved > limit {
-            self.limit(consumer_index)
-                .store(reserved.wrapping_add(self.capacity), Ordering::Release);
-            return reserved;
-        }
         start
     }
 
@@ -256,16 +266,16 @@ impl LaneConsumerState {
     /// surviving reserve limit (`next_to_read + capacity`), so it resumes where
     /// the dead owner left off — those unread cells are still pinned by the
     /// limit. This only reads the slot, so this consumer's backpressure is never
-    /// dropped. If the slot was never claimed, start fresh at the frontier.
+    /// dropped. If the slot was never claimed, start fresh at the reservation
+    /// frontier.
     pub(crate) fn recover(
         &self,
         consumer_index: usize,
-        published: usize,
-        read_reserved: impl FnOnce() -> usize,
+        read_reserved: impl Fn() -> usize,
     ) -> usize {
         let limit = self.limit(consumer_index).load(Ordering::Acquire);
         if limit == UNCLAIMED {
-            self.join(consumer_index, false, published, read_reserved)
+            self.join(consumer_index, read_reserved)
         } else {
             limit.wrapping_sub(self.capacity)
         }
@@ -292,6 +302,7 @@ impl LaneConsumerState {
 mod tests {
     use super::*;
     use crate::shmem::Region;
+    use std::cell::Cell;
     use std::num::NonZeroUsize;
 
     fn consumer_state(slot_count: usize) -> (std::sync::Arc<Region>, ConsumerState) {
@@ -329,11 +340,24 @@ mod tests {
             Err(Error::ConsumerSlotsExhausted)
         ));
 
+        assert!(matches!(
+            state.begin_recovery(0),
+            ConsumerRecoveryMode::RestartJoin
+        ));
+        state.activate(0);
+        assert!(matches!(
+            state.begin_recovery(0),
+            ConsumerRecoveryMode::Resume
+        ));
+
         state.release(0);
         assert_eq!(state.acquire().unwrap(), 0);
 
         state.release(1);
-        state.recover(1);
+        assert!(matches!(
+            state.begin_recovery(1),
+            ConsumerRecoveryMode::RestartJoin
+        ));
         assert!(matches!(
             state.acquire(),
             Err(Error::ConsumerSlotsExhausted)
@@ -357,13 +381,13 @@ mod tests {
 
         assert_eq!(state.reserve_limit(), UNCLAIMED);
 
-        assert_eq!(state.join(0, false, 10, || 10), 10);
+        assert_eq!(state.join(0, || 10), 10);
         assert_eq!(state.reserve_limit(), 14);
 
         state.set_cursor(0, 12);
         assert_eq!(state.reserve_limit(), 16);
 
-        assert_eq!(state.join(1, false, 10, || 10), 10);
+        assert_eq!(state.join(1, || 10), 10);
         assert_eq!(state.reserve_limit(), 14);
 
         state.release(1);
@@ -374,10 +398,24 @@ mod tests {
     }
 
     #[test]
-    fn lane_consumer_state_backlog_join_fast_forwards_when_lapped() {
+    fn lane_consumer_state_join_resamples_reservation_frontier() {
         let (_region, state) = lane_consumer_state(1, 4);
+        let samples = [10, 13];
+        let sample_index = Cell::new(0);
 
-        assert_eq!(state.join(0, true, 10, || 13), 13);
+        assert_eq!(
+            state.join(0, || {
+                let index = sample_index.get();
+                sample_index.set(index + 1);
+                let sample = samples[index];
+                if sample == 13 {
+                    assert_eq!(state.reserve_limit(), 14);
+                }
+                sample
+            }),
+            13
+        );
+        assert_eq!(sample_index.get(), 2);
         assert_eq!(state.reserve_limit(), 17);
     }
 
@@ -387,7 +425,7 @@ mod tests {
 
         state.set_cursor(0, 7);
         assert_eq!(
-            state.recover(0, 99, || panic!("claimed slot should not rejoin")),
+            state.recover(0, || panic!("claimed slot should not rejoin")),
             7
         );
         assert_eq!(state.reserve_limit(), 11);
@@ -397,7 +435,7 @@ mod tests {
     fn lane_consumer_state_recover_unclaimed_slot_joins_frontier() {
         let (_region, state) = lane_consumer_state(1, 4);
 
-        assert_eq!(state.recover(0, 12, || 12), 12);
+        assert_eq!(state.recover(0, || 12), 12);
         assert_eq!(state.reserve_limit(), 16);
     }
 }
