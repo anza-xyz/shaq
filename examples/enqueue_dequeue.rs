@@ -254,7 +254,7 @@ fn run_spsc_consumer(
         }
 
         for _ in 1..SYNC_CADENCE.get() {
-            if consumer.try_read().is_none() {
+            if consumer.try_read_ptr().is_none() {
                 break;
             }
         }

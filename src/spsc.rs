@@ -34,15 +34,16 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 
 /// Creates a new in-process SPSC queue pair backed by a heap allocation.
 ///
-/// Values left buffered when the queue is dropped may be leaked instead of
-/// having their destructors run.
+/// Buffered values are dropped with the last endpoint. Values in uncommitted
+/// writes may be leaked.
 pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
     let region_size = minimum_region_size::<T>(capacity);
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
-    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
-    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    let producer = unsafe { Producer::from_header(region, header) }?;
+    // SAFETY: The region is fresh and has no other consumer.
+    let consumer = unsafe { producer.join_as_consumer() }?;
     Ok((producer, consumer))
 }
 
@@ -97,8 +98,9 @@ impl<T> Producer<T> {
     /// # Safety
     /// - The caller must ensure this is the unique Consumer for this queue.
     pub unsafe fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
-        // SAFETY: caller guarantees uniqueness of the consumer role.
-        unsafe { Consumer::from_header(Arc::clone(&self.queue.region), self.queue.header) }
+        Ok(Consumer {
+            queue: SharedQueue::from_shared(Arc::clone(&self.queue.shared)),
+        })
     }
 
     /// # Safety
@@ -239,8 +241,9 @@ impl<T> Consumer<T> {
     /// # Safety
     /// - The caller must ensure this is the unique Producer for this queue.
     pub unsafe fn join_as_producer(&self) -> Result<Producer<T>, Error> {
-        // SAFETY: caller guarantees uniqueness of the producer role.
-        unsafe { Producer::from_header(Arc::clone(&self.queue.region), self.queue.header) }
+        Ok(Producer {
+            queue: SharedQueue::from_shared(Arc::clone(&self.queue.shared)),
+        })
     }
 
     /// # Safety
@@ -275,22 +278,43 @@ impl<T> Consumer<T> {
 
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
-    /// Returns a reference to the value if available.
-    pub fn try_read(&mut self) -> Option<&T> {
-        // SAFETY: `try_read_ptr` returns a pointer to properly aligned
-        //         location for `T`.
-        //         IF producer properly wrote items, or T is POD, it is
-        //         safe to convert to reference here.
-        self.try_read_ptr().map(|p| unsafe { p.as_ref() })
+    /// Returns ownership of the value if available.
+    ///
+    /// Call [`Self::finalize`] to release consumed capacity back to the
+    /// producer. Pending capacity is also released when the consumer is
+    /// dropped.
+    pub fn try_read(&mut self) -> Option<T> {
+        let read_ptr = self.try_reserve_read_ptr()?;
+        // SAFETY: `read_ptr` is the initialized position just reserved by this
+        // consumer, and ownership has not previously been taken from it.
+        Some(unsafe { read_ptr.read() })
     }
 
-    /// Attempts to read a value from the queue.
+    /// Attempts to reserve a value for zero-copy reading.
     /// Returns `None` if there are no values available.
     /// Returns a pointer to the value if available.
     ///
-    /// All read items should be processed and pointers discarded before
-    /// calling `finalize`.
-    pub fn try_read_ptr(&mut self) -> Option<NonNull<T>> {
+    /// All returned pointers must be discarded before calling
+    /// [`Self::finalize`] or dropping the consumer.
+    pub fn try_read_ptr(&mut self) -> Option<NonNull<T>>
+    where
+        T: Copy,
+    {
+        self.try_reserve_read_ptr()
+    }
+
+    /// Attempts to reserve a value for raw reading.
+    ///
+    /// # Safety
+    /// Before the read position is released, every reserved non-`Copy` value
+    /// must be moved out or dropped exactly once. No reference or pointer to a
+    /// reserved value may be used after its position is released. Dropping the
+    /// consumer releases all pending read positions.
+    pub unsafe fn try_read_ptr_raw(&mut self) -> Option<NonNull<T>> {
+        self.try_reserve_read_ptr()
+    }
+
+    fn try_reserve_read_ptr(&mut self) -> Option<NonNull<T>> {
         if self.queue.cached_read == self.queue.cached_write {
             return None; // Queue is empty
         }
@@ -303,8 +327,8 @@ impl<T> Consumer<T> {
         Some(read_ptr)
     }
 
-    /// Publishes the read position, making it visible to the producer.
-    /// All previously read items MUST be processed before this is called.
+    /// Publishes the current read position, releasing all reserved capacity
+    /// back to the producer.
     pub fn finalize(&mut self) {
         self.queue
             .header()
@@ -334,18 +358,16 @@ impl<T> Consumer<T> {
             })
     }
 
-    /// Blocks until a committed item can be reserved for reading or `timeout`
+    /// Blocks until ownership of a committed item can be taken or `timeout`
     /// elapses.
     ///
-    /// The caller must still call [`Self::finalize`] to release consumed
-    /// capacity back to the producer.
-    pub fn read_timeout(&mut self, timeout: Duration) -> Result<&T, WaitError> {
-        // SAFETY: `read_ptr_timeout` returns a pointer to properly aligned
-        //         location for `T`.
-        //         IF producer properly wrote items, or T is POD, it is
-        //         safe to convert to reference here.
-        self.read_ptr_timeout(timeout)
-            .map(|p| unsafe { p.as_ref() })
+    /// Call [`Self::finalize`] to release consumed capacity back to the
+    /// producer.
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
+        let read_ptr = self.reserve_read_ptr_timeout(timeout)?;
+        // SAFETY: `read_ptr` is the initialized position just reserved by this
+        // consumer, and ownership has not previously been taken from it.
+        Ok(unsafe { read_ptr.read() })
     }
 
     /// Blocks until a committed item can be reserved for reading or `timeout`
@@ -353,7 +375,26 @@ impl<T> Consumer<T> {
     ///
     /// The caller must still process all returned pointers and call
     /// [`Self::finalize`] to release consumed capacity back to the producer.
-    pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
+    pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError>
+    where
+        T: Copy,
+    {
+        self.reserve_read_ptr_timeout(timeout)
+    }
+
+    /// Blocks until a committed item can be reserved for raw reading or
+    /// `timeout` elapses.
+    ///
+    /// # Safety
+    /// The caller must satisfy [`Self::try_read_ptr_raw`]'s safety contract.
+    pub unsafe fn read_ptr_raw_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<NonNull<T>, WaitError> {
+        self.reserve_read_ptr_timeout(timeout)
+    }
+
+    fn reserve_read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
         let header = self.queue.header;
         // SAFETY: `header` points to this consumer's live shared queue header.
         let header = unsafe { header.as_ref() };
@@ -361,20 +402,29 @@ impl<T> Consumer<T> {
             .waiters
             .wait_for(&header.write, SPIN_ATTEMPTS, timeout, || {
                 self.queue.load_write();
-                self.try_read_ptr()
+                self.try_reserve_read_ptr()
             })
     }
 }
 
 unsafe impl<T: Send> Send for Consumer<T> {}
 
-struct SharedQueue<T> {
-    header: NonNull<SharedQueueHeader>,
-    buffer: NonNull<T>,
+impl<T> Drop for Consumer<T> {
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
 
-    buffer_mask: usize,
+struct SharedQueue<T> {
     cached_write: usize,
     cached_read: usize,
+    shared: Arc<SharedQueueInner<T>>,
+}
+
+struct SharedQueueInner<T> {
+    header: NonNull<SharedQueueHeader>,
+    buffer: NonNull<T>,
+    buffer_mask: usize,
     // `NonNull<T>` is covariant, but paired endpoints must not be independently
     // coerced to different payload lifetimes. The function input/output marker
     // makes `T` invariant without affecting layout or auto traits.
@@ -383,6 +433,35 @@ struct SharedQueue<T> {
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
     region: Arc<Region>,
+}
+
+impl<T> core::ops::Deref for SharedQueue<T> {
+    type Target = SharedQueueInner<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+impl<T> Drop for SharedQueueInner<T> {
+    fn drop(&mut self) {
+        if !self.region.is_heap() || !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        // SharedQueueInner is dropped by its Arc after both endpoints
+        // disappear, so the published cursors are final.
+        let header = unsafe { self.header.as_ref() };
+        let mut position = header.read.load(Ordering::Acquire);
+        let write = header.write.load(Ordering::Acquire);
+
+        while position != write {
+            // SAFETY: Published positions not yet released by the consumer
+            // contain initialized values still in the queue.
+            unsafe { self.buffer.add(position & self.buffer_mask).drop_in_place() };
+            position = position.wrapping_add(1);
+        }
+    }
 }
 
 impl<T> SharedQueue<T> {
@@ -408,20 +487,28 @@ impl<T> SharedQueue<T> {
         //         of sufficient size.
         let buffer = unsafe { Self::buffer_from_header(header) };
 
-        let mut queue = Self {
+        let shared = Arc::new(SharedQueueInner {
             region,
             header,
             buffer,
             buffer_mask: size - 1,
+            _invariant: PhantomData,
+        });
+
+        Ok(Self::from_shared(shared))
+    }
+
+    fn from_shared(shared: Arc<SharedQueueInner<T>>) -> Self {
+        let mut queue = Self {
             cached_write: 0,
             cached_read: 0,
-            _invariant: PhantomData,
+            shared,
         };
 
         queue.load_write();
         queue.load_read();
 
-        Ok(queue)
+        queue
     }
 
     /// Gets a pointer to the buffer following the header.
@@ -723,9 +810,40 @@ mod tests {
             producer.commit();
             consumer.sync();
             let val = consumer.try_read().expect("read failed");
-            assert_eq!(*val, 42);
+            assert_eq!(val, 42);
             consumer.finalize();
         }
+    }
+
+    #[test]
+    fn test_owned_read_non_copy() {
+        let (mut producer, mut consumer) = pair(1).expect("failed to create queue");
+        let value = Arc::new(42);
+
+        producer.try_write(Arc::clone(&value)).unwrap();
+        producer.commit();
+        consumer.sync();
+
+        let received = consumer.try_read().expect("read failed");
+        assert!(Arc::ptr_eq(&received, &value));
+        consumer.finalize();
+        assert_eq!(Arc::strong_count(&value), 2);
+        drop(received);
+        assert_eq!(Arc::strong_count(&value), 1);
+    }
+
+    #[test]
+    fn test_heap_pair_drops_buffered_value_with_last_endpoint() {
+        let value = Arc::new(());
+        let (mut producer, consumer) = pair(1).expect("failed to create queue");
+
+        producer.try_write(Arc::clone(&value)).unwrap();
+        producer.commit();
+        drop(producer);
+        assert_eq!(Arc::strong_count(&value), 2);
+
+        drop(consumer);
+        assert_eq!(Arc::strong_count(&value), 1);
     }
 
     #[test]
@@ -741,7 +859,7 @@ mod tests {
             producer.commit();
             consumer.sync();
             let val = consumer.try_read().expect("read failed");
-            assert_eq!(*val, 99);
+            assert_eq!(val, 99);
             consumer.finalize();
         }
     }
@@ -763,7 +881,7 @@ mod tests {
             // Can still read the message from the shared consumer
             consumer.sync();
             let val = consumer.try_read().expect("read after producer drop");
-            assert_eq!(*val, 7);
+            assert_eq!(val, 7);
             consumer.finalize();
         }
     }
