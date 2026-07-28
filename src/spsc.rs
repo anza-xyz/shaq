@@ -41,7 +41,9 @@ pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Erro
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
+    // SAFETY: `header` was just created in `region`, so it is valid for the queue.
     let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
+    // SAFETY: `header` was just created in `region`, so it is valid for the queue.
     let consumer = unsafe { Consumer::from_header(region, header) }?;
     Ok((producer, consumer))
 }
@@ -186,6 +188,9 @@ impl<T> Producer<T> {
     }
 }
 
+// SAFETY: The producer owns the write side exclusively and access to the
+// shared buffer is synchronized by the queue protocol, so it is safe to move
+// to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Producer<T> {}
 
 /// Consumer side of the SPSC shared queue.
@@ -366,6 +371,9 @@ impl<T> Consumer<T> {
     }
 }
 
+// SAFETY: The consumer owns the read side exclusively and access to the
+// shared buffer is synchronized by the queue protocol, so it is safe to move
+// to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Consumer<T> {}
 
 struct SharedQueue<T> {
@@ -637,8 +645,10 @@ mod tests {
     fn create_file_backed_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         let file = create_temp_shmem_file().expect("failed to create temp file");
         let file_size = minimum_file_size::<T>(capacity);
+        // SAFETY: fresh temp file sized for the queue, no other users.
         let producer =
             unsafe { Producer::create(&file, file_size) }.expect("failed to create producer");
+        // SAFETY: file was just initialized by the producer above.
         let consumer = unsafe { Consumer::join(&file) }.expect("failed to join consumer");
 
         (producer, consumer)
@@ -662,51 +672,51 @@ mod tests {
             assert_eq!(producer.capacity(), BUFFER_CAPACITY);
             assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
 
-            unsafe {
-                producer
-                    .reserve()
-                    .expect("Failed to reserve")
-                    .as_ref()
-                    .store(42, Ordering::Release);
-                assert!(consumer.try_read().is_none()); // not committed yet
-                producer.commit();
-                assert!(consumer.try_read().is_none()); // consumer has not synced yet
-                consumer.sync();
-                let item = consumer.try_read().expect("Failed to read item");
-                assert_eq!(item.load(Ordering::Acquire), 42);
-                assert!(consumer.try_read().is_none()); // no more items to read
-                consumer.finalize();
-                producer.sync();
+            // SAFETY: single producer over a freshly created queue.
+            let spot = unsafe { producer.reserve() }.expect("Failed to reserve");
+            // SAFETY: spot is a valid reserved slot.
+            unsafe { spot.as_ref() }.store(42, Ordering::Release);
+            assert!(consumer.try_read().is_none()); // not committed yet
+            producer.commit();
+            assert!(consumer.try_read().is_none()); // consumer has not synced yet
+            consumer.sync();
+            let item = consumer.try_read().expect("Failed to read item");
+            assert_eq!(item.load(Ordering::Acquire), 42);
+            assert!(consumer.try_read().is_none()); // no more items to read
+            consumer.finalize();
+            producer.sync();
 
-                // Ensure we can push up to the capacity.
-                for _ in 0..BUFFER_CAPACITY {
-                    let spot = producer.reserve().expect("Failed to reserve");
-                    spot.as_ref().store(1, Ordering::Release);
-                }
-                assert!(producer.reserve().is_none()); // buffer is full, we cannot reserve more
-                producer.commit();
-                consumer.sync();
-                for _ in 0..BUFFER_CAPACITY {
-                    let item = consumer.try_read().expect("Failed to read item");
-                    assert_eq!(item.load(Ordering::Acquire), 1);
-                }
-                assert!(consumer.try_read().is_none()); // no more items to read
-                consumer.finalize();
-                producer.sync();
-
-                // Ensure we can reserve again after finalizing/sync.
-                let spot = producer
-                    .reserve()
-                    .expect("Failed to reserve after finalize");
-                spot.as_ref().store(2, Ordering::Release);
-                producer.commit();
-                consumer.sync();
-                let item = consumer
-                    .try_read()
-                    .expect("Failed to read item after finalize");
-                assert_eq!(item.load(Ordering::Acquire), 2);
-                consumer.finalize();
+            // Ensure we can push up to the capacity.
+            for _ in 0..BUFFER_CAPACITY {
+                // SAFETY: single producer over the queue.
+                let spot = unsafe { producer.reserve() }.expect("Failed to reserve");
+                // SAFETY: spot is a valid reserved slot.
+                unsafe { spot.as_ref() }.store(1, Ordering::Release);
             }
+            // SAFETY: single producer; buffer is full so reserve yields None.
+            assert!(unsafe { producer.reserve() }.is_none()); // buffer is full, we cannot reserve more
+            producer.commit();
+            consumer.sync();
+            for _ in 0..BUFFER_CAPACITY {
+                let item = consumer.try_read().expect("Failed to read item");
+                assert_eq!(item.load(Ordering::Acquire), 1);
+            }
+            assert!(consumer.try_read().is_none()); // no more items to read
+            consumer.finalize();
+            producer.sync();
+
+            // Ensure we can reserve again after finalizing/sync.
+            // SAFETY: single producer over the queue after finalize.
+            let spot = unsafe { producer.reserve() }.expect("Failed to reserve after finalize");
+            // SAFETY: spot is a valid reserved slot.
+            unsafe { spot.as_ref() }.store(2, Ordering::Release);
+            producer.commit();
+            consumer.sync();
+            let item = consumer
+                .try_read()
+                .expect("Failed to read item after finalize");
+            assert_eq!(item.load(Ordering::Acquire), 2);
+            consumer.finalize();
         }
     }
 
@@ -781,7 +791,9 @@ mod tests {
         for create_queue in test_queue_creators::<u64>() {
             let (mut producer, mut consumer) = create_queue(64);
 
+            // SAFETY: single producer over a freshly created queue.
             let spot = unsafe { producer.reserve() }.expect("reserve failed");
+            // SAFETY: spot is a valid reserved slot.
             unsafe { spot.write(42) };
 
             assert!(matches!(

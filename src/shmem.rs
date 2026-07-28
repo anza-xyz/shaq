@@ -74,6 +74,8 @@ enum RegionBacking {
 // SAFETY: The mapped memory is shared (MAP_SHARED / file-backed) and access
 // is synchronized by the queue protocol built on top of it.
 unsafe impl Send for Region {}
+// SAFETY: Shared access to the mapped memory is synchronized by the queue
+// protocol built on top of it, so the Region may be shared across threads.
 unsafe impl Sync for Region {}
 
 fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
@@ -93,6 +95,8 @@ fn validate_region_alignment(addr: NonNull<u8>) -> Result<(), Error> {
 fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
     use std::os::fd::AsRawFd;
 
+    // SAFETY: A null hint lets the kernel choose the address; size and fd come
+    // from a valid open file, and MAP_FAILED is checked below.
     let addr = unsafe {
         libc::mmap(
             core::ptr::null_mut(),
@@ -113,6 +117,7 @@ fn map_file(file: &File, size: usize) -> Result<NonNull<u8>, Error> {
 /// Unmaps a previously mapped file view.
 #[cfg(unix)]
 unsafe fn unmap_file(addr: NonNull<u8>, size: usize) {
+    // SAFETY: addr and size describe a mapping produced by a prior map_file call.
     let _ = unsafe { libc::munmap(addr.as_ptr().cast(), size) };
 }
 

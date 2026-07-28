@@ -207,7 +207,11 @@ impl<T> Clone for Producer<T> {
     }
 }
 
+// SAFETY: All payload access is synchronized through the atomic reservation
+// and publication cursors in the shared header, so `T` is only touched by one
+// endpoint at a time; sending/sharing across threads is sound when `T: Send`.
 unsafe impl<T: Send> Send for Producer<T> {}
+// SAFETY: See the `Send` impl above; the queue protocol synchronizes all access.
 unsafe impl<T: Send> Sync for Producer<T> {}
 
 pub struct Consumer<T> {
@@ -456,7 +460,11 @@ impl<T> Clone for Consumer<T> {
     }
 }
 
+// SAFETY: All payload access is synchronized through the atomic reservation
+// and publication cursors in the shared header, so `T` is only touched by one
+// endpoint at a time; sending/sharing across threads is sound when `T: Send`.
 unsafe impl<T: Send> Send for Consumer<T> {}
+// SAFETY: See the `Send` impl above; the queue protocol synchronizes all access.
 unsafe impl<T: Send> Sync for Consumer<T> {}
 
 /// Calculates the minimum file size required for a queue with given capacity.
@@ -481,6 +489,8 @@ pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Erro
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
+    // SAFETY: `header` was just created in `region`, so it is valid, aligned,
+    // and paired with that region.
     let producer = unsafe { Producer::from_header(region, header) }?;
     let consumer = producer.join_as_consumer();
     Ok((producer, consumer))
@@ -505,16 +515,18 @@ impl<T> Drop for SharedQueue<T> {
             return;
         }
 
-        // SharedQueue is dropped by its Arc after the last endpoint disappears,
-        // so no endpoint can access the header or buffer during cleanup.
+        // SAFETY: SharedQueue is dropped by its Arc after the last endpoint
+        // disappears, so no endpoint can access the header during cleanup.
         let header = unsafe { self.header.as_ref() };
         let mut position = header.consumer_reservation.load(Ordering::Acquire);
         let publication = header.producer_publication.load(Ordering::Acquire);
 
         while position != publication {
+            // SAFETY: Mask keeps the index within the allocated buffer.
+            let slot = unsafe { self.buffer.add(position & self.buffer_mask) };
             // SAFETY: Positions from the consumer reservation cursor through
             // producer publication contain initialized, unclaimed values.
-            unsafe { self.buffer.add(position & self.buffer_mask).drop_in_place() };
+            unsafe { slot.drop_in_place() };
             position = position.wrapping_add(1);
         }
     }
@@ -623,6 +635,7 @@ impl<T> SharedQueue<T> {
         region: Arc<Region>,
         header: NonNull<SharedQueueHeader>,
     ) -> Result<Arc<Self>, Error> {
+        // SAFETY: caller guarantees `header` is non-null, aligned, and valid.
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
@@ -1010,8 +1023,10 @@ impl<'a, T> WriteBatch<'a, T> {
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
+        // SAFETY: Mask keeps the index within the reserved buffer.
+        let slot = unsafe { self.buffer.add(position & self.buffer_mask) };
         // SAFETY: The position was reserved for writing.
-        unsafe { self.buffer.add(position & self.buffer_mask).cast().as_mut() }
+        unsafe { slot.cast().as_mut() }
     }
 
     /// Writes a value into the slot at index.
@@ -1023,8 +1038,10 @@ impl<'a, T> WriteBatch<'a, T> {
     pub unsafe fn write(&mut self, index: usize, value: T) {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
-        // SAFETY: The position was reserved for writing
-        unsafe { self.buffer.add(position & self.buffer_mask).write(value) }
+        // SAFETY: Mask keeps the index within the reserved buffer.
+        let slot = unsafe { self.buffer.add(position & self.buffer_mask) };
+        // SAFETY: The position was reserved for writing.
+        unsafe { slot.write(value) }
     }
 }
 
@@ -1073,8 +1090,10 @@ impl<'a, T> RawReadBatch<'a, T> {
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
+        // SAFETY: Mask keeps the index within the buffer.
+        let slot = unsafe { self.buffer.add(position & self.buffer_mask) };
         // SAFETY: The position was reserved for reading and is initialized.
-        unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
+        unsafe { slot.as_ref() }
     }
 
     /// Reads the value at `index`.
@@ -1087,8 +1106,10 @@ impl<'a, T> RawReadBatch<'a, T> {
     pub unsafe fn get_owned_unchecked(&self, index: usize) -> T {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
+        // SAFETY: Mask keeps the index within the buffer.
+        let slot = unsafe { self.buffer.add(position & self.buffer_mask) };
         // SAFETY: The position was reserved for reading.
-        unsafe { self.buffer.add(position & self.buffer_mask).read() }
+        unsafe { slot.read() }
     }
 }
 
@@ -1265,8 +1286,10 @@ mod tests {
     fn create_file_backed_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         let file = create_temp_shmem_file().expect("failed to create temp file");
         let file_size = minimum_file_size::<T>(capacity);
+        // SAFETY: test-only; sole producer for a freshly created file.
         let producer =
             unsafe { Producer::create(&file, file_size) }.expect("failed to create producer");
+        // SAFETY: test-only; sole consumer for this file.
         let consumer = unsafe { Consumer::join(&file) }.expect("failed to join consumer");
 
         (producer, consumer)
@@ -1374,6 +1397,7 @@ mod tests {
         for create_queue in test_queue_creators::<Item>() {
             let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
+            // SAFETY: test-only; slot is initialized below before the guard drops.
             let mut guard = unsafe { producer.try_reserve_write() }.expect("reserve failed");
             guard.as_mut().write(42);
             drop(guard);
@@ -1390,9 +1414,11 @@ mod tests {
             let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
             let batch_size = NonZeroUsize::new(4).unwrap();
+            // SAFETY: test-only; every slot is initialized below before drop.
             let mut batch = unsafe { producer.try_reserve_write_batch(batch_size) }
                 .expect("reserve_batch failed");
             for index in 0..batch.len() {
+                // SAFETY: test-only; index < batch.len().
                 unsafe {
                     batch.as_mut(index).write(index as u64);
                 }
@@ -1417,6 +1443,7 @@ mod tests {
         for create_queue in test_queue_creators::<Item>() {
             let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
+            // SAFETY: test-only; reservation fails so no slot is left uninitialized.
             unsafe {
                 assert!(producer
                     .try_reserve_write_batch(NonZeroUsize::new(BUFFER_CAPACITY + 1).unwrap())
@@ -1556,6 +1583,7 @@ mod tests {
                     .try_reserve_read_batch_raw(NonZeroUsize::new(4).unwrap())
                     .expect("raw read batch")
             };
+            // SAFETY: test-only; index 2 is in bounds and not yet moved out.
             assert_eq!(unsafe { batch.get_unchecked(2) }.value, 2);
             for index in [2, 0, 1] {
                 // SAFETY: Each in-bounds index is moved out exactly once.
@@ -1771,6 +1799,7 @@ mod tests {
             assert_eq!(*guard.as_ref(), 0);
             core::mem::forget(guard);
 
+            // SAFETY: test-only; sole consumer, no other live consumer.
             unsafe {
                 consumer.recover_as_exclusive_lossy();
             }
@@ -1795,6 +1824,7 @@ mod tests {
             assert_eq!(*guard.as_ref(), 0);
             core::mem::forget(guard);
 
+            // SAFETY: test-only; sole consumer, no other live consumer.
             unsafe {
                 consumer.recover_as_exclusive();
             }
@@ -1814,10 +1844,12 @@ mod tests {
 
             producer.try_write(10).unwrap();
 
+            // SAFETY: test-only; slot is initialized below before it is forgotten.
             let mut guard = unsafe { producer.try_reserve_write() }.expect("reserve write");
             guard.as_mut().write(99);
             core::mem::forget(guard);
 
+            // SAFETY: test-only; sole producer, no other live producer.
             unsafe {
                 producer.recover_as_exclusive();
             }

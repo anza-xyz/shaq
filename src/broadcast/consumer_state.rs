@@ -137,8 +137,10 @@ impl ConsumerState {
     #[inline]
     fn slot(&self, index: usize) -> &AtomicU64 {
         debug_assert!(index < self.slot_count);
-        // SAFETY: `index < slot_count`; the slot was initialized.
-        unsafe { self.slots.add(index).as_ref() }
+        // SAFETY: `index < slot_count`, so the offset stays in bounds.
+        let slot = unsafe { self.slots.add(index) };
+        // SAFETY: the slot was initialized at construction.
+        unsafe { slot.as_ref() }
     }
 }
 
@@ -293,8 +295,10 @@ impl LaneConsumerState {
     #[inline]
     fn limit(&self, consumer_index: usize) -> &CacheAlignedAtomicSize {
         debug_assert!(consumer_index < self.slot_count);
-        // SAFETY: `consumer_index < slot_count`; the slot was initialized.
-        unsafe { self.limits.add(consumer_index).as_ref() }
+        // SAFETY: `consumer_index < slot_count`, so the offset stays in bounds.
+        let limit = unsafe { self.limits.add(consumer_index) };
+        // SAFETY: the slot was initialized at construction.
+        unsafe { limit.as_ref() }
     }
 }
 

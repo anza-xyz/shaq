@@ -331,7 +331,9 @@ mod imp {
 
     fn errno() -> i32 {
         // SAFETY: `__errno_location` returns this thread's errno location on Linux.
-        unsafe { *libc::__errno_location() }
+        let errno = unsafe { libc::__errno_location() };
+        // SAFETY: the returned pointer is valid and points to this thread's errno.
+        unsafe { *errno }
     }
 }
 

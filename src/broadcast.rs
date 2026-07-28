@@ -270,6 +270,7 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region<T>(region: &Arc<Region>) -> Result<Self, Error> {
+        // SAFETY: caller guarantees `region` was laid out by `create_in_region`.
         unsafe { Self::join_region_with(region, QueueLayout::from_header::<T>) }
     }
 
@@ -279,6 +280,7 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region_untyped(region: &Arc<Region>) -> Result<Self, Error> {
+        // SAFETY: caller guarantees `region` was laid out by `create_in_region`.
         unsafe { Self::join_region_with(region, QueueLayout::from_header_payload) }
     }
 
@@ -308,6 +310,7 @@ impl SharedQueue {
         let base = region.addr();
 
         // Global consumer-ownership table: every index free.
+        // SAFETY: `consumer_state_offset` lies within the region (>= `layout.total`).
         let consumer_state = unsafe { base.byte_add(layout.consumer_state_offset) };
         // SAFETY: the layout reserves `consumer_slots` AtomicU64s here.
         unsafe { ConsumerState::init(consumer_state, layout.consumer_slots) };
@@ -493,6 +496,7 @@ impl Clone for SharedQueue {
 // SAFETY: the region is shared (file-backed / heap) and access is synchronized
 // by the queue protocol; the pointers are stable for the region's lifetime.
 unsafe impl Send for SharedQueue {}
+// SAFETY: shared access to the region is synchronized by the queue protocol.
 unsafe impl Sync for SharedQueue {}
 
 /// A producer: owns one lane and publishes into it. Single-threaded use (its
@@ -1711,11 +1715,10 @@ mod tests {
                 .expect("readable batch");
             assert_eq!(batch.len(), 2);
             assert_eq!(batch.payload_size(), size_of::<Payload>());
-            // SAFETY: both indexes are below `batch.len()`.
-            unsafe {
-                assert_eq!(batch.as_slice(0), 11u64.to_ne_bytes());
-                assert_eq!(batch.as_slice(1), 12u64.to_ne_bytes());
-            }
+            // SAFETY: index 0 < batch.len().
+            unsafe { assert_eq!(batch.as_slice(0), 11u64.to_ne_bytes()) };
+            // SAFETY: index 1 < batch.len().
+            unsafe { assert_eq!(batch.as_slice(1), 12u64.to_ne_bytes()) };
         }
 
         let guard = consumer.try_read().expect("remaining item");
