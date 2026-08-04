@@ -148,6 +148,9 @@ impl<T> Producer<T> {
     }
 
     /// Writes item into the queue or returns it if there is not enough space.
+    ///
+    /// When writing multiple items, prefer [`Self::write_batch`] to amortize
+    /// synchronization and publication across the batch.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
         self.sync();
         self.try_write_inner(item)?;
@@ -341,6 +344,10 @@ impl<T> Consumer<T> {
     ///
     /// Returns `None` if there are no values available. Consumed capacity is
     /// released before this method returns.
+    ///
+    /// When reading multiple items, prefer [`Self::read_session`] or
+    /// [`Self::try_reserve_read_batch`] to amortize synchronization and
+    /// capacity release across the batch.
     pub fn try_read(&mut self) -> Option<T> {
         self.read_session().try_read()
     }
