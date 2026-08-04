@@ -912,12 +912,9 @@ pub struct WriteBatch<'a, T: Copy> {
 }
 
 impl<T: Copy> WriteBatch<'_, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// Mutable reference to the reserved cell at `index`.
@@ -1396,12 +1393,9 @@ pub struct ReadBatch<'a, T: Copy> {
 }
 
 impl<T: Copy> ReadBatch<'_, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// Reference to the value at `index`.
@@ -1664,12 +1658,9 @@ pub struct SliceReadBatch<'a> {
 }
 
 impl SliceReadBatch<'_> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// Byte length of each payload in the batch.

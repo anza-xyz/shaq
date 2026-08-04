@@ -570,12 +570,9 @@ pub struct ReadBatch<'a, T> {
 }
 
 impl<'a, T> ReadBatch<'a, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.reservation.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// Returns a shared reference to the value at `index`, or `None` if it is
@@ -1279,7 +1276,6 @@ mod tests {
                     .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
                     .expect("read batch");
                 assert_eq!(batch.len(), 2);
-                assert!(!batch.is_empty());
                 assert_eq!(batch.get(0), Some(&0));
                 assert_eq!(batch[1], 1);
                 assert_eq!(batch.get_owned(1), Some(1));

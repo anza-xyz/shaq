@@ -1002,13 +1002,9 @@ pub struct WriteBatch<'a, T> {
 }
 
 impl<'a, T> WriteBatch<'a, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        // count is guaranteed to be non-zero by the type, so this batch can never be empty.
-        false
     }
 
     /// Returns a mutable reference to the reserved slot.
@@ -1070,13 +1066,9 @@ pub struct RawReadBatch<'a, T> {
 }
 
 impl<'a, T> RawReadBatch<'a, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        // count is guaranteed to be non-zero by the type, so this batch can never be empty.
-        false
     }
 
     /// Returns a reference to the reserved slot.
@@ -1138,12 +1130,9 @@ impl<'a, T> ReadBatch<'a, T> {
         &self.raw
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.raw().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// Returns a shared reference to the value at `index`, or `None` if it is
