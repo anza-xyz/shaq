@@ -229,8 +229,13 @@ impl<'a, T> WriteBatch<'a, T> {
         self.producer.try_write_inner(item)
     }
 
-    /// Returns a maybe-uninit pointer to the reserved position if one is available.
-    pub fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
+    /// Returns a mutable reference to the next reserved position if one is available.
+    ///
+    /// # Safety
+    /// If this returns `Some`, the caller must initialize the reserved slot with a
+    /// valid `T` before the batch is dropped and publishes it. This requirement
+    /// also applies if control exits by unwinding.
+    pub unsafe fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
         // SAFETY: The reserved slot belongs exclusively to this producer.
         let mut reserved = unsafe { self.producer.reserve() }?.cast();
         // SAFETY: The mutable reference is tied to the borrow of this batch.
