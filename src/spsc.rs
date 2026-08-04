@@ -345,22 +345,13 @@ impl<T> Consumer<T> {
     /// Returns `None` if there are no values available. Consumed capacity is
     /// released before this method returns.
     ///
-    /// When reading multiple items, prefer [`Self::read_session`] or
-    /// [`Self::try_reserve_read_batch`] to amortize synchronization and
-    /// capacity release across the batch.
+    /// When reading multiple items, prefer [`Self::try_reserve_read_batch`] to
+    /// amortize synchronization and capacity release across the batch.
     pub fn try_read(&mut self) -> Option<T> {
-        self.read_session().try_read()
-    }
-
-    /// Starts a streaming read session.
-    ///
-    /// The consumer synchronizes with the producer once when the session is
-    /// created. Repeated calls to [`ReadSession::try_read`] consume from that
-    /// snapshot without further synchronization. Consumed capacity is
-    /// released when the session is dropped.
-    pub fn read_session(&mut self) -> ReadSession<'_, T> {
         self.sync();
-        ReadSession { consumer: self }
+        let item = self.try_read_inner();
+        self.finalize();
+        item
     }
 
     /// Attempts to reserve up to `max` values from the queue.
@@ -477,29 +468,6 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         self.finalize();
-    }
-}
-
-/// A streaming read session that releases consumed capacity on drop.
-///
-/// The session observes the producer's publication cursor once when it is
-/// created. Values published later are visible to the next session.
-#[must_use]
-pub struct ReadSession<'a, T> {
-    consumer: &'a mut Consumer<T>,
-}
-
-impl<T> ReadSession<'_, T> {
-    /// Takes ownership of the next value in this session's snapshot, or
-    /// returns `None` when the snapshot has been exhausted.
-    pub fn try_read(&mut self) -> Option<T> {
-        self.consumer.try_read_inner()
-    }
-}
-
-impl<T> Drop for ReadSession<'_, T> {
-    fn drop(&mut self) {
-        self.consumer.finalize();
     }
 }
 
@@ -1064,19 +1032,22 @@ mod tests {
                 assert!(batch.try_write(AtomicU64::new(1)).is_err());
             }
             {
-                let mut session = consumer.read_session();
+                let batch = consumer
+                    .try_reserve_read_batch(NonZeroUsize::new(BUFFER_CAPACITY).unwrap())
+                    .expect("Failed to reserve read batch");
+                let mut drain = batch.drain();
                 for _ in 0..BUFFER_CAPACITY {
-                    let item = session.try_read().expect("Failed to read item");
+                    let item = drain.next().expect("Failed to read item");
                     assert_eq!(item.load(Ordering::Acquire), 1);
                 }
-                assert!(session.try_read().is_none()); // no more items to read
+                assert!(drain.next().is_none()); // no more items to read
             }
 
-            // Ensure we can write again after the session releases its reads.
+            // Ensure we can write again after the batch releases its reads.
             producer.try_write(AtomicU64::new(2)).unwrap();
             let item = consumer
                 .try_read()
-                .expect("Failed to read item after session");
+                .expect("Failed to read item after batch");
             assert_eq!(item.load(Ordering::Acquire), 2);
         }
     }
@@ -1228,45 +1199,6 @@ mod tests {
                 Err(WaitError::Timeout) => panic!("read timed out after commit"),
             };
             assert_eq!(value, 9);
-        }
-    }
-
-    #[test]
-    fn read_session_releases_consumed_prefix_on_drop() {
-        for create_queue in test_queue_creators::<u64>() {
-            let (mut producer, mut consumer) = create_queue(4);
-            for value in 0..4 {
-                producer.try_write(value).unwrap();
-            }
-
-            {
-                let mut session = consumer.read_session();
-                assert_eq!(session.try_read(), Some(0));
-                assert_eq!(session.try_read(), Some(1));
-                assert!(producer.try_write(4).is_err());
-            }
-
-            assert!(producer.try_write(4).is_ok());
-            assert_eq!(consumer.try_read(), Some(2));
-            assert_eq!(consumer.try_read(), Some(3));
-            assert_eq!(consumer.try_read(), Some(4));
-            assert_eq!(consumer.try_read(), None);
-        }
-    }
-
-    #[test]
-    fn read_session_uses_a_single_publication_snapshot() {
-        for create_queue in test_queue_creators::<u64>() {
-            let (mut producer, mut consumer) = create_queue(4);
-            producer.try_write(0).unwrap();
-
-            let mut session = consumer.read_session();
-            producer.try_write(1).unwrap();
-            assert_eq!(session.try_read(), Some(0));
-            assert_eq!(session.try_read(), None);
-            drop(session);
-
-            assert_eq!(consumer.try_read(), Some(1));
         }
     }
 
