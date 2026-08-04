@@ -220,21 +220,16 @@ fn run_spsc_producer(
         verbose.then(|| "Producer".to_string()),
         total_items_produced,
         move || {
-            producer.sync();
+            let mut batch = producer.write_batch();
             let mut produced = 0;
             for _ in 0..SYNC_CADENCE.get() {
-                // SAFETY: reserve() yields a valid write slot.
-                let Some(mut spot) = (unsafe { producer.reserve() }) else {
+                if batch.try_write(Item { data: [42u8; _] }).is_ok() {
+                    produced += 1;
+                } else {
                     producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                     break;
-                };
-                // SAFETY: the reserved slot can be fully initialized.
-                unsafe {
-                    spot.as_mut().data.fill(42);
                 }
-                produced += 1;
             }
-            producer.commit();
             (produced > 0).then_some(produced)
         },
     );

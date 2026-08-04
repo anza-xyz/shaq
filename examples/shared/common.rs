@@ -10,6 +10,7 @@ use std::{
 
 #[derive(Clone, Copy)]
 pub struct Item {
+    #[allow(unused)]
     pub data: [u8; 512],
 }
 

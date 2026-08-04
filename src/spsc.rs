@@ -5,7 +5,7 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
 };
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 use std::{
     fs::File,
     num::NonZeroUsize,
@@ -135,8 +135,23 @@ impl<T> Producer<T> {
         self.queue.is_empty()
     }
 
+    /// Start a batched write.
+    pub fn write_batch(&mut self) -> WriteBatch<'_, T> {
+        self.sync();
+        WriteBatch { producer: self }
+    }
+
     /// Writes item into the queue or returns it if there is not enough space.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
+        self.sync();
+        self.try_write_inner(item)?;
+        self.commit();
+        Ok(())
+    }
+
+    /// Writes item into the queue or returns it if there is not enough space.
+    /// Does not perform synchronization of cached cursors.
+    fn try_write_inner(&mut self, item: T) -> Result<(), T> {
         // SAFETY: pointer is written below if successfully reserved.
         match unsafe { self.reserve() } {
             Some(p) => {
@@ -156,7 +171,7 @@ impl<T> Producer<T> {
     /// # Safety
     /// All reserved positions must be fully initialized before calling `commit`.
     /// Pointers should be dropped before calling `commit`.
-    pub unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
+    unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
         // If write is > read + buffer_mask, the queue is written one iteration
         // ahead of the consumer, and we cannot reserve more space.
         if self.queue.cached_write.wrapping_sub(self.queue.cached_read) > self.queue.buffer_mask {
@@ -172,7 +187,7 @@ impl<T> Producer<T> {
     }
 
     /// Commits the reserved position, making it visible to the consumer.
-    pub fn commit(&self) {
+    fn commit(&self) {
         let header = self.queue.header();
         // Release publication; `wake` supplies the fence that pairs it with
         // a registering waiter and must be called unconditionally; see the
@@ -185,7 +200,7 @@ impl<T> Producer<T> {
 
     /// Synchronize the producer's cached read position with the queue's read
     /// position.
-    pub fn sync(&mut self) {
+    fn sync(&mut self) {
         self.queue.load_read();
     }
 }
@@ -194,6 +209,34 @@ impl<T> Producer<T> {
 // shared buffer is synchronized by the queue protocol, so it is safe to move
 // to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Producer<T> {}
+
+/// A batch of writes published on drop.
+pub struct WriteBatch<'a, T> {
+    producer: &'a mut Producer<T>,
+}
+
+impl<'a, T> WriteBatch<'a, T> {
+    /// If the next sequence number is available, writes the item and returns Ok(()).
+    /// Otherwise, returns an error with the item.
+    pub fn try_write(&mut self, item: T) -> Result<(), T> {
+        self.producer.try_write_inner(item)
+    }
+
+    /// Returns a maybe-uninit pointer to the reserved position if one is available.
+    pub fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
+        // SAFETY: The reserved slot belongs exclusively to this producer.
+        let mut reserved = unsafe { self.producer.reserve() }?.cast();
+        // SAFETY: The mutable reference is tied to the borrow of this batch.
+        Some(unsafe { reserved.as_mut() })
+    }
+}
+
+impl<'a, T> Drop for WriteBatch<'a, T> {
+    fn drop(&mut self) {
+        // Commit any written items
+        self.producer.commit();
+    }
+}
 
 /// Consumer side of the SPSC shared queue.
 pub struct Consumer<T> {
@@ -458,15 +501,19 @@ impl<T> Drop for SharedQueueInner<T> {
         }
 
         // SharedQueueInner is dropped by its Arc after both endpoints
-        // disappear, so the published cursors are final.
+        // disappear, so the published cursors are final. `header` remains
+        // valid because `region` is still alive and is dropped last.
+        // SAFETY: `header` points into the live region for this queue.
         let header = unsafe { self.header.as_ref() };
         let mut position = header.read.load(Ordering::Acquire);
         let write = header.write.load(Ordering::Acquire);
 
         while position != write {
+            // SAFETY: Masking the position produces an index within the buffer.
+            let value = unsafe { self.buffer.add(position & self.buffer_mask) };
             // SAFETY: Published positions not yet released by the consumer
             // contain initialized values still in the queue.
-            unsafe { self.buffer.add(position & self.buffer_mask).drop_in_place() };
+            unsafe { value.drop_in_place() };
             position = position.wrapping_add(1);
         }
     }
@@ -771,18 +818,15 @@ mod tests {
             assert_eq!(item.load(Ordering::Acquire), 42);
             assert!(consumer.try_read().is_none()); // no more items to read
             consumer.finalize();
-            producer.sync();
 
             // Ensure we can push up to the capacity.
-            for _ in 0..BUFFER_CAPACITY {
-                // SAFETY: single producer over the queue.
-                let spot = unsafe { producer.reserve() }.expect("Failed to reserve");
-                // SAFETY: spot is a valid reserved slot.
-                unsafe { spot.as_ref() }.store(1, Ordering::Release);
+            {
+                let mut batch = producer.write_batch();
+                for _ in 0..BUFFER_CAPACITY {
+                    assert!(batch.try_write(AtomicU64::new(1)).is_ok());
+                }
+                assert!(batch.try_write(AtomicU64::new(1)).is_err());
             }
-            // SAFETY: single producer; buffer is full so reserve yields None.
-            assert!(unsafe { producer.reserve() }.is_none()); // buffer is full, we cannot reserve more
-            producer.commit();
             consumer.sync();
             for _ in 0..BUFFER_CAPACITY {
                 let item = consumer.try_read().expect("Failed to read item");
@@ -790,14 +834,9 @@ mod tests {
             }
             assert!(consumer.try_read().is_none()); // no more items to read
             consumer.finalize();
-            producer.sync();
 
-            // Ensure we can reserve again after finalizing/sync.
-            // SAFETY: single producer over the queue after finalize.
-            let spot = unsafe { producer.reserve() }.expect("Failed to reserve after finalize");
-            // SAFETY: spot is a valid reserved slot.
-            unsafe { spot.as_ref() }.store(2, Ordering::Release);
-            producer.commit();
+            // Ensure we can write again after finalizing.
+            producer.try_write(AtomicU64::new(2)).unwrap();
             consumer.sync();
             let item = consumer
                 .try_read()
@@ -817,7 +856,6 @@ mod tests {
             let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
 
             producer.try_write(42).unwrap();
-            producer.commit();
             consumer.sync();
             let val = consumer.try_read().expect("read failed");
             assert_eq!(val, 42);
@@ -831,7 +869,6 @@ mod tests {
         let value = Arc::new(42);
 
         producer.try_write(Arc::clone(&value)).unwrap();
-        producer.commit();
         consumer.sync();
 
         let received = consumer.try_read().expect("read failed");
@@ -848,7 +885,6 @@ mod tests {
         let (mut producer, consumer) = pair(1).expect("failed to create queue");
 
         producer.try_write(Arc::clone(&value)).unwrap();
-        producer.commit();
         drop(producer);
         assert_eq!(Arc::strong_count(&value), 2);
 
@@ -866,7 +902,6 @@ mod tests {
             let mut producer = unsafe { consumer.join_as_producer() }.expect("join failed");
 
             producer.try_write(99).unwrap();
-            producer.commit();
             consumer.sync();
             let val = consumer.try_read().expect("read failed");
             assert_eq!(val, 99);
@@ -885,7 +920,6 @@ mod tests {
 
             // Write a message then drop.
             producer.try_write(7).unwrap();
-            producer.commit();
             drop(producer);
 
             // Can still read the message from the shared consumer
@@ -937,7 +971,6 @@ mod tests {
             let (mut producer, mut consumer) = create_queue(64);
 
             producer.try_write(1).unwrap();
-            producer.commit();
 
             // `Duration::MAX` overflows `Instant`; the deadline must saturate
             // instead of panicking. Data is already committed so this returns
@@ -964,7 +997,6 @@ mod tests {
             ));
 
             producer.try_write(9).unwrap();
-            producer.commit();
 
             let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
                 Ok(ptr) => ptr,
