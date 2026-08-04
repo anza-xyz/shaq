@@ -217,6 +217,7 @@ impl<T> Producer<T> {
 unsafe impl<T: Send> Send for Producer<T> {}
 
 /// A batch of writes published on drop.
+#[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
 }
