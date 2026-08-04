@@ -242,20 +242,14 @@ fn run_spsc_consumer(
 ) {
     let wait_timeout = Duration::from_millis(10);
     run_consumer_loop(exit, move || {
-        match consumer.read_ptr_timeout(wait_timeout) {
-            Ok(_item) => {}
+        let batch = match consumer.reserve_read_batch_timeout(SYNC_CADENCE, wait_timeout) {
+            Ok(batch) => batch,
             Err(WaitError::Timeout) => {
                 consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        }
-
-        for _ in 1..SYNC_CADENCE.get() {
-            if consumer.try_read_ptr().is_none() {
-                break;
-            }
-        }
-        consumer.finalize();
+        };
+        let _ = batch.len();
     });
 }
 

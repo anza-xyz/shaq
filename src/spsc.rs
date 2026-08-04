@@ -5,7 +5,13 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
 };
-use core::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
+use core::{
+    iter::FusedIterator,
+    marker::PhantomData,
+    mem::{ManuallyDrop, MaybeUninit},
+    ops::Index,
+    ptr::NonNull,
+};
 use std::{
     fs::File,
     num::NonZeroUsize,
@@ -324,45 +330,39 @@ impl<T> Consumer<T> {
         self.queue.is_empty()
     }
 
-    /// Attempts to read a value from the queue.
-    /// Returns `None` if there are no values available.
-    /// Returns ownership of the value if available.
+    /// Attempts to read a value from the queue, synchronizing with the
+    /// producer first.
     ///
-    /// Call [`Self::finalize`] to release consumed capacity back to the
-    /// producer. Pending capacity is also released when the consumer is
-    /// dropped.
+    /// Returns `None` if there are no values available. Consumed capacity is
+    /// released before this method returns.
     pub fn try_read(&mut self) -> Option<T> {
-        let read_ptr = self.try_reserve_read_ptr()?;
-        // SAFETY: `read_ptr` is the initialized position just reserved by this
-        // consumer, and ownership has not previously been taken from it.
-        Some(unsafe { read_ptr.read() })
+        self.read_session().try_read()
     }
 
-    /// Attempts to reserve a value for zero-copy reading.
-    /// Returns `None` if there are no values available.
-    /// Returns a pointer to the value if available.
+    /// Starts a streaming read session.
     ///
-    /// All returned pointers must be discarded before calling
-    /// [`Self::finalize`] or dropping the consumer.
-    pub fn try_read_ptr(&mut self) -> Option<NonNull<T>>
-    where
-        T: Copy,
-    {
-        self.try_reserve_read_ptr()
+    /// The consumer synchronizes with the producer once when the session is
+    /// created. Repeated calls to [`ReadSession::try_read`] consume from that
+    /// snapshot without further synchronization. Consumed capacity is
+    /// released when the session is dropped.
+    pub fn read_session(&mut self) -> ReadSession<'_, T> {
+        self.sync();
+        ReadSession { consumer: self }
     }
 
-    /// Attempts to reserve a value for raw reading.
+    /// Attempts to reserve up to `max` values from the queue.
     ///
-    /// # Safety
-    /// Before the read position is released, every reserved non-`Copy` value
-    /// must be moved out or dropped exactly once. No reference or pointer to a
-    /// reserved value may be used after its position is released. Dropping the
-    /// consumer releases all pending read positions.
-    pub unsafe fn try_read_ptr_raw(&mut self) -> Option<NonNull<T>> {
-        self.try_reserve_read_ptr()
+    /// The consumer synchronizes with the producer before reserving. Dropping
+    /// the returned batch drops any values that were not moved out through
+    /// [`ReadBatch::drain`] and releases the complete reservation.
+    #[must_use]
+    pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
+        self.sync();
+        let reservation = self.try_reserve_read_range(max)?;
+        Some(self.read_batch_for(reservation))
     }
 
-    fn try_reserve_read_ptr(&mut self) -> Option<NonNull<T>> {
+    fn try_read_inner(&mut self) -> Option<T> {
         if self.queue.cached_read == self.queue.cached_write {
             return None; // Queue is empty
         }
@@ -372,20 +372,36 @@ impl<T> Consumer<T> {
         let read_ptr = unsafe { self.queue.buffer.add(read_index) };
         self.queue.cached_read = self.queue.cached_read.wrapping_add(1);
 
-        Some(read_ptr)
+        // SAFETY: `read_ptr` is the initialized position just reserved by this
+        // consumer, and ownership has not previously been taken from it.
+        Some(unsafe { read_ptr.read() })
     }
 
-    /// Publishes the current read position, releasing all reserved capacity
-    /// back to the producer.
-    pub fn finalize(&mut self) {
+    fn try_reserve_read_range(&mut self, max: NonZeroUsize) -> Option<(usize, NonZeroUsize)> {
+        let count = NonZeroUsize::new(self.queue.len().min(max.get()))?;
+        let start = self.queue.cached_read;
+        self.queue.cached_read = self.queue.cached_read.wrapping_add(count.get());
+        Some((start, count))
+    }
+
+    fn read_batch_for(&mut self, (start, count): (usize, NonZeroUsize)) -> ReadBatch<'_, T> {
+        ReadBatch {
+            reservation: ReadReservation {
+                consumer: self,
+                start,
+                count,
+            },
+        }
+    }
+
+    fn finalize(&mut self) {
         self.queue
             .header()
             .read
             .store(self.queue.cached_read, Ordering::Release);
     }
 
-    /// Synchronizes the consumer's cached write position with the queue's write position.
-    pub fn sync(&mut self) {
+    fn sync(&mut self) {
         self.queue.load_write();
     }
 
@@ -407,51 +423,36 @@ impl<T> Consumer<T> {
     }
 
     /// Blocks until ownership of a committed item can be taken or `timeout`
-    /// elapses.
-    ///
-    /// Call [`Self::finalize`] to release consumed capacity back to the
-    /// producer.
+    /// elapses. Consumed capacity is released before this method returns.
     pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
-        let read_ptr = self.reserve_read_ptr_timeout(timeout)?;
-        // SAFETY: `read_ptr` is the initialized position just reserved by this
-        // consumer, and ownership has not previously been taken from it.
-        Ok(unsafe { read_ptr.read() })
+        let batch = self.reserve_read_batch_timeout(NonZeroUsize::MIN, timeout)?;
+        Ok(batch
+            .drain()
+            .next()
+            .expect("a successful one-item reservation is non-empty"))
     }
 
-    /// Blocks until a committed item can be reserved for reading or `timeout`
-    /// elapses.
+    /// Attempts to reserve up to `max` values, waiting up to `timeout` for a
+    /// producer to publish data.
     ///
-    /// The caller must still process all returned pointers and call
-    /// [`Self::finalize`] to release consumed capacity back to the producer.
-    pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError>
-    where
-        T: Copy,
-    {
-        self.reserve_read_ptr_timeout(timeout)
-    }
-
-    /// Blocks until a committed item can be reserved for raw reading or
-    /// `timeout` elapses.
-    ///
-    /// # Safety
-    /// The caller must satisfy [`Self::try_read_ptr_raw`]'s safety contract.
-    pub unsafe fn read_ptr_raw_timeout(
+    /// Returns `Err(WaitError::Timeout)` if no values are available before the
+    /// timeout elapses. The method returns as soon as at least one value can be
+    /// reserved; it does not wait for `max` values.
+    pub fn reserve_read_batch_timeout(
         &mut self,
+        max: NonZeroUsize,
         timeout: Duration,
-    ) -> Result<NonNull<T>, WaitError> {
-        self.reserve_read_ptr_timeout(timeout)
-    }
-
-    fn reserve_read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
+    ) -> Result<ReadBatch<'_, T>, WaitError> {
         let header = self.queue.header;
         // SAFETY: `header` points to this consumer's live shared queue header.
         let header = unsafe { header.as_ref() };
-        header
+        let reservation = header
             .waiters
             .wait_for(&header.write, SPIN_ATTEMPTS, timeout, || {
                 self.queue.load_write();
-                self.try_reserve_read_ptr()
-            })
+                self.try_reserve_read_range(max)
+            })?;
+        Ok(self.read_batch_for(reservation))
     }
 }
 
@@ -463,6 +464,230 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         self.finalize();
+    }
+}
+
+/// A streaming read session that releases consumed capacity on drop.
+///
+/// The session observes the producer's publication cursor once when it is
+/// created. Values published later are visible to the next session.
+#[must_use]
+pub struct ReadSession<'a, T> {
+    consumer: &'a mut Consumer<T>,
+}
+
+impl<T> ReadSession<'_, T> {
+    /// Takes ownership of the next value in this session's snapshot, or
+    /// returns `None` when the snapshot has been exhausted.
+    pub fn try_read(&mut self) -> Option<T> {
+        self.consumer.try_read_inner()
+    }
+}
+
+impl<T> Drop for ReadSession<'_, T> {
+    fn drop(&mut self) {
+        self.consumer.finalize();
+    }
+}
+
+struct ReadReservation<'a, T> {
+    consumer: &'a mut Consumer<T>,
+    start: usize,
+    count: NonZeroUsize,
+}
+
+impl<T> ReadReservation<'_, T> {
+    fn len(&self) -> usize {
+        self.count.get()
+    }
+
+    /// Returns a reference to the reserved slot.
+    ///
+    /// # Safety
+    /// - `index` must be less than [`Self::len`].
+    /// - The value at `index` must not have previously been moved out or
+    ///   dropped.
+    /// - A reference returned by this method must not be used after the value
+    ///   is moved out or dropped by any means.
+    unsafe fn get_unchecked(&self, index: usize) -> &T {
+        debug_assert!(index < self.len());
+        let position = self.start.wrapping_add(index);
+        // SAFETY: Masking the reserved position produces an index within the
+        // queue buffer.
+        let value = unsafe {
+            self.consumer
+                .queue
+                .buffer
+                .add(position & self.consumer.queue.buffer_mask)
+        };
+        // SAFETY: The position was reserved for reading and is initialized.
+        unsafe { value.as_ref() }
+    }
+
+    /// Reads the value at `index`.
+    ///
+    /// # Safety
+    /// - `index` must be less than [`Self::len`].
+    /// - The value must not have previously been moved out or dropped.
+    /// - No reference to the slot may be used after moving out its value.
+    unsafe fn get_owned_unchecked(&self, index: usize) -> T {
+        debug_assert!(index < self.len());
+        let position = self.start.wrapping_add(index);
+        // SAFETY: Masking the reserved position produces an index within the
+        // queue buffer.
+        let value = unsafe {
+            self.consumer
+                .queue
+                .buffer
+                .add(position & self.consumer.queue.buffer_mask)
+        };
+        // SAFETY: The position was reserved for reading and is initialized.
+        unsafe { value.read() }
+    }
+}
+
+impl<T> Drop for ReadReservation<'_, T> {
+    fn drop(&mut self) {
+        self.consumer.finalize();
+    }
+}
+
+/// A destructor-safe reservation for consecutive initialized consumer slots.
+///
+/// The batch keeps all of its slots reserved while it lives. It may be
+/// inspected without consuming values, and [`Self::drain`] converts it into a
+/// sequential consuming iterator. Dropping the batch without draining it drops
+/// every value before releasing the reservation.
+#[must_use]
+pub struct ReadBatch<'a, T> {
+    reservation: ReadReservation<'a, T>,
+}
+
+impl<'a, T> ReadBatch<'a, T> {
+    pub fn len(&self) -> usize {
+        self.reservation.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Returns a shared reference to the value at `index`, or `None` if it is
+    /// outside the batch.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            return None;
+        }
+        // SAFETY: The bounds check establishes that the initialized slot is in
+        // the reservation, and a safe batch has not moved out any values.
+        Some(unsafe { self.reservation.get_unchecked(index) })
+    }
+
+    /// Iterates over shared references without consuming any values.
+    ///
+    /// The batch reservation remains held for the iterator's lifetime.
+    pub fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + FusedIterator + '_ {
+        (0..self.len()).map(|index| {
+            // SAFETY: The safe batch has not moved out any values, and the
+            // range only produces indices within the reservation.
+            unsafe { self.reservation.get_unchecked(index) }
+        })
+    }
+
+    /// Converts the batch into a sequential consuming iterator.
+    ///
+    /// The returned drain keeps the complete batch reservation held. Dropping
+    /// it before exhaustion drops all values that have not yet been yielded.
+    pub fn drain(self) -> ReadBatchDrain<'a, T> {
+        let batch = ManuallyDrop::new(self);
+        // SAFETY: `batch` is not dropped, so this moves its reservation exactly once.
+        let reservation = unsafe { core::ptr::read(&batch.reservation) };
+        ReadBatchDrain {
+            reservation,
+            next: 0,
+        }
+    }
+}
+
+impl<T: Copy> ReadBatch<'_, T> {
+    /// Copies the value at `index`, or returns `None` if it is outside the
+    /// batch.
+    pub fn get_owned(&self, index: usize) -> Option<T> {
+        self.get(index).copied()
+    }
+}
+
+impl<T> Index<usize> for ReadBatch<'_, T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("read batch index out of bounds")
+    }
+}
+
+impl<T> Drop for ReadBatch<'_, T> {
+    fn drop(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        for index in 0..self.reservation.len() {
+            // SAFETY: An intact safe batch has not moved out any values.
+            let value = unsafe { self.reservation.get_owned_unchecked(index) };
+            drop(value);
+        }
+    }
+}
+
+/// A sequential consuming iterator over a reserved read batch.
+///
+/// This iterator keeps the complete batch reservation held until it is
+/// dropped. Dropping it before exhaustion drops the unconsumed suffix before
+/// releasing the reservation.
+#[must_use]
+pub struct ReadBatchDrain<'a, T> {
+    reservation: ReadReservation<'a, T>,
+    next: usize,
+}
+
+impl<T> Iterator for ReadBatchDrain<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.reservation.len() {
+            return None;
+        }
+        let index = self.next;
+        // Advance before returning ownership so Drop only considers the suffix.
+        self.next += 1;
+        // SAFETY: The cursor visits every reserved index at most once.
+        Some(unsafe { self.reservation.get_owned_unchecked(index) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.reservation.len() - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for ReadBatchDrain<'_, T> {}
+impl<T> FusedIterator for ReadBatchDrain<'_, T> {}
+
+impl<T> Drop for ReadBatchDrain<'_, T> {
+    fn drop(&mut self) {
+        if !core::mem::needs_drop::<T>() {
+            return;
+        }
+
+        while self.next < self.reservation.len() {
+            let index = self.next;
+            self.next += 1;
+            // SAFETY: The cursor visits every reserved index at most once.
+            let value = unsafe { self.reservation.get_owned_unchecked(index) };
+            drop(value);
+        }
     }
 }
 
@@ -767,7 +992,11 @@ mod tests {
     use super::*;
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
-    use std::{sync::atomic::AtomicU64, time::Duration};
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::atomic::{AtomicU64, AtomicUsize},
+        time::Duration,
+    };
 
     type CreateQueue<T> = fn(usize) -> (Producer<T>, Consumer<T>);
 
@@ -812,12 +1041,9 @@ mod tests {
             unsafe { spot.as_ref() }.store(42, Ordering::Release);
             assert!(consumer.try_read().is_none()); // not committed yet
             producer.commit();
-            assert!(consumer.try_read().is_none()); // consumer has not synced yet
-            consumer.sync();
             let item = consumer.try_read().expect("Failed to read item");
             assert_eq!(item.load(Ordering::Acquire), 42);
             assert!(consumer.try_read().is_none()); // no more items to read
-            consumer.finalize();
 
             // Ensure we can push up to the capacity.
             {
@@ -827,22 +1053,21 @@ mod tests {
                 }
                 assert!(batch.try_write(AtomicU64::new(1)).is_err());
             }
-            consumer.sync();
-            for _ in 0..BUFFER_CAPACITY {
-                let item = consumer.try_read().expect("Failed to read item");
-                assert_eq!(item.load(Ordering::Acquire), 1);
+            {
+                let mut session = consumer.read_session();
+                for _ in 0..BUFFER_CAPACITY {
+                    let item = session.try_read().expect("Failed to read item");
+                    assert_eq!(item.load(Ordering::Acquire), 1);
+                }
+                assert!(session.try_read().is_none()); // no more items to read
             }
-            assert!(consumer.try_read().is_none()); // no more items to read
-            consumer.finalize();
 
-            // Ensure we can write again after finalizing.
+            // Ensure we can write again after the session releases its reads.
             producer.try_write(AtomicU64::new(2)).unwrap();
-            consumer.sync();
             let item = consumer
                 .try_read()
-                .expect("Failed to read item after finalize");
+                .expect("Failed to read item after session");
             assert_eq!(item.load(Ordering::Acquire), 2);
-            consumer.finalize();
         }
     }
 
@@ -856,10 +1081,8 @@ mod tests {
             let mut consumer = unsafe { producer.join_as_consumer() }.expect("join failed");
 
             producer.try_write(42).unwrap();
-            consumer.sync();
             let val = consumer.try_read().expect("read failed");
             assert_eq!(val, 42);
-            consumer.finalize();
         }
     }
 
@@ -869,11 +1092,9 @@ mod tests {
         let value = Arc::new(42);
 
         producer.try_write(Arc::clone(&value)).unwrap();
-        consumer.sync();
 
         let received = consumer.try_read().expect("read failed");
         assert!(Arc::ptr_eq(&received, &value));
-        consumer.finalize();
         assert_eq!(Arc::strong_count(&value), 2);
         drop(received);
         assert_eq!(Arc::strong_count(&value), 1);
@@ -902,10 +1123,8 @@ mod tests {
             let mut producer = unsafe { consumer.join_as_producer() }.expect("join failed");
 
             producer.try_write(99).unwrap();
-            consumer.sync();
             let val = consumer.try_read().expect("read failed");
             assert_eq!(val, 99);
-            consumer.finalize();
         }
     }
 
@@ -923,10 +1142,8 @@ mod tests {
             drop(producer);
 
             // Can still read the message from the shared consumer
-            consumer.sync();
             let val = consumer.try_read().expect("read after producer drop");
             assert_eq!(val, 7);
-            consumer.finalize();
         }
     }
 
@@ -939,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_ptr_timeout_observes_commit() {
+    fn test_read_timeout_observes_commit() {
         for create_queue in test_queue_creators::<u64>() {
             let (mut producer, mut consumer) = create_queue(64);
 
@@ -955,13 +1172,11 @@ mod tests {
 
             producer.commit();
 
-            let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
-                Ok(ptr) => ptr,
+            let value = match consumer.read_timeout(Duration::ZERO) {
+                Ok(value) => value,
                 Err(WaitError::Timeout) => panic!("read timed out after commit"),
             };
-            // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
-            assert_eq!(unsafe { ptr.read() }, 42);
-            consumer.finalize();
+            assert_eq!(value, 42);
         }
     }
 
@@ -992,19 +1207,220 @@ mod tests {
             ));
 
             assert!(matches!(
-                consumer.read_ptr_timeout(Duration::from_millis(1)),
+                consumer.read_timeout(Duration::from_millis(1)),
                 Err(WaitError::Timeout)
             ));
 
             producer.try_write(9).unwrap();
 
-            let ptr = match consumer.read_ptr_timeout(Duration::ZERO) {
-                Ok(ptr) => ptr,
+            let value = match consumer.read_timeout(Duration::ZERO) {
+                Ok(value) => value,
                 Err(WaitError::Timeout) => panic!("read timed out after commit"),
             };
-            // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
-            assert_eq!(unsafe { ptr.read() }, 9);
-            consumer.finalize();
+            assert_eq!(value, 9);
+        }
+    }
+
+    #[test]
+    fn read_session_releases_consumed_prefix_on_drop() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            for value in 0..4 {
+                producer.try_write(value).unwrap();
+            }
+
+            {
+                let mut session = consumer.read_session();
+                assert_eq!(session.try_read(), Some(0));
+                assert_eq!(session.try_read(), Some(1));
+                assert!(producer.try_write(4).is_err());
+            }
+
+            assert!(producer.try_write(4).is_ok());
+            assert_eq!(consumer.try_read(), Some(2));
+            assert_eq!(consumer.try_read(), Some(3));
+            assert_eq!(consumer.try_read(), Some(4));
+            assert_eq!(consumer.try_read(), None);
+        }
+    }
+
+    #[test]
+    fn read_session_uses_a_single_publication_snapshot() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            producer.try_write(0).unwrap();
+
+            let mut session = consumer.read_session();
+            producer.try_write(1).unwrap();
+            assert_eq!(session.try_read(), Some(0));
+            assert_eq!(session.try_read(), None);
+            drop(session);
+
+            assert_eq!(consumer.try_read(), Some(1));
+        }
+    }
+
+    #[test]
+    fn read_batch_is_bounded_and_releases_on_drop() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            for value in 0..4 {
+                producer.try_write(value).unwrap();
+            }
+
+            {
+                let batch = consumer
+                    .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                    .expect("read batch");
+                assert_eq!(batch.len(), 2);
+                assert!(!batch.is_empty());
+                assert_eq!(batch.get(0), Some(&0));
+                assert_eq!(batch[1], 1);
+                assert_eq!(batch.get_owned(1), Some(1));
+                assert_eq!(batch.get(2), None);
+                assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+                assert!(producer.try_write(4).is_err());
+            }
+
+            assert!(producer.try_write(4).is_ok());
+            let batch = consumer
+                .reserve_read_batch_timeout(NonZeroUsize::new(8).unwrap(), Duration::ZERO)
+                .expect("remaining batch");
+            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn read_batch_supports_wrapped_random_access() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            for value in 0..3 {
+                producer.try_write(value).unwrap();
+            }
+            assert_eq!(consumer.try_read(), Some(0));
+            assert_eq!(consumer.try_read(), Some(1));
+            for value in 3..6 {
+                producer.try_write(value).unwrap();
+            }
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                .expect("wrapped read batch");
+            assert_eq!(batch.get_owned(3), Some(5));
+            assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+        }
+    }
+
+    struct CountedItem {
+        value: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountedItem {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn read_batch_drop_and_partial_drain_drop_values() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (mut producer, mut consumer) = create_queue(4);
+            for value in 0..3 {
+                producer
+                    .try_write(CountedItem {
+                        value,
+                        drops: Arc::clone(&drops),
+                    })
+                    .unwrap_or_else(|_| panic!("write failed"));
+            }
+
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
+                .expect("read batch");
+            assert_eq!(
+                batch.iter().map(|item| item.value).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            drop(batch);
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+
+            for value in 3..6 {
+                producer
+                    .try_write(CountedItem {
+                        value,
+                        drops: Arc::clone(&drops),
+                    })
+                    .unwrap_or_else(|_| panic!("write failed"));
+            }
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
+                .expect("read batch");
+            let mut drain = batch.drain();
+            let first = drain.next().expect("first value");
+            assert_eq!(first.value, 3);
+            drop(first);
+            drop(drain);
+            assert_eq!(drops.load(Ordering::Relaxed), 6);
+        }
+    }
+
+    struct PanicOnDrop(bool);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            assert!(!self.0, "requested drop panic");
+        }
+    }
+
+    #[test]
+    fn panicking_batch_element_drop_still_releases_reservation() {
+        let (mut producer, mut consumer) = pair(2).expect("failed to create queue");
+        producer
+            .try_write(PanicOnDrop(true))
+            .unwrap_or_else(|_| panic!("write failed"));
+        producer
+            .try_write(PanicOnDrop(false))
+            .unwrap_or_else(|_| panic!("write failed"));
+        let batch = consumer
+            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+            .expect("read batch");
+
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(batch))).is_err());
+
+        producer
+            .try_write(PanicOnDrop(false))
+            .unwrap_or_else(|_| panic!("write failed"));
+        producer
+            .try_write(PanicOnDrop(false))
+            .unwrap_or_else(|_| panic!("write failed"));
+        drop(
+            consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("replacement read batch"),
+        );
+    }
+
+    #[test]
+    fn reserve_read_batch_timeout_waits_for_at_least_one_value() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            assert!(matches!(
+                consumer.reserve_read_batch_timeout(
+                    NonZeroUsize::new(4).unwrap(),
+                    Duration::from_millis(1),
+                ),
+                Err(WaitError::Timeout)
+            ));
+
+            producer.try_write(7).unwrap();
+            let batch = consumer
+                .reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO)
+                .expect("read batch");
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![7]);
         }
     }
 }
