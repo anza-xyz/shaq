@@ -1146,6 +1146,30 @@ impl<'a, T> ReadBatch<'a, T> {
         Some(unsafe { self.raw().get_unchecked(index) })
     }
 
+    /// Returns the values in logical read order as two slices.
+    ///
+    /// The second slice is empty unless the batch wraps around the end of the
+    /// queue buffer. This borrows the values without consuming the batch.
+    pub fn as_slices(&self) -> (&[T], &[T]) {
+        let start = self.raw.start & self.raw.buffer_mask;
+        let capacity = self.raw.buffer_mask.wrapping_add(1);
+        let first_len = self.len().min(capacity.wrapping_sub(start));
+        let second_len = self.len().wrapping_sub(first_len);
+
+        // SAFETY: `start` is within the queue buffer.
+        let first = unsafe { self.raw.buffer.add(start) };
+        let first = NonNull::slice_from_raw_parts(first, first_len);
+        // SAFETY: The first part of the reservation is initialized, contiguous,
+        // and remains reserved for the lifetime of the returned slice.
+        let first = unsafe { first.as_ref() };
+        let second = NonNull::slice_from_raw_parts(self.raw.buffer, second_len);
+        // SAFETY: The wrapped part of the reservation starts at the buffer base,
+        // is initialized and contiguous, and remains reserved for the lifetime
+        // of the returned slice.
+        let second = unsafe { second.as_ref() };
+        (first, second)
+    }
+
     /// Iterates over shared references without consuming any values.
     ///
     /// The batch reservation remains held for the iterator's lifetime.
@@ -1464,6 +1488,9 @@ mod tests {
             }
             assert_eq!(batch.get(batch.len()), None);
             assert_eq!(batch.get_owned(batch.len()), None);
+            let (first, second) = batch.as_slices();
+            assert_eq!(first, &[0, 1, 2, 3]);
+            assert!(second.is_empty());
             let mut borrowed = Vec::new();
             for value in &batch {
                 borrowed.push(*value);
@@ -1597,6 +1624,9 @@ mod tests {
             assert_eq!(batch.get_owned(3), Some(5));
             assert_eq!(batch.get_owned(0), Some(2));
             assert_eq!(batch.get_owned(3), Some(5));
+            let (first, second) = batch.as_slices();
+            assert_eq!(first, &[2, 3]);
+            assert_eq!(second, &[4, 5]);
             assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
             let mut values = Vec::new();
             for value in batch {

@@ -140,8 +140,13 @@ impl ProducerLane {
     }
 
     #[inline]
-    fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.mask.wrapping_add(1)
+    }
+
+    #[inline]
+    pub(crate) fn mask(&self, sequence: usize) -> usize {
+        sequence & self.mask
     }
 
     #[inline]
@@ -159,7 +164,7 @@ impl ProducerLane {
     /// write a reserved cell and by consumers to read a published one.
     #[inline]
     pub(crate) fn payload_ptr(&self, sequence: usize) -> NonNull<u8> {
-        let offset = (sequence & self.mask).wrapping_mul(self.payload_size);
+        let offset = self.mask(sequence).wrapping_mul(self.payload_size);
         // SAFETY: `sequence & mask < capacity`; the ring has `capacity` cells of
         // `payload_size` bytes. Zero-sized payloads always point at the ring base.
         unsafe { self.ring.byte_add(offset) }

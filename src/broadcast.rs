@@ -1428,6 +1428,33 @@ impl<T: Copy> ReadBatch<'_, T> {
         // cursor.
         unsafe { ptr.read() }
     }
+
+    /// Returns the values in logical read order as two slices.
+    ///
+    /// The second slice is empty unless the batch wraps around the end of the
+    /// lane's ring buffer. This borrows the values without consuming the batch.
+    pub fn as_slices(&self) -> (&[T], &[T])
+    where
+        T: Sync,
+    {
+        let lane = self.consumer.lane(self.lane);
+        let start = lane.mask(self.start);
+        let first_len = self.len().min(lane.capacity().wrapping_sub(start));
+        let second_len = self.len().wrapping_sub(first_len);
+
+        let first = lane.payload_ptr(self.start).cast::<T>();
+        let first = NonNull::slice_from_raw_parts(first, first_len);
+        // SAFETY: The first part of the reservation is initialized, contiguous,
+        // and remains protected from overwrite for the lifetime of the slice.
+        let first = unsafe { first.as_ref() };
+        let second = lane.payload_ptr(0).cast::<T>();
+        let second = NonNull::slice_from_raw_parts(second, second_len);
+        // SAFETY: The wrapped part of the reservation starts at the ring base,
+        // is initialized and contiguous, and remains protected from overwrite
+        // for the lifetime of the slice.
+        let second = unsafe { second.as_ref() };
+        (first, second)
+    }
 }
 
 impl<T: Copy> Drop for ReadBatch<'_, T> {
@@ -2198,6 +2225,9 @@ mod tests {
                     .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
                     .unwrap();
                 assert_eq!(batch.len(), 3);
+                let (first, second) = batch.as_slices();
+                assert_eq!(first, &[0, 1, 2]);
+                assert!(second.is_empty());
                 for index in 0..3 {
                     // SAFETY: `index < len`; `Payload` is `u64`.
                     assert_eq!(unsafe { batch.read(index) }, index as u64);
@@ -2245,6 +2275,32 @@ mod tests {
             for value in 99..103u64 {
                 assert!(p.try_write(value).is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn read_batch_as_slices_supports_wrapping() {
+        for create in producer_creators() {
+            let mut p = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let mut c = p.broadcast_handle().consumer().unwrap();
+            for value in 0..4u64 {
+                assert!(p.try_write(value).is_ok());
+            }
+            assert_eq!(c.try_read(), Some(0));
+            assert_eq!(c.try_read(), Some(1));
+            assert!(p.try_write(4).is_ok());
+            assert!(p.try_write(5).is_ok());
+
+            let batch = c
+                .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            let (first, second) = batch.as_slices();
+            assert_eq!(first, &[2, 3]);
+            assert_eq!(second, &[4, 5]);
         }
     }
 
