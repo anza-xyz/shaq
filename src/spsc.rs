@@ -357,8 +357,8 @@ impl<T> Consumer<T> {
     /// Attempts to reserve up to `max` values from the queue.
     ///
     /// The consumer synchronizes with the producer before reserving. Dropping
-    /// the returned batch drops any values that were not moved out through
-    /// [`ReadBatch::drain`] and releases the complete reservation.
+    /// the returned batch drops any values that were not moved out through its
+    /// [`IntoIterator`] implementation and releases the complete reservation.
     #[must_use]
     pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         self.sync();
@@ -431,7 +431,7 @@ impl<T> Consumer<T> {
     pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, WaitError> {
         let batch = self.reserve_read_batch_timeout(NonZeroUsize::MIN, timeout)?;
         Ok(batch
-            .drain()
+            .into_iter()
             .next()
             .expect("a successful one-item reservation is non-empty"))
     }
@@ -536,9 +536,9 @@ impl<T> Drop for ReadReservation<'_, T> {
 /// A destructor-safe reservation for consecutive initialized consumer slots.
 ///
 /// The batch keeps all of its slots reserved while it lives. It may be
-/// inspected without consuming values, and [`Self::drain`] converts it into a
-/// sequential consuming iterator. Dropping the batch without draining it drops
-/// every value before releasing the reservation.
+/// inspected without consuming values or converted into a sequential consuming
+/// iterator. Dropping the batch without consuming it drops every value before
+/// releasing the reservation.
 #[must_use]
 pub struct ReadBatch<'a, T> {
     reservation: ReadReservation<'a, T>,
@@ -573,16 +573,22 @@ impl<'a, T> ReadBatch<'a, T> {
             unsafe { self.reservation.get_unchecked(index) }
         })
     }
+}
+
+impl<'a, T> IntoIterator for ReadBatch<'a, T> {
+    type Item = T;
+    type IntoIter = ReadBatchIntoIter<'a, T>;
 
     /// Converts the batch into a sequential consuming iterator.
     ///
-    /// The returned drain keeps the complete batch reservation held. Dropping
-    /// it before exhaustion drops all values that have not yet been yielded.
-    pub fn drain(self) -> ReadBatchDrain<'a, T> {
+    /// The returned iterator keeps the complete batch reservation held.
+    /// Dropping it before exhaustion drops all values that have not yet been
+    /// yielded.
+    fn into_iter(self) -> Self::IntoIter {
         let batch = ManuallyDrop::new(self);
         // SAFETY: `batch` is not dropped, so this moves its reservation exactly once.
         let reservation = unsafe { core::ptr::read(&batch.reservation) };
-        ReadBatchDrain {
+        ReadBatchIntoIter {
             reservation,
             next: 0,
         }
@@ -625,12 +631,12 @@ impl<T> Drop for ReadBatch<'_, T> {
 /// dropped. Dropping it before exhaustion drops the unconsumed suffix before
 /// releasing the reservation.
 #[must_use]
-pub struct ReadBatchDrain<'a, T> {
+pub struct ReadBatchIntoIter<'a, T> {
     reservation: ReadReservation<'a, T>,
     next: usize,
 }
 
-impl<T> Iterator for ReadBatchDrain<'_, T> {
+impl<T> Iterator for ReadBatchIntoIter<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -650,10 +656,10 @@ impl<T> Iterator for ReadBatchDrain<'_, T> {
     }
 }
 
-impl<T> ExactSizeIterator for ReadBatchDrain<'_, T> {}
-impl<T> FusedIterator for ReadBatchDrain<'_, T> {}
+impl<T> ExactSizeIterator for ReadBatchIntoIter<'_, T> {}
+impl<T> FusedIterator for ReadBatchIntoIter<'_, T> {}
 
-impl<T> Drop for ReadBatchDrain<'_, T> {
+impl<T> Drop for ReadBatchIntoIter<'_, T> {
     fn drop(&mut self) {
         if !core::mem::needs_drop::<T>() {
             return;
@@ -1035,12 +1041,12 @@ mod tests {
                 let batch = consumer
                     .try_reserve_read_batch(NonZeroUsize::new(BUFFER_CAPACITY).unwrap())
                     .expect("Failed to reserve read batch");
-                let mut drain = batch.drain();
+                let mut iter = batch.into_iter();
                 for _ in 0..BUFFER_CAPACITY {
-                    let item = drain.next().expect("Failed to read item");
+                    let item = iter.next().expect("Failed to read item");
                     assert_eq!(item.load(Ordering::Acquire), 1);
                 }
-                assert!(drain.next().is_none()); // no more items to read
+                assert!(iter.next().is_none()); // no more items to read
             }
 
             // Ensure we can write again after the batch releases its reads.
@@ -1227,7 +1233,7 @@ mod tests {
             let batch = consumer
                 .reserve_read_batch_timeout(NonZeroUsize::new(8).unwrap(), Duration::ZERO)
                 .expect("remaining batch");
-            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4]);
+            assert_eq!(batch.into_iter().collect::<Vec<_>>(), vec![2, 3, 4]);
         }
     }
 
@@ -1249,7 +1255,7 @@ mod tests {
                 .expect("wrapped read batch");
             assert_eq!(batch.get_owned(3), Some(5));
             assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
-            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+            assert_eq!(batch.into_iter().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
         }
     }
 
@@ -1265,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn read_batch_drop_and_partial_drain_drop_values() {
+    fn read_batch_drop_and_partial_iteration_drop_values() {
         for create_queue in test_queue_creators::<CountedItem>() {
             let drops = Arc::new(AtomicUsize::new(0));
             let (mut producer, mut consumer) = create_queue(4);
@@ -1299,11 +1305,11 @@ mod tests {
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
                 .expect("read batch");
-            let mut drain = batch.drain();
-            let first = drain.next().expect("first value");
+            let mut iter = batch.into_iter();
+            let first = iter.next().expect("first value");
             assert_eq!(first.value, 3);
             drop(first);
-            drop(drain);
+            drop(iter);
             assert_eq!(drops.load(Ordering::Relaxed), 6);
         }
     }
@@ -1361,7 +1367,7 @@ mod tests {
                 .reserve_read_batch_timeout(NonZeroUsize::new(4).unwrap(), Duration::ZERO)
                 .expect("read batch");
             assert_eq!(batch.len(), 1);
-            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![7]);
+            assert_eq!(batch.into_iter().collect::<Vec<_>>(), vec![7]);
         }
     }
 }

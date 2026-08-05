@@ -322,7 +322,7 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn try_reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         // SAFETY: ReadBatch drops all values that are not moved out through its
-        // sequential drain before the raw reservation is released.
+        // consuming iterator before the raw reservation is released.
         let raw = unsafe { self.try_reserve_read_batch_raw(max) }?;
         Some(ReadBatch { raw })
     }
@@ -1118,9 +1118,9 @@ impl<'a, T> Drop for RawReadBatch<'a, T> {
 /// A destructor-safe reservation for consecutive initialized consumer slots.
 ///
 /// The batch keeps all of its slots reserved while it lives. It may be
-/// inspected without consuming values, and [`Self::drain`] converts it into a
-/// sequential consuming iterator. Dropping the batch without draining it drops
-/// every value before releasing the reservation.
+/// inspected without consuming values or converted into a sequential consuming
+/// iterator. Dropping the batch without consuming it drops every value before
+/// releasing the reservation.
 pub struct ReadBatch<'a, T> {
     raw: RawReadBatch<'a, T>,
 }
@@ -1158,16 +1158,22 @@ impl<'a, T> ReadBatch<'a, T> {
             unsafe { self.raw().get_unchecked(index) }
         })
     }
+}
+
+impl<'a, T> IntoIterator for ReadBatch<'a, T> {
+    type Item = T;
+    type IntoIter = ReadBatchIntoIter<'a, T>;
 
     /// Converts the batch into a sequential consuming iterator.
     ///
-    /// The returned drain keeps the complete batch reservation held. Dropping
-    /// it before exhaustion drops all values that have not yet been yielded.
-    pub fn drain(self) -> ReadBatchDrain<'a, T> {
+    /// The returned iterator keeps the complete batch reservation held.
+    /// Dropping it before exhaustion drops all values that have not yet been
+    /// yielded.
+    fn into_iter(self) -> Self::IntoIter {
         let batch = ManuallyDrop::new(self);
         // SAFETY: `batch` is not dropped, so this moves its raw guard exactly once.
         let raw = unsafe { core::ptr::read(&batch.raw) };
-        ReadBatchDrain { raw, next: 0 }
+        ReadBatchIntoIter { raw, next: 0 }
     }
 }
 
@@ -1207,12 +1213,12 @@ impl<T> Drop for ReadBatch<'_, T> {
 /// This iterator keeps the complete batch reservation held until it is
 /// dropped. Dropping it before exhaustion drops the unconsumed suffix before
 /// releasing the reservation.
-pub struct ReadBatchDrain<'a, T> {
+pub struct ReadBatchIntoIter<'a, T> {
     raw: RawReadBatch<'a, T>,
     next: usize,
 }
 
-impl<T> Iterator for ReadBatchDrain<'_, T> {
+impl<T> Iterator for ReadBatchIntoIter<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1232,10 +1238,10 @@ impl<T> Iterator for ReadBatchDrain<'_, T> {
     }
 }
 
-impl<T> ExactSizeIterator for ReadBatchDrain<'_, T> {}
-impl<T> FusedIterator for ReadBatchDrain<'_, T> {}
+impl<T> ExactSizeIterator for ReadBatchIntoIter<'_, T> {}
+impl<T> FusedIterator for ReadBatchIntoIter<'_, T> {}
 
-impl<T> Drop for ReadBatchDrain<'_, T> {
+impl<T> Drop for ReadBatchIntoIter<'_, T> {
     fn drop(&mut self) {
         if !core::mem::needs_drop::<T>() {
             return;
@@ -1505,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn read_batch_drain_drop_drops_only_unconsumed_values() {
+    fn read_batch_into_iter_drop_drops_only_unconsumed_values() {
         for create_queue in test_queue_creators::<CountedItem>() {
             let drops = Arc::new(AtomicUsize::new(0));
             let (producer, consumer) = create_queue(4);
@@ -1516,15 +1522,15 @@ mod tests {
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
                 .expect("read batch");
-            let mut drain = batch.drain();
-            assert_eq!(drain.len(), 3);
-            let first = drain.next().expect("first value");
+            let mut iter = batch.into_iter();
+            assert_eq!(iter.len(), 3);
+            let first = iter.next().expect("first value");
             assert_eq!(first.value, 0);
-            assert_eq!(drain.len(), 2);
+            assert_eq!(iter.len(), 2);
             drop(first);
             assert_eq!(drops.load(Ordering::Relaxed), 1);
 
-            drop(drain);
+            drop(iter);
             assert_eq!(drops.load(Ordering::Relaxed), 3);
             assert!(consumer.try_read().is_none());
             for value in 3..7 {
@@ -1538,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_read_batch_supports_wrapped_random_access_and_drain() {
+    fn copy_read_batch_supports_wrapped_random_access_and_into_iter() {
         for create_queue in test_queue_creators::<Item>() {
             let (producer, consumer) = create_queue(4);
             assert!(producer.try_write_slice(&[0, 1, 2]));
@@ -1553,7 +1559,11 @@ mod tests {
             assert_eq!(batch.get_owned(0), Some(2));
             assert_eq!(batch.get_owned(3), Some(5));
             assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
-            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+            let mut values = Vec::new();
+            for value in batch {
+                values.push(value);
+            }
+            assert_eq!(values, vec![2, 3, 4, 5]);
         }
     }
 
