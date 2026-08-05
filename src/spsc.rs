@@ -9,7 +9,7 @@ use core::{
     iter::FusedIterator,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
-    ops::Index,
+    ops::{Index, Range},
     ptr::NonNull,
 };
 use std::{
@@ -564,16 +564,50 @@ impl<'a, T> ReadBatch<'a, T> {
     /// Iterates over shared references without consuming any values.
     ///
     /// The batch reservation remains held for the iterator's lifetime.
-    pub fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + FusedIterator + '_ {
-        (0..self.len()).map(|index| {
-            // SAFETY: The safe batch has not moved out any values, and the
-            // range only produces indices within the reservation.
-            unsafe { self.reservation.get_unchecked(index) }
-        })
+    pub fn iter(&self) -> ReadBatchIter<'_, 'a, T> {
+        self.into_iter()
     }
 }
+
+impl<'batch, 'queue, T> IntoIterator for &'batch ReadBatch<'queue, T> {
+    type Item = &'batch T;
+    type IntoIter = ReadBatchIter<'batch, 'queue, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ReadBatchIter {
+            batch: self,
+            range: 0..self.len(),
+        }
+    }
+}
+
+/// An iterator over shared references to the values in a read batch.
+#[must_use]
+pub struct ReadBatchIter<'batch, 'queue, T> {
+    batch: &'batch ReadBatch<'queue, T>,
+    range: Range<usize>,
+}
+
+impl<'batch, T> Iterator for ReadBatchIter<'batch, '_, T> {
+    type Item = &'batch T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.batch.get(self.range.next()?)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+
+impl<T> DoubleEndedIterator for ReadBatchIter<'_, '_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.batch.get(self.range.next_back()?)
+    }
+}
+
+impl<T> ExactSizeIterator for ReadBatchIter<'_, '_, T> {}
+impl<T> FusedIterator for ReadBatchIter<'_, '_, T> {}
 
 impl<'a, T> IntoIterator for ReadBatch<'a, T> {
     type Item = T;
@@ -1226,6 +1260,11 @@ mod tests {
                 assert_eq!(batch.get_owned(1), Some(1));
                 assert_eq!(batch.get(2), None);
                 assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+                let mut borrowed = Vec::new();
+                for value in &batch {
+                    borrowed.push(*value);
+                }
+                assert_eq!(borrowed, vec![0, 1]);
                 assert!(producer.try_write(4).is_err());
             }
 
