@@ -2622,9 +2622,8 @@ mod tests {
             let metadata = broadcast
                 .lane_metadata(producer.index())
                 .expect("owned lane has metadata");
-            let producer_id = metadata.producer_id();
 
-            assert_eq!(producer_id, producer_id);
+            assert_eq!(producer_id, metadata.producer_id());
         }
     }
 
