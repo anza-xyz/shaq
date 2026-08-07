@@ -335,6 +335,32 @@ impl ProducerId {
     }
 }
 
+#[derive(Clone, Copy)]
+struct UnverifiedLane;
+#[derive(Clone, Copy)]
+struct InitializedLane;
+
+#[derive(Clone, Copy)]
+struct LaneIndex<State> {
+    index: usize,
+    _state: PhantomData<State>,
+}
+
+impl LaneIndex<UnverifiedLane> {
+    fn new(index: usize) -> Self {
+        Self {
+            index,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl<State> LaneIndex<State> {
+    fn get(self) -> usize {
+        self.index
+    }
+}
+
 /// Shared header at the start of the region. The producer-lane cursors and the
 /// per-consumer reserve limits live in the lane blocks; consumer-index ownership
 /// and the blocked-consumer wake state are global.
@@ -660,7 +686,7 @@ impl SharedQueue {
         if lane_index >= self.producer_slots() {
             return None;
         }
-        LaneMetadata::try_new(self.lane_header(lane_index), lane_index)
+        LaneMetadata::try_new(self.lane_header(lane_index), LaneIndex::new(lane_index))
     }
 
     /// Claims a free producer lane, returning its index.
@@ -1029,12 +1055,29 @@ impl<T: Copy> Drop for WriteBatch<'_, T> {
 /// [`ConsumerCore::advance`] for the lane.
 #[derive(Clone, Copy)]
 struct ReadableLane {
-    lane: usize,
+    lane: LaneIndex<InitializedLane>,
     sequence: usize,
     published: usize,
 }
 
 impl ReadableLane {
+    /// Builds a readable lane from the publication load that proved the lane
+    /// has an initialized, published value at `sequence`.
+    fn try_new(lane: LaneIndex<UnverifiedLane>, sequence: usize, published: usize) -> Option<Self> {
+        if published <= sequence {
+            return None;
+        }
+
+        Some(Self {
+            lane: LaneIndex {
+                index: lane.get(),
+                _state: PhantomData,
+            },
+            sequence,
+            published,
+        })
+    }
+
     /// Number of consecutive published values to read starting at `sequence`,
     /// bounded by `max`.
     fn count(&self, max: NonZeroUsize) -> NonZeroUsize {
@@ -1141,8 +1184,8 @@ impl ConsumerCore {
 
     /// Returns metadata for a lane containing a published value.
     #[inline]
-    fn metadata(&self, lane_index: usize) -> LaneMetadata<'_> {
-        self.lane(lane_index).published_metadata(lane_index)
+    fn metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
+        self.lane(lane.get()).metadata(lane)
     }
 
     #[inline]
@@ -1178,13 +1221,12 @@ impl ConsumerCore {
         for _ in 0..producer_slots {
             let sequence = self.next_for_lane(lane);
             let published = self.lane(lane).published();
-            // Cursor wrap is not supported - simple comparison works here.
-            if published > sequence {
-                return Some(ReadableLane {
-                    lane,
-                    sequence,
-                    published,
-                });
+            // Cursor wrap is not supported - simple comparison works here. An
+            // observed publication also proves that lane acquisition completed.
+            let lane_index = LaneIndex::new(lane);
+
+            if let Some(readable) = ReadableLane::try_new(lane_index, sequence, published) {
+                return Some(readable);
             }
             lane = lane.wrapping_add(1);
             if lane == producer_slots {
@@ -1196,21 +1238,23 @@ impl ConsumerCore {
 
     /// Pointer to the published cell at `readable`'s next unread sequence.
     fn payload_ptr(&self, readable: ReadableLane) -> NonNull<u8> {
-        self.lane(readable.lane).payload_ptr(readable.sequence)
+        self.lane(readable.lane.get())
+            .payload_ptr(readable.sequence)
     }
 
     /// Advances this consumer's cursor on `lane` by `count` consumed values,
     /// publishing the progress and rotating the scan start. The consumer is the
     /// sole reader of its own cursor (`&mut self`), so the cursor only moves here
     /// and advancing is a plain increment.
-    fn advance(&mut self, lane: usize, count: NonZeroUsize) {
-        let next = self.next_for_lane(lane).wrapping_add(count.get());
-        self.set_next_for_lane(lane, next);
-        self.lane(lane)
+    fn advance(&mut self, lane: LaneIndex<InitializedLane>, count: NonZeroUsize) {
+        let lane_index = lane.get();
+        let next = self.next_for_lane(lane_index).wrapping_add(count.get());
+        self.set_next_for_lane(lane_index, next);
+        self.lane(lane_index)
             .consumer_state()
             .set_cursor(self.index, next);
         // `lane < producer_slots`, so the wrap is a conditional subtract.
-        let mut scan_start_lane = lane.wrapping_add(1);
+        let mut scan_start_lane = lane_index.wrapping_add(1);
         if scan_start_lane == self.queue.producer_slots() {
             scan_start_lane = 0;
         }
@@ -1434,7 +1478,7 @@ unsafe impl<T: Copy + Send> Send for Consumer<T> {}
 #[must_use]
 pub struct ReadGuard<'a, T: Copy> {
     consumer: &'a mut ConsumerCore,
-    lane: usize,
+    lane: LaneIndex<InitializedLane>,
     payload: NonNull<T>,
 }
 
@@ -1471,7 +1515,7 @@ impl<T: Copy> Drop for ReadGuard<'_, T> {
 #[must_use]
 pub struct ReadBatch<'a, T: Copy> {
     consumer: &'a mut ConsumerCore,
-    lane: usize,
+    lane: LaneIndex<InitializedLane>,
     start: usize,
     count: NonZeroUsize,
     _marker: PhantomData<T>,
@@ -1497,7 +1541,7 @@ impl<T: Copy> ReadBatch<'_, T> {
         T: Sync,
     {
         debug_assert!(index < self.count.get());
-        let ptr = self.consumer.lanes[self.lane]
+        let ptr = self.consumer.lanes[self.lane.get()]
             .payload_ptr(self.start.wrapping_add(index))
             .cast();
         // SAFETY: the cell is published and held by this consumer's
@@ -1511,7 +1555,7 @@ impl<T: Copy> ReadBatch<'_, T> {
     /// - `index < len`
     pub unsafe fn read(&self, index: usize) -> T {
         debug_assert!(index < self.count.get());
-        let ptr = self.consumer.lanes[self.lane]
+        let ptr = self.consumer.lanes[self.lane.get()]
             .payload_ptr(self.start.wrapping_add(index))
             .cast();
         // SAFETY: the cell is published and held by this consumer's
@@ -1527,7 +1571,7 @@ impl<T: Copy> ReadBatch<'_, T> {
     where
         T: Sync,
     {
-        let lane = self.consumer.lane(self.lane);
+        let lane = self.consumer.lane(self.lane.get());
         let start = lane.mask(self.start);
         let first_len = self.len().min(lane.capacity().wrapping_sub(start));
         let second_len = self.len().wrapping_sub(first_len);
@@ -1729,7 +1773,7 @@ unsafe impl Send for SliceConsumer {}
 #[must_use]
 pub struct SliceReadGuard<'a> {
     consumer: &'a mut ConsumerCore,
-    lane: usize,
+    lane: LaneIndex<InitializedLane>,
     payload: NonNull<u8>,
     len: usize,
 }
@@ -1773,7 +1817,7 @@ impl Drop for SliceReadGuard<'_> {
 #[must_use]
 pub struct SliceReadBatch<'a> {
     consumer: &'a mut ConsumerCore,
-    lane: usize,
+    lane: LaneIndex<InitializedLane>,
     start: usize,
     count: NonZeroUsize,
     payload_size: usize,
@@ -1803,7 +1847,7 @@ impl SliceReadBatch<'_> {
         debug_assert!(index < self.count.get());
         let payload = self
             .consumer
-            .lane(self.lane)
+            .lane(self.lane.get())
             .payload_ptr(self.start.wrapping_add(index));
         let payload = NonNull::slice_from_raw_parts(payload, self.payload_size);
         // SAFETY: forwarded; the cell is published and held by this consumer's

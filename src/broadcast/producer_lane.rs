@@ -7,8 +7,9 @@ use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicU64, Ordering};
+use std::marker::PhantomData;
 
-use crate::broadcast::ProducerId;
+use crate::broadcast::{InitializedLane, LaneIndex, ProducerId, UnverifiedLane};
 use crate::CacheAlignedAtomicSize;
 
 use super::consumer_state::LaneConsumerState;
@@ -59,12 +60,12 @@ pub(crate) struct ProducerLane {
 #[derive(Clone, Copy)]
 pub struct LaneMetadata<'a> {
     header: &'a LaneHeader,
-    lane: usize,
+    lane: LaneIndex<InitializedLane>,
 }
 
 impl<'a> LaneMetadata<'a> {
     /// Builds a metadata view if the lane has completed acquisition.
-    pub(super) fn try_new(header: &'a LaneHeader, lane: usize) -> Option<Self> {
+    pub(super) fn try_new(header: &'a LaneHeader, lane: LaneIndex<UnverifiedLane>) -> Option<Self> {
         let state = header.state.load(Ordering::Acquire);
 
         let lane_is_acquired = matches!(state, LANE_ACTIVE | LANE_RETIRED);
@@ -72,18 +73,27 @@ impl<'a> LaneMetadata<'a> {
             return None;
         }
 
-        Some(Self::new(header, lane))
+        Some(Self {
+            header,
+            lane: LaneIndex {
+                index: lane.get(),
+                _state: PhantomData,
+            },
+        })
     }
 
     /// Builds a metadata view over a borrowed lane header.
-    fn new(header: &'a LaneHeader, lane: usize) -> Self {
+    pub(super) fn from_initialized_lane(
+        header: &'a LaneHeader,
+        lane: LaneIndex<InitializedLane>,
+    ) -> Self {
         Self { header, lane }
     }
 
     /// The index of this producer lane.
     #[inline]
     pub fn lane(&self) -> usize {
-        self.lane
+        self.lane.get()
     }
 
     /// The advisory [`ProducerId`] currently associated with this lane.
@@ -205,8 +215,8 @@ impl ProducerLane {
 
     /// Returns borrowed metadata for this lane.
     #[inline]
-    pub(crate) fn published_metadata(&self, lane: usize) -> LaneMetadata<'_> {
-        LaneMetadata::new(self.header(), lane)
+    pub(crate) fn metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
+        LaneMetadata::from_initialized_lane(self.header(), lane)
     }
 
     #[inline]
@@ -365,7 +375,7 @@ mod tests {
     }
 
     fn metadata(lane: &ProducerLane) -> LaneMetadata<'_> {
-        LaneMetadata::try_new(lane.header(), 0).expect("lane is active or retired")
+        LaneMetadata::try_new(lane.header(), LaneIndex::new(0)).expect("lane is active or retired")
     }
 
     /// Reserves, writes, and publishes one value; `false` on backpressure.
@@ -399,7 +409,7 @@ mod tests {
     fn never_owned_lane_has_not_completed_acquisition() {
         let (_region, lane) = lane(4, 1);
 
-        let metadata = LaneMetadata::try_new(lane.header(), 0);
+        let metadata = LaneMetadata::try_new(lane.header(), LaneIndex::new(0));
 
         assert!(metadata.is_none());
     }
@@ -419,7 +429,7 @@ mod tests {
             .expect("lane is free");
         header.producer_id.store(42, Ordering::Relaxed);
 
-        let metadata = LaneMetadata::try_new(lane.header(), 0);
+        let metadata = LaneMetadata::try_new(lane.header(), LaneIndex::new(0));
 
         assert!(metadata.is_none());
     }
