@@ -1184,7 +1184,7 @@ impl ConsumerCore {
 
     /// Returns metadata for a lane containing a published value.
     #[inline]
-    fn metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
+    fn lane_metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
         self.lane(lane.get()).metadata(lane)
     }
 
@@ -1484,8 +1484,8 @@ pub struct ReadGuard<'a, T: Copy> {
 
 impl<T: Copy> ReadGuard<'_, T> {
     /// Metadata for the producer lane this value was published on.
-    pub fn metadata(&self) -> LaneMetadata<'_> {
-        self.consumer.metadata(self.lane)
+    pub fn lane_metadata(&self) -> LaneMetadata<'_> {
+        self.consumer.lane_metadata(self.lane)
     }
 
     /// Copies the value out; the guard advances past it on drop.
@@ -1523,8 +1523,8 @@ pub struct ReadBatch<'a, T: Copy> {
 
 impl<T: Copy> ReadBatch<'_, T> {
     /// Metadata for the producer lane every value in this batch was published on.
-    pub fn metadata(&self) -> LaneMetadata<'_> {
-        self.consumer.metadata(self.lane)
+    pub fn lane_metadata(&self) -> LaneMetadata<'_> {
+        self.consumer.lane_metadata(self.lane)
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -1780,8 +1780,8 @@ pub struct SliceReadGuard<'a> {
 
 impl SliceReadGuard<'_> {
     /// Metadata for the producer lane this payload was published on.
-    pub fn metadata(&self) -> LaneMetadata<'_> {
-        self.consumer.metadata(self.lane)
+    pub fn lane_metadata(&self) -> LaneMetadata<'_> {
+        self.consumer.lane_metadata(self.lane)
     }
 
     /// Byte length of the payload.
@@ -1825,8 +1825,8 @@ pub struct SliceReadBatch<'a> {
 
 impl SliceReadBatch<'_> {
     /// Metadata for the producer lane every payload in this batch was published on.
-    pub fn metadata(&self) -> LaneMetadata<'_> {
-        self.consumer.metadata(self.lane)
+    pub fn lane_metadata(&self) -> LaneMetadata<'_> {
+        self.consumer.lane_metadata(self.lane)
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -2762,7 +2762,7 @@ mod tests {
             publishing_producer.try_write(7).expect("ring has capacity");
 
             let guard = consumer.try_reserve_read().expect("readable");
-            let source_lane = guard.metadata().lane();
+            let source_lane = guard.lane_metadata().lane();
             drop(guard);
 
             assert_eq!(source_lane, publishing_producer.index());
@@ -2786,7 +2786,7 @@ mod tests {
             publishing_producer.try_write(7).expect("ring has capacity");
 
             let guard = consumer.try_reserve_read().expect("readable");
-            let source_producer_id = guard.metadata().producer_id();
+            let source_producer_id = guard.lane_metadata().producer_id();
             drop(guard);
 
             assert_eq!(source_producer_id, publishing_producer.producer_id());
@@ -2922,7 +2922,7 @@ mod tests {
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
                 .expect("readable batch");
-            let source_lane = batch.metadata().lane();
+            let source_lane = batch.lane_metadata().lane();
             drop(batch);
 
             assert_eq!(source_lane, publishing_producer.index());
@@ -2948,7 +2948,7 @@ mod tests {
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
                 .expect("readable batch");
-            let source_producer_id = batch.metadata().producer_id();
+            let source_producer_id = batch.lane_metadata().producer_id();
             drop(batch);
 
             assert_eq!(source_producer_id, publishing_producer.producer_id());
@@ -2989,7 +2989,7 @@ mod tests {
         producer.try_write(1).expect("ring has capacity");
 
         let guard = consumer.try_read().expect("readable");
-        let source_lane = guard.metadata().lane();
+        let source_lane = guard.lane_metadata().lane();
         drop(guard);
 
         assert_eq!(source_lane, producer.index());
@@ -3010,7 +3010,7 @@ mod tests {
         producer.try_write(1).expect("ring has capacity");
 
         let guard = consumer.try_read().expect("readable");
-        let source_producer_id = guard.metadata().producer_id();
+        let source_producer_id = guard.lane_metadata().producer_id();
         drop(guard);
 
         assert_eq!(source_producer_id, producer.producer_id());
@@ -3033,7 +3033,7 @@ mod tests {
         let batch = consumer
             .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
             .expect("readable batch");
-        let source_lane = batch.metadata().lane();
+        let source_lane = batch.lane_metadata().lane();
         drop(batch);
 
         assert_eq!(source_lane, producer.index());
@@ -3056,7 +3056,7 @@ mod tests {
         let batch = consumer
             .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
             .expect("readable batch");
-        let source_producer_id = batch.metadata().producer_id();
+        let source_producer_id = batch.lane_metadata().producer_id();
         drop(batch);
 
         assert_eq!(source_producer_id, producer.producer_id());
