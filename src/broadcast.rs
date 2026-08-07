@@ -35,7 +35,9 @@
 //! and a rejected-items counter (events refused by backpressure). A read guard
 //! exposes the publishing lane's metadata via [`ReadGuard::metadata`]. To
 //! poll metadata by lane index, borrow [`LaneMetadata`] with
-//! [`Broadcast::lane_metadata`].
+//! [`Broadcast::lane_metadata`]. Producer attribution is best-effort: the ID is
+//! read from the lane when metadata is queried rather than stored with each
+//! payload. Callers should not use it for correctness decisions.
 //!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
 //! [`Drop`] and therefore does not require a destructor when a cell is
@@ -328,7 +330,7 @@ impl ProducerId {
         Self(id)
     }
 
-    pub fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
@@ -1137,15 +1139,10 @@ impl ConsumerCore {
         self.queue.payload.size()
     }
 
-    /// Returns metadata for a lane whose publication has been acquired.
-    ///
-    /// # Safety
-    /// - `lane_index` must identify the lane of a [`ReadableLane`] returned by
-    ///   this consumer. Its publication acquire makes the producer id visible.
+    /// Returns metadata for a lane containing a published value.
     #[inline]
-    unsafe fn metadata(&self, lane_index: usize) -> LaneMetadata<'_> {
-        // SAFETY: forwarded from the caller.
-        unsafe { self.lane(lane_index).published_metadata(lane_index) }
+    fn metadata(&self, lane_index: usize) -> LaneMetadata<'_> {
+        self.lane(lane_index).published_metadata(lane_index)
     }
 
     #[inline]
@@ -1444,9 +1441,7 @@ pub struct ReadGuard<'a, T: Copy> {
 impl<T: Copy> ReadGuard<'_, T> {
     /// Metadata for the producer lane this value was published on.
     pub fn metadata(&self) -> LaneMetadata<'_> {
-        // SAFETY: guards are only built from `ReadableLane`, whose publication
-        // was observed with an acquire load.
-        unsafe { self.consumer.metadata(self.lane) }
+        self.consumer.metadata(self.lane)
     }
 
     /// Copies the value out; the guard advances past it on drop.
@@ -1485,9 +1480,7 @@ pub struct ReadBatch<'a, T: Copy> {
 impl<T: Copy> ReadBatch<'_, T> {
     /// Metadata for the producer lane every value in this batch was published on.
     pub fn metadata(&self) -> LaneMetadata<'_> {
-        // SAFETY: batches are only built from `ReadableLane`, whose publication
-        // was observed with an acquire load.
-        unsafe { self.consumer.metadata(self.lane) }
+        self.consumer.metadata(self.lane)
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -1744,9 +1737,7 @@ pub struct SliceReadGuard<'a> {
 impl SliceReadGuard<'_> {
     /// Metadata for the producer lane this payload was published on.
     pub fn metadata(&self) -> LaneMetadata<'_> {
-        // SAFETY: guards are only built from `ReadableLane`, whose publication
-        // was observed with an acquire load.
-        unsafe { self.consumer.metadata(self.lane) }
+        self.consumer.metadata(self.lane)
     }
 
     /// Byte length of the payload.
@@ -1791,9 +1782,7 @@ pub struct SliceReadBatch<'a> {
 impl SliceReadBatch<'_> {
     /// Metadata for the producer lane every payload in this batch was published on.
     pub fn metadata(&self) -> LaneMetadata<'_> {
-        // SAFETY: batches are only built from `ReadableLane`, whose publication
-        // was observed with an acquire load.
-        unsafe { self.consumer.metadata(self.lane) }
+        self.consumer.metadata(self.lane)
     }
 
     #[allow(clippy::len_without_is_empty)]

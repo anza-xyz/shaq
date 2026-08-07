@@ -3,7 +3,6 @@
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
 use core::alloc::Layout;
-use core::cell::UnsafeCell;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -19,48 +18,13 @@ const LANE_CLAIMING: u64 = 1;
 const LANE_ACTIVE: u64 = 2;
 const LANE_RETIRED: u64 = 3;
 
-#[repr(transparent)]
-struct WriteOnceProducerId(UnsafeCell<u64>);
-
-impl WriteOnceProducerId {
-    const fn new() -> Self {
-        Self(UnsafeCell::new(0))
-    }
-
-    /// Installs the id for a lane that this caller exclusively holds in the
-    /// `LANE_CLAIMING` state.
-    ///
-    /// # Safety
-    /// This must be called exactly once, before the lane is published as active.
-    unsafe fn initialize(&self, producer_id: ProducerId) {
-        // SAFETY: upheld by the caller's exclusive ownership of `LANE_CLAIMING`.
-        unsafe { self.0.get().write(producer_id.get()) };
-    }
-
-    /// Reads an id whose initialization has been acquired through lane state or
-    /// message publication.
-    ///
-    /// # Safety
-    /// The caller must have performed the matching acquire operation.
-    unsafe fn get(&self) -> ProducerId {
-        // SAFETY: the caller guarantees initialization is visible and the value
-        // is never modified after the lane becomes active.
-        ProducerId::new(unsafe { *self.0.get() })
-    }
-}
-
-// SAFETY: exactly one producer writes the value while it exclusively owns the
-// `LANE_CLAIMING` state. Readers synchronize through the release/acquire lane
-// state or publication protocol, after which the value never changes.
-unsafe impl Sync for WriteOnceProducerId {}
-
 /// Fixed-size head of a producer-lane block.
 #[repr(C)]
 pub(super) struct LaneHeader {
     /// Lane ownership: `LANE_FREE`, `LANE_CLAIMING`, `LANE_ACTIVE`, or `LANE_RETIRED`.
     state: AtomicU64,
     /// Supplied [`ProducerId`], meaningful once the lane is active or retired.
-    producer_id: WriteOnceProducerId,
+    producer_id: AtomicU64,
     /// Count of messages refused by backpressure.
     rejected_items: AtomicU64,
     /// Claimed-up-to sequence: advanced before a ring cell is written.
@@ -91,9 +55,7 @@ pub(crate) struct ProducerLane {
 
 /// A borrowed view of one producer lane's metadata.
 ///
-/// The lane index and producer id are fixed; the rejected-items counter may
-/// continue to change. The view cannot outlive the broadcast mapping from which
-/// it was obtained.
+/// The view cannot outlive the broadcast mapping from which it was obtained.
 #[derive(Clone, Copy)]
 pub struct LaneMetadata<'a> {
     header: &'a LaneHeader,
@@ -110,15 +72,11 @@ impl<'a> LaneMetadata<'a> {
             return None;
         }
 
-        Some(Self { header, lane })
+        Some(Self::new(header, lane))
     }
 
-    /// Builds a metadata view for a lane whose publication has been acquired.
-    ///
-    /// # Safety
-    /// The caller must have observed a published message from this lane with an
-    /// acquire operation. Producer-id initialization precedes every publication.
-    unsafe fn new_published(header: &'a LaneHeader, lane: usize) -> Self {
+    /// Builds a metadata view over a borrowed lane header.
+    fn new(header: &'a LaneHeader, lane: usize) -> Self {
         Self { header, lane }
     }
 
@@ -128,12 +86,10 @@ impl<'a> LaneMetadata<'a> {
         self.lane
     }
 
-    /// The [`ProducerId`] of the producer owning this lane.
+    /// The advisory [`ProducerId`] currently associated with this lane.
     #[inline]
     pub fn producer_id(&self) -> ProducerId {
-        // SAFETY: both constructors require an acquire operation that observes
-        // initialization, and a lane's producer id never changes afterward.
-        unsafe { self.header.producer_id.get() }
+        ProducerId::new(self.header.producer_id.load(Ordering::Relaxed))
     }
 
     /// Count of messages refused by backpressure on this lane.
@@ -196,7 +152,7 @@ impl ProducerLane {
     pub(crate) unsafe fn init(block: NonNull<u8>, consumer_slots: usize) {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
-            producer_id: WriteOnceProducerId::new(),
+            producer_id: AtomicU64::new(0),
             rejected_items: AtomicU64::new(0),
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
@@ -247,15 +203,10 @@ impl ProducerLane {
         }
     }
 
-    /// Returns borrowed metadata for a lane whose publication has been acquired.
-    ///
-    /// # Safety
-    /// The caller must have observed a published message from this lane with an
-    /// acquire operation.
+    /// Returns borrowed metadata for this lane.
     #[inline]
-    pub(crate) unsafe fn published_metadata(&self, lane: usize) -> LaneMetadata<'_> {
-        // SAFETY: forwarded from the caller.
-        unsafe { LaneMetadata::new_published(self.header(), lane) }
+    pub(crate) fn published_metadata(&self, lane: usize) -> LaneMetadata<'_> {
+        LaneMetadata::new(self.header(), lane)
     }
 
     #[inline]
@@ -304,9 +255,9 @@ impl ProducerLane {
             return false;
         }
 
-        // SAFETY: the successful transition from free to claiming gives this
-        // producer exclusive initialization rights, and lanes are never reused.
-        unsafe { self.header().producer_id.initialize(producer_id) };
+        self.header()
+            .producer_id
+            .store(producer_id.get(), Ordering::Relaxed);
 
         self.header().state.store(LANE_ACTIVE, Ordering::Release);
 
@@ -466,10 +417,7 @@ mod tests {
                 Ordering::Acquire,
             )
             .expect("lane is free");
-        // SAFETY: this test exclusively owns the lane in `LANE_CLAIMING`.
-        unsafe {
-            header.producer_id.initialize(ProducerId::new(42));
-        }
+        header.producer_id.store(42, Ordering::Relaxed);
 
         let metadata = LaneMetadata::try_new(lane.header(), 0);
 
