@@ -1,6 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: cargo
+    versioning-strategy: lockfile-only
     directories:
       - "/"
     schedule:
