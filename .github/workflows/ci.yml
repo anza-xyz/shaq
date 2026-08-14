@@ -39,23 +39,23 @@ jobs:
 
       - name: Clippy lint
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check documentation
         if: matrix.os == 'ubuntu-latest'
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --locked --workspace --all-features --no-deps
 
       - name: Build release
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Cargo check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
   minimal-versions:
     name: Check minimal-versions
