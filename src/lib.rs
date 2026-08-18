@@ -12,7 +12,8 @@ pub mod spsc;
 
 pub(crate) const VERSION_MAJOR: u16 = 3;
 pub(crate) const VERSION_PATCH: u16 = 0;
-pub(crate) const VERSION: u32 = (VERSION_MAJOR as u32) << 16 | VERSION_PATCH as u32;
+/// Packed shared-memory ABI version.
+pub const VERSION: u32 = (VERSION_MAJOR as u32) << 16 | VERSION_PATCH as u32;
 
 pub(crate) const fn normalized_capacity(capacity: usize) -> usize {
     if capacity == 0 {
