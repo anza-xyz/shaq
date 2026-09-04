@@ -13,12 +13,15 @@ edition = "2021"
 libc = { version = "0.2.180" }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Memory",
-] }
+windows-sys = {
+    version = "0.61",
+    features = [
+        "Win32_Foundation",
+        "Win32_Security",
+        "Win32_Storage_FileSystem",
+        "Win32_System_Memory",
+    ]
+}
 
 [dev-dependencies]
 core_affinity = "0.8.3"
