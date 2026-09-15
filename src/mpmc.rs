@@ -1,9 +1,9 @@
 //! DPDK-style bounded MPMC ring queue
 
 use crate::{
+    checked_queue_size,
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
-    normalized_capacity,
     shmem::Region,
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
 };
@@ -516,14 +516,46 @@ unsafe impl<T: Send> Sync for Consumer<T> {}
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
 /// page-size requirements.
+///
+/// # Panics
+/// Panics if capacity normalization or byte-size arithmetic overflows.
+/// Use [`try_minimum_file_size`] to handle overflow as an error.
 pub const fn minimum_file_size<T>(capacity: usize) -> usize {
-    let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
-    buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
+    checked_queue_size(
+        capacity,
+        core::mem::size_of::<T>(),
+        SharedQueueHeader::buffer_offset::<T>(),
+    )
+    .expect("queue size overflow")
 }
 
-/// Calculates the minimum region size required for a queue with given capacity.
+/// Equivalent to [`minimum_file_size`], including its overflow panic behavior.
 pub const fn minimum_region_size<T>(capacity: usize) -> usize {
     minimum_file_size::<T>(capacity)
+}
+
+/// Calculates the minimum file size using checked arithmetic.
+///
+/// Nonzero capacities round up to a power of two; zero returns the header size.
+/// Page-size rounding remains the caller's responsibility.
+///
+/// # Errors
+/// Returns [`Error::InvalidBufferSize`] on arithmetic overflow. Success does not
+/// guarantee a supported queue capacity or available memory.
+pub const fn try_minimum_file_size<T>(capacity: usize) -> Result<usize, Error> {
+    match checked_queue_size(
+        capacity,
+        core::mem::size_of::<T>(),
+        SharedQueueHeader::buffer_offset::<T>(),
+    ) {
+        Some(size) => Ok(size),
+        None => Err(Error::InvalidBufferSize),
+    }
+}
+
+/// Equivalent to [`try_minimum_file_size`], including its normalization and errors.
+pub const fn try_minimum_region_size<T>(capacity: usize) -> Result<usize, Error> {
+    try_minimum_file_size::<T>(capacity)
 }
 
 /// Creates a new in-process MPMC queue pair backed by a heap allocation.
@@ -531,7 +563,8 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 /// Buffered values are dropped with the last endpoint. Values held by
 /// forgotten reservations may be leaked.
 pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
-    let region_size = minimum_region_size::<T>(capacity);
+    let region_size = try_minimum_region_size::<T>(capacity)?;
+    SharedQueueHeader::calculate_buffer_size_in_items::<T>(region_size)?;
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
     let header =
@@ -771,6 +804,7 @@ impl SharedQueueHeader {
         size: usize,
         identifier: u64,
     ) -> Result<(Arc<Region>, NonNull<Self>), Error> {
+        Self::calculate_buffer_size_in_items::<T>(size)?;
         file.set_len(size as u64)?;
 
         let region = Region::map_file(file, size)?;
@@ -825,14 +859,12 @@ impl SharedQueueHeader {
 
         // The buffer size (in units of T) must be a power of two.
         let buffer_size_in_bytes = file_size - buffer_offset;
-        let mut buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
-        if !buffer_size_in_items.is_power_of_two() {
-            // If not a power of two, round down to the previous power of two.
-            buffer_size_in_items = buffer_size_in_items.next_power_of_two() >> 1;
-            if buffer_size_in_items == 0 {
-                return Err(Error::InvalidBufferSize);
-            }
+        let buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
+        if buffer_size_in_items == 0 {
+            return Err(Error::InvalidBufferSize);
         }
+        // Round down without first rounding up, which can overflow.
+        let buffer_size_in_items = buffer_size_in_items.isolate_highest_one();
 
         // The buffer mask is stored as u32, so the capacity must fit.
         if buffer_size_in_items > u32::MAX as usize + 1 {
@@ -870,6 +902,7 @@ impl SharedQueueHeader {
 
     fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
+        Self::calculate_buffer_size_in_items::<T>(file_size)?;
         let region = Region::map_file(file, file_size)?;
         let header = Self::join_region::<T>(&region)?;
         Ok((region, header))
@@ -1391,6 +1424,24 @@ mod tests {
 
     type CreateQueue<T> = fn(usize) -> (Producer<T>, Consumer<T>);
 
+    #[cfg(not(miri))]
+    #[test]
+    fn invalid_file_sizes_are_rejected_before_io() {
+        let file = create_temp_shmem_file().unwrap();
+        let offset = SharedQueueHeader::buffer_offset::<u8>();
+        for size in [0, offset - 1, offset, usize::MAX] {
+            // SAFETY: this is a fresh file with no other users.
+            let result = unsafe { Producer::<u8>::create(&file, size) };
+            assert!(matches!(result, Err(Error::InvalidBufferSize)));
+            assert_eq!(file.metadata().unwrap().len(), 0);
+        }
+        file.set_len(offset as u64).unwrap();
+        assert!(matches!(
+            SharedQueueHeader::join::<u8>(&file),
+            Err(Error::InvalidBufferSize)
+        ));
+    }
+
     fn create_heap_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         pair(capacity).expect("failed to create heap-backed queue pair")
     }
@@ -1398,7 +1449,7 @@ mod tests {
     #[cfg(not(miri))]
     fn create_file_backed_test_queue<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         let file = create_temp_shmem_file().expect("failed to create temp file");
-        let file_size = minimum_file_size::<T>(capacity);
+        let file_size = try_minimum_file_size::<T>(capacity).expect("invalid queue size");
         // SAFETY: test-only; sole producer for a freshly created file.
         let producer =
             unsafe { Producer::create(&file, file_size) }.expect("failed to create producer");
