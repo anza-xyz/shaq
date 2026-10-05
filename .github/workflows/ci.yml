@@ -83,7 +83,7 @@ jobs:
           toolchain: nightly
 
       - name: Install minimal-version tools
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3  # v2.87.16
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0  # v2.87.22
         with:
           tool: cargo-hack,cargo-minimal-versions
 
