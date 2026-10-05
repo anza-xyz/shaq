@@ -20,8 +20,8 @@ fn broadcast() -> Broadcast<usize> {
     Broadcast::from_queue(queue)
 }
 
-// Tests the reservation-based double-sample join handshake. A racing consumer
-// must either start past earlier reservations or install a limit that prevents
+// Tests the publication-based double-sample join handshake. A racing consumer
+// must either start past earlier publications or install a limit that prevents
 // the producer from overwriting its unread cell, including while a guard is held.
 #[test]
 fn joining_consumer_protects_unread_cell() {
@@ -35,7 +35,7 @@ fn joining_consumer_protects_unread_cell() {
             let _ = producer.try_write(1);
         });
 
-        // Join while the producer can reserve or publish either value.
+        // Join while the producer can publish either value.
         let mut consumer = broadcast.consumer().unwrap();
         let next = consumer.core.next_for_lane(0);
         // If data is available, hold the guard until writing finishes.
@@ -44,18 +44,13 @@ fn joining_consumer_protects_unread_cell() {
         let guard = consumer.try_reserve_read();
         writer.join().unwrap();
 
-        // Joining must either skip earlier reservations or constrain the writer.
-        // Completing the writer makes these samples observe its final cursors.
+        // Joining must either skip earlier publications or constrain the writer.
+        // Completing the writer makes this sample observe its final cursor.
         let lane = broadcast.shared_queue.producer_lanes().next().unwrap();
-        let reserved = lane.reserved();
         let published = lane.published();
-        assert!(reserved >= next, "reservation precedes the join position");
+        assert!(published >= next, "publication precedes the join position");
         assert!(
-            reserved - next <= CAPACITY,
-            "producer reserved an unread cell"
-        );
-        assert!(
-            published <= next + CAPACITY,
+            published - next <= CAPACITY,
             "producer overwrote an unread cell"
         );
 
@@ -65,8 +60,8 @@ fn joining_consumer_protects_unread_cell() {
 }
 
 // Tests the release/acquire producer ownership handover. A replacement that
-// acquires a released lane must observe the previous owner's reservation and
-// publication cursors and respect a racing consumer's join limit. Ownership
+// acquires a released lane must observe the previous owner's publication
+// cursor and respect a racing consumer's join limit. Ownership
 // transfer must preserve the ordering required by the join handshake.
 #[test]
 fn replacement_producer_respects_joining_consumer() {
@@ -84,7 +79,6 @@ fn replacement_producer_respects_joining_consumer() {
             // Failure means the old owner is live. Successful acquisition must
             // observe its completed write before checking the consumer's limit.
             if let Ok(mut replacement) = replacement_broadcast.producer() {
-                assert_eq!(replacement.lane.reserved(), 1);
                 assert_eq!(replacement.lane.published(), 1);
                 // Refuse this write if the joining consumer pins the only cell.
                 if replacement.try_write(1).is_ok() {
@@ -101,11 +95,11 @@ fn replacement_producer_respects_joining_consumer() {
 
         // Neither owner may advance past the cell protected by the consumer.
         let lane = broadcast.shared_queue.producer_lanes().next().unwrap();
-        let reserved = lane.reserved();
-        assert!(reserved >= next, "reservation precedes the join position");
+        let published = lane.published();
+        assert!(published >= next, "publication precedes the join position");
         assert!(
-            reserved - next <= CAPACITY,
-            "replacement reserved an unread cell"
+            published - next <= CAPACITY,
+            "replacement overwrote an unread cell"
         );
         drop(guard);
     });

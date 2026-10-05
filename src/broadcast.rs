@@ -18,18 +18,19 @@
 //! [`WriteGuard`], or a [`WriteBatch`]; [`Consumer`] reads via
 //! [`Consumer::try_read`], a [`ReadGuard`], or a [`ReadBatch`], with blocking
 //! `*_timeout` variants that park on the queue's futex when idle. A consumer
-//! joins at each lane's reservation frontier, skipping values that were already
-//! reserved. After a crash, a consumer index can be taken over with
+//! joins at each lane's publication frontier, skipping values already published.
+//! Writes in progress are received if they publish after the join. After a
+//! crash, a consumer index can be taken over with
 //! [`Broadcast::recover_consumer`] or returned to the pool with
 //! [`Broadcast::force_release`]. A fully joined consumer
 //! resumes where the dead owner was; an interrupted join restarts at each
-//! lane's current reservation frontier.
+//! lane's current publication frontier.
 //!
 //! Dropping a producer releases its lane for reuse. A replacement continues
 //! from the lane's publication frontier, preserving unread values and consumer
 //! progress. A crashed producer's lane stays claimed; replacing it requires
-//! recreating the queue. A lane with an unpublished reservation (from a
-//! forgotten write guard) also stays claimed.
+//! recreating the queue. Unpublished writes leave the publication cursor
+//! unchanged, allowing a replacement to reuse their cells.
 //!
 //! Each lane carries metadata: its lane index and a counter of items rejected
 //! by backpressure over the lane's lifetime.
@@ -183,7 +184,7 @@ where
     /// **resumes where the dead owner left off** on each lane — its unread items
     /// are still pinned by its reserve limit, so they are delivered. If the
     /// owner died before joining every lane, recovery instead restarts every
-    /// lane at its current reservation frontier. To unconditionally restart
+    /// lane at its current publication frontier. To unconditionally restart
     /// fresh, [`force_release`](Self::force_release) the index and `join` it.
     ///
     /// # Safety
@@ -200,8 +201,8 @@ where
 
 impl Broadcast<UnknownType> {
     /// Joins an existing broadcast queue in `file` as an untyped consumer,
-    /// starting at each lane's reservation frontier. Values already reserved
-    /// are skipped, even if they have not yet been published.
+    /// starting at each lane's publication frontier. Values already published
+    /// are skipped; writes in progress are received if they publish after the join.
     ///
     /// Pinned to [`UnknownType`] rather than generic over the caller's choice
     /// of `T`: the queue's payload layout is never checked here (that's the
@@ -295,7 +296,7 @@ impl<T> Broadcast<T> {
     /// Takes over a consumer index whose owner died. A fully joined consumer
     /// resumes where the dead owner left off on each lane. If the owner died
     /// before joining every lane, recovery instead restarts every lane at its
-    /// current reservation frontier.
+    /// current publication frontier.
     ///
     /// # Safety
     /// - the consumer that owned `index` must be dead and no other live handle
@@ -727,7 +728,9 @@ impl SharedQueue {
 
     /// Bumps the wake counter and wakes blocked consumers, if any. Called after
     /// a publish (the lane cursor is already advanced); a no-op on the hot path
-    /// when nothing is blocked.
+    /// when nothing is blocked except for its unconditional SeqCst fence. That
+    /// fence also orders publication before the next write's consumer-limit
+    /// checks, pairing with the consumer-join fence.
     fn wake(&self) {
         let header = self.header();
         header.waiters.bump_and_wake(&header.wake_seq);
@@ -1136,7 +1139,7 @@ impl ConsumerCore {
     fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         let index = queue.acquire_consumer_index()?;
         // Cache a view per lane (independent of `queue`) and join each at its
-        // reservation frontier.
+        // publication frontier.
         let lanes: Box<[ProducerLane]> = queue.producer_lanes().collect();
         let next_by_lane = lanes
             .iter()
@@ -1194,12 +1197,12 @@ impl ConsumerCore {
 
     fn join_lane(lane: &ProducerLane, index: usize) -> usize {
         let consumer_state = lane.consumer_state();
-        consumer_state.join(index, || lane.reserved())
+        consumer_state.join(index, || lane.published())
     }
 
     fn recover_lane(lane: &ProducerLane, index: usize) -> usize {
         let consumer_state = lane.consumer_state();
-        consumer_state.recover(index, || lane.reserved())
+        consumer_state.recover(index, || lane.published())
     }
 
     fn index(&self) -> usize {
@@ -1311,7 +1314,7 @@ impl Drop for ConsumerCore {
 unsafe impl Send for ConsumerCore {}
 
 /// A consumer: owns one consumer index and reads every lane round-robin,
-/// starting at each lane's reservation frontier. Single-threaded use (`&mut
+/// starting at each lane's publication frontier. Single-threaded use (`&mut
 /// self`).
 pub struct Consumer<T: Copy> {
     core: ConsumerCore,
@@ -1342,8 +1345,8 @@ impl<T: Copy> Consumer<T> {
     }
 
     /// Joins an existing broadcast queue in `file` as a consumer, starting at
-    /// each lane's reservation frontier. Values already reserved are skipped,
-    /// even if they have not yet been published.
+    /// each lane's publication frontier. Values already published are skipped;
+    /// writes in progress are received if they publish after the join.
     ///
     /// # Safety
     /// - Same as [`Producer::join`]: live queue, same `T` across all handles.
@@ -1376,7 +1379,7 @@ impl<T: Copy> Consumer<T> {
     /// **resumes where the dead owner left off** on each lane — its unread items
     /// are still pinned by its reserve limit, so they are delivered. If the
     /// owner died before joining every lane, recovery instead restarts every
-    /// lane at its current reservation frontier. To unconditionally restart
+    /// lane at its current publication frontier. To unconditionally restart
     /// fresh, [`force_release`](Self::force_release) the index and `join` it.
     ///
     /// # Safety
@@ -1682,8 +1685,8 @@ impl core::fmt::Debug for SliceConsumer {
 
 impl SliceConsumer {
     /// Joins an existing broadcast queue in `file` as an untyped consumer,
-    /// starting at each lane's reservation frontier. Values already reserved
-    /// are skipped, even if they have not yet been published.
+    /// starting at each lane's publication frontier. Values already published
+    /// are skipped; writes in progress are received if they publish after the join.
     ///
     /// # Safety
     /// - `file` must refer to a live broadcast queue, not resized while joined.
@@ -1724,7 +1727,7 @@ impl SliceConsumer {
     /// Takes over a consumer index whose owner died. A fully joined consumer
     /// resumes where the dead owner left off on each lane. If the owner died
     /// before joining every lane, recovery instead restarts every lane at its
-    /// current reservation frontier.
+    /// current publication frontier.
     ///
     /// # Safety
     /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
@@ -2643,7 +2646,7 @@ mod tests {
             for value in 0..3u64 {
                 assert!(p.try_write(value).is_ok());
             }
-            // Joins at the current reservation (3), so it sees only later items.
+            // Joins at the current publication (3), so it sees only later items.
             let mut c = p.broadcast_handle().consumer().unwrap();
             assert!(p.try_write(99).is_ok());
             assert_eq!(c.try_read(), Some(99));
@@ -2652,7 +2655,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_joining_during_unpublished_reservation_skips_it() {
+    fn consumer_joining_during_unpublished_write_receives_it() {
         let config = BroadcastConfig {
             capacity: 4,
             producer_slots: 1,
@@ -2669,11 +2672,69 @@ mod tests {
         guard.as_mut().write(42);
         drop(guard);
 
+        assert_eq!(consumer.try_read(), Some(42));
         assert_eq!(consumer.try_read(), None);
 
         assert!(producer.try_write(99).is_ok());
         assert_eq!(consumer.try_read(), Some(99));
         assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn consumer_joining_during_unpublished_batch_reads_wrapped_batch() {
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+            assert!(producer.try_write_slice(&[0, 1]));
+            // SAFETY: every cell is initialized before the batch is dropped.
+            let mut batch =
+                unsafe { producer.try_reserve_write_batch(NonZeroUsize::new(4).unwrap()) }.unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            assert_eq!(consumer.try_read(), None);
+            for index in 0..batch.len() {
+                // SAFETY: index is within the batch.
+                unsafe { batch.write(index, index as u64 + 2) };
+            }
+            drop(batch);
+            // The joined consumer pins the entire batch, including its wrap.
+            assert_eq!(producer.try_write(6), Err(6));
+            let read = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            assert_eq!(read.as_slices(), (&[2, 3][..], &[4, 5][..]));
+            drop(read);
+            producer.try_write(6).unwrap();
+            assert_eq!(consumer.try_read(), Some(6));
+            assert_eq!(consumer.try_read(), None);
+        }
+    }
+
+    #[test]
+    fn forgotten_write_batch_can_be_reused_by_same_producer() {
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 2,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+            // SAFETY: the batch is forgotten and never publishes any cell.
+            let mut batch =
+                unsafe { producer.try_reserve_write_batch(NonZeroUsize::new(2).unwrap()) }.unwrap();
+            // SAFETY: index zero is within the batch; the other cell stays untouched.
+            unsafe { batch.write(0, 99) };
+            let mut consumer = broadcast.consumer().unwrap();
+            std::mem::forget(batch);
+            assert_eq!(consumer.try_read(), None);
+            assert!(producer.try_write_slice(&[1, 2]));
+            assert_eq!(consumer.try_read(), Some(1));
+            assert_eq!(consumer.try_read(), Some(2));
+            assert_eq!(consumer.try_read(), None);
+        }
     }
 
     #[test]
@@ -2969,7 +3030,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_producer_with_unpublished_reservation_stays_claimed() {
+    fn dropped_producer_with_unpublished_write_releases_lane() {
         for create in producer_creators() {
             for batch in [false, true] {
                 let mut producer = create(BroadcastConfig {
@@ -2993,11 +3054,10 @@ mod tests {
                 }
                 drop(producer);
 
-                assert!(matches!(
-                    broadcast.producer(),
-                    Err(Error::ProducerSlotsExhausted)
-                ));
+                let mut replacement = broadcast.producer().unwrap();
+                replacement.try_write(2).unwrap();
                 assert_eq!(consumer.try_read(), Some(1));
+                assert_eq!(consumer.try_read(), Some(2));
                 assert_eq!(consumer.try_read(), None);
             }
         }
@@ -3187,16 +3247,16 @@ mod tests {
         let lane = queue.producer_lanes().next().unwrap();
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
 
-        // The consumer sampled reservation 0, then the producer filled the ring
+        // The consumer sampled publication 0, then the producer filled the ring
         // before the consumer published its initial limit. Simulate a crash after
-        // that initial limit store but before the second reservation sample. The
+        // that initial limit store but before the second publication sample. The
         // global ownership slot deliberately remains JOINING.
         for value in 0..4u64 {
             assert!(producer.try_write(value).is_ok());
         }
         lane.consumer_state().set_cursor(index, 0);
 
-        // Recovery must restart the incomplete join at reservation 4 rather than
+        // Recovery must restart the incomplete join at publication 4 rather than
         // interpreting the temporary limit as a completed cursor at sequence 0.
         let mut recovered = Consumer::recover_in_queue(queue.clone(), index).unwrap();
         assert_eq!(recovered.try_read(), None);
@@ -3234,7 +3294,7 @@ mod tests {
         ));
 
         // Force-release frees it (clear limits + free the index); a fresh join
-        // then reclaims it at the current reservation frontier.
+        // then reclaims it at the current publication frontier.
         for lane in queue.producer_lanes() {
             lane.consumer_state().release(index);
         }

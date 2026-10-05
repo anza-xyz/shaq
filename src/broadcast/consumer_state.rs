@@ -22,7 +22,7 @@ pub(crate) enum ConsumerRecoveryMode {
 
     /// The global ownership slot was free or still joining, so its per-lane
     /// limits may be absent or may only be provisional handshake values.
-    /// Recovery must join every lane again at its reservation frontier before
+    /// Recovery must join every lane again at its publication frontier before
     /// marking the consumer active.
     RestartJoin,
 }
@@ -215,32 +215,33 @@ impl LaneConsumerState {
             .unwrap_or(UNCLAIMED)
     }
 
-    /// Joins `consumer_index` to this lane at the current reservation frontier.
+    /// Joins `consumer_index` to this lane at the current publication frontier.
     ///
     /// The caller must already own `consumer_index` through the broadcast's
     /// global consumer-ownership state, so this slot has a single writer (the
     /// owning consumer): no CAS is needed — a release store publishes the limit.
     ///
-    /// The first reservation sample supplies an initial limit that permits a
-    /// full ring of producer progress. After publishing that limit, the consumer
-    /// fences and samples the reservation again. The producer either observes
-    /// the initial limit or the second sample observes its previously committed
-    /// frontier. A reservation racing after the second sample starts at that
-    /// frontier, so it is future data for this consumer rather than an overwrite
-    /// of a cell the consumer may read.
-    pub(crate) fn join(&self, consumer_index: usize, read_reserved: impl Fn() -> usize) -> usize {
-        let initial_start = read_reserved();
+    /// The first publication sample supplies a provisional limit permitting a
+    /// full ring of producer progress. After storing that limit, the consumer
+    /// fences and samples publication again. The producer fences after each
+    /// publication, before checking limits for its next write. Either it sees
+    /// the provisional limit or this consumer sees the preceding publication
+    /// and skips those values. An unpublished batch starts at publication and
+    /// fits in the ring, so it is future data for a consumer joining there.
+    /// See tests/broadcast_join_loom.rs for the capacity-one model.
+    pub(crate) fn join(&self, consumer_index: usize, read_published: impl Fn() -> usize) -> usize {
+        let initial_start = read_published();
         let initial_limit = initial_start.wrapping_add(self.capacity);
         debug_assert!(initial_limit != UNCLAIMED);
         self.limit(consumer_index)
             .store(initial_limit, Ordering::Release);
 
         // Consumer half of the join handshake: order the initial limit before
-        // re-reading the reservation frontier. This pairs with the producer's
-        // fence before it reads reserve limits.
+        // re-reading the publication frontier. This pairs with the producer's
+        // post-publication fence in the broadcast wake path.
         fence(Ordering::SeqCst);
 
-        let start = read_reserved();
+        let start = read_published();
         let limit = start.wrapping_add(self.capacity);
         debug_assert!(limit != UNCLAIMED);
         self.limit(consumer_index).store(limit, Ordering::Release);
@@ -268,16 +269,16 @@ impl LaneConsumerState {
     /// surviving reserve limit (`next_to_read + capacity`), so it resumes where
     /// the dead owner left off — those unread cells are still pinned by the
     /// limit. This only reads the slot, so this consumer's backpressure is never
-    /// dropped. If the slot was never claimed, start fresh at the reservation
+    /// dropped. If the slot was never claimed, start fresh at the publication
     /// frontier.
     pub(crate) fn recover(
         &self,
         consumer_index: usize,
-        read_reserved: impl Fn() -> usize,
+        read_published: impl Fn() -> usize,
     ) -> usize {
         let limit = self.limit(consumer_index).load(Ordering::Acquire);
         if limit == UNCLAIMED {
-            self.join(consumer_index, read_reserved)
+            self.join(consumer_index, read_published)
         } else {
             limit.wrapping_sub(self.capacity)
         }
@@ -402,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_consumer_state_join_resamples_reservation_frontier() {
+    fn lane_consumer_state_join_resamples_publication_frontier() {
         let (_region, state) = lane_consumer_state(1, 4);
         let samples = [10, 13];
         let sample_index = Cell::new(0);

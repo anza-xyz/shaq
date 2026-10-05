@@ -1,8 +1,8 @@
 //! One producer's lane: a self-contained shared-memory block holding the lane's
-//! ownership state, its reserve/publication cursors, the per-consumer reserve
+//! ownership state, its publication cursor, the per-consumer reserve
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
-use crate::sync::atomic::{fence, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
@@ -24,8 +24,6 @@ pub(super) struct LaneHeader {
     state: AtomicU64,
     /// Count of messages refused by backpressure.
     rejected_items: AtomicU64,
-    /// Claimed-up-to sequence: advanced before a ring cell is written.
-    producer_reservation: CacheAlignedAtomicSize,
     /// Visible-up-to sequence: advanced after a ring cell is written; consumers
     /// read sequences `< producer_publication`.
     producer_publication: CacheAlignedAtomicSize,
@@ -33,10 +31,10 @@ pub(super) struct LaneHeader {
 
 /// A single producer's lane.
 ///
-/// The lane holds ownership state, the reserve/publication cursors, the
+/// The lane holds ownership state, the publication cursor, the
 /// per-lane consumer reserve-limit state, and the ring of fixed-size payload
 /// cells. The owning
-/// producer mutates the ring and producer cursors (`&mut self`); consumers read
+/// producer mutates the ring and publication cursor (`&mut self`); consumers read
 /// published payloads and publish their own progress through [`LaneConsumerState`].
 ///
 /// Block layout: `LaneHeader`, then `[CacheAlignedAtomicSize; consumer_slots]`
@@ -145,7 +143,6 @@ impl ProducerLane {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
             rejected_items: AtomicU64::new(0),
-            producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
         };
         // SAFETY: `block` begins with a `LaneHeader`.
@@ -241,14 +238,8 @@ impl ProducerLane {
             .is_ok()
     }
 
-    /// Releases the lane for reuse, preserving its cursors and rejection count.
+    /// Releases the lane for reuse, preserving its publication cursor and rejection count.
     pub(crate) fn release(&self) {
-        // A forgotten write guard can leave uninitialized cells reserved. Reuse
-        // would publish that gap, while rewinding the reservation cursor would
-        // break the concurrent consumer-join handshake. Keep this lane claimed.
-        if self.reserved() != self.published() {
-            return;
-        }
         let _ = self.header().state.compare_exchange(
             LANE_ACTIVE,
             LANE_FREE,
@@ -268,15 +259,11 @@ impl ProducerLane {
         if count.get() > self.capacity() {
             return None;
         }
-        let start = self.header().producer_reservation.load(Ordering::Acquire);
-        // Producer half of the join handshake: order the previous reserve's
-        // `producer_reservation` store before this reserve's limit loads. A
-        // racing consumer publishes a limit from its first reservation sample,
-        // fences, then samples again. Either this reserve observes that limit or
-        // the consumer observes our committed frontier. If both race with this
-        // reserve's later store, the consumer starts at `start`, making this
-        // reservation future data rather than an overwrite.
-        fence(Ordering::SeqCst);
+        let start = self.published();
+        // The previous publication is ordered before these limit loads by the
+        // unconditional fence in the broadcast's futex wake path. Together with
+        // the consumer's double-sampled join, this prevents overwriting data a
+        // joining consumer may read. See tests/broadcast_join_loom.rs.
         // Each slot already stores `next_to_read + capacity`, so the gate is a
         // plain comparison: rejecting once the batch would reach a sequence a
         // consumer still needs. Unowned slots sit at the top, so they never
@@ -287,15 +274,12 @@ impl ProducerLane {
                 .fetch_add(count.get() as u64, Ordering::Relaxed);
             return None;
         }
-        // Claim before the writes; consumers only read `< producer_publication`.
-        self.header()
-            .producer_reservation
-            .store(start.wrapping_add(count.get()), Ordering::Release);
         Some(start)
     }
 
     /// Publishes `start..start + count`, making it visible to consumers. Call
-    /// after the cells are written.
+    /// after the cells are written. The caller must issue a SeqCst fence before
+    /// checking limits for another write; broadcast does this in its wake path.
     pub(crate) fn publish(&mut self, start: usize, count: NonZeroUsize) {
         self.header()
             .producer_publication
@@ -304,11 +288,6 @@ impl ProducerLane {
     #[inline]
     pub(crate) fn published(&self) -> usize {
         self.header().producer_publication.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(crate) fn reserved(&self) -> usize {
-        self.header().producer_reservation.load(Ordering::Acquire)
     }
 }
 
@@ -341,7 +320,7 @@ mod tests {
 
     fn join_consumer(lane: &ProducerLane, consumer_index: usize) -> usize {
         let consumer_state = lane.consumer_state();
-        consumer_state.join(consumer_index, || lane.reserved())
+        consumer_state.join(consumer_index, || lane.published())
     }
 
     fn metadata(lane: &ProducerLane) -> LaneMetadata<'_> {
@@ -357,6 +336,8 @@ mod tests {
         // SAFETY: the cell is reserved and not yet published.
         unsafe { lane.payload_ptr(start).cast().write(value) };
         lane.publish(start, one);
+        // Match the broadcast wake path before the next write.
+        core::sync::atomic::fence(Ordering::SeqCst);
         true
     }
 
@@ -422,7 +403,6 @@ mod tests {
             assert!(publish_value(&mut lane, value * 10));
         }
         assert_eq!(lane.published(), 4);
-        assert_eq!(lane.reserved(), 4);
         for seq in 0..4usize {
             assert_eq!(read(&lane, seq), seq as u64 * 10);
         }
@@ -443,7 +423,6 @@ mod tests {
             };
         }
         // Reserved but not yet visible.
-        assert_eq!(lane.reserved(), 3);
         assert_eq!(lane.published(), 0);
         lane.publish(start, count);
         assert_eq!(lane.published(), 3);
