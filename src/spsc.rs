@@ -193,7 +193,12 @@ impl<T> Producer<T> {
     /// Start a batched write.
     pub fn write_batch(&mut self) -> WriteBatch<'_, T> {
         self.sync();
-        WriteBatch { producer: self }
+        let initial_write = self.queue.cached_write;
+        WriteBatch {
+            producer: self,
+            initial_write,
+            armed: true,
+        }
     }
 
     /// Writes item into the queue or returns it if there is not enough space.
@@ -269,9 +274,17 @@ impl<T> Producer<T> {
 unsafe impl<T: Send> Send for Producer<T> {}
 
 /// A batch of writes published on drop.
+///
+/// Dropping an armed batch commits all reserved writes, making them visible
+/// to the consumer. Call [`WriteBatch::disarm`] to discard the batch instead:
+/// dropping a disarmed batch rolls back to the write cursor from batch
+/// creation without publishing, recycling the reserved slots for subsequent
+/// writes.
 #[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
+    initial_write: usize,
+    armed: bool,
 }
 
 impl<'a, T> WriteBatch<'a, T> {
@@ -281,12 +294,33 @@ impl<'a, T> WriteBatch<'a, T> {
         self.producer.try_write_inner(item)
     }
 
+    /// Disarms the batch so dropping it discards rather than publishes.
+    ///
+    /// This rolls back the producer's write cursor to its value at batch
+    /// creation, recycling reserved slots without making their contents
+    /// visible to consumers. Reserved slots may contain partially written or
+    /// invalid data, so their destructors are not run; valid values written
+    /// via [`WriteBatch::try_write`] before disarming are leaked. Any raw
+    /// pointers or references obtained via [`WriteBatch::try_as_mut`] must not
+    /// be used after disarming.
+    ///
+    /// Disarming is idempotent. Writes reserved after disarming are also
+    /// discarded when the batch is dropped.
+    pub fn disarm(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.producer.queue.cached_write = self.initial_write;
+        }
+    }
+
     /// Returns a mutable reference to the next reserved position if one is available.
     ///
     /// # Safety
     /// If this returns `Some`, the caller must initialize the reserved slot with a
     /// valid `T` before the batch is dropped and publishes it. This requirement
-    /// also applies if control exits by unwinding.
+    /// also applies if control exits by unwinding. If the batch is disarmed,
+    /// initialization is no longer required and the slot is recycled without
+    /// running destructors.
     pub unsafe fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
         // SAFETY: The reserved slot belongs exclusively to this producer.
         let mut reserved = unsafe { self.producer.reserve() }?.cast();
@@ -297,8 +331,14 @@ impl<'a, T> WriteBatch<'a, T> {
 
 impl<'a, T> Drop for WriteBatch<'a, T> {
     fn drop(&mut self) {
-        // Commit any written items
-        self.producer.commit();
+        if self.armed {
+            // Commit any written items
+            self.producer.commit();
+        } else {
+            // Discard any writes (including writes after disarm) without
+            // publishing or waking the consumer.
+            self.producer.queue.cached_write = self.initial_write;
+        }
     }
 }
 
@@ -1348,6 +1388,87 @@ mod tests {
             // Can still read the message from the shared consumer
             let val = consumer.try_read().expect("read after producer drop");
             assert_eq!(val, 7);
+        }
+    }
+
+    #[test]
+    fn test_write_batch_disarm_discards_and_recycles() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            // Armed drop preserves publish-on-drop.
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(10).unwrap();
+                batch.try_write(11).unwrap();
+            }
+            assert_eq!(consumer.try_read(), Some(10));
+            assert_eq!(consumer.try_read(), Some(11));
+
+            // Disarmed drop exposes nothing.
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(99).unwrap();
+                batch.try_write(100).unwrap();
+                batch.disarm();
+            }
+            assert!(consumer.try_read().is_none());
+
+            // Reserved slots are recycled.
+            producer.try_write(42).unwrap();
+            assert_eq!(consumer.try_read(), Some(42));
+        }
+    }
+
+    #[test]
+    fn test_write_batch_disarm_fallible_write() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            // Mirrors the `wincode::serialize_into(guard.as_mut(), ...)?` pattern
+            // from the tracking issue: a failed in-place write must not publish
+            // partial data.
+            {
+                let mut batch = producer.write_batch();
+                // SAFETY: slot is initialized before the publish decision below.
+                let slot = unsafe { batch.try_as_mut() }.expect("reserve failed");
+                slot.write(77);
+                let res: Result<(), ()> = Err(());
+                if res.is_err() {
+                    batch.disarm();
+                }
+            }
+            assert!(consumer.try_read().is_none());
+
+            // Queue remains usable after the aborted write.
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(7).unwrap();
+            }
+            assert_eq!(consumer.try_read(), Some(7));
+        }
+    }
+
+    #[test]
+    fn test_write_batch_disarm_idempotent_and_discards_later_writes() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(1).unwrap();
+                batch.disarm();
+                batch.disarm();
+                // Writes after disarm are also discarded.
+                batch.try_write(2).unwrap();
+            }
+            assert!(consumer.try_read().is_none());
+
+            // Disarming an empty batch is safe.
+            {
+                let mut batch = producer.write_batch();
+                batch.disarm();
+            }
+            assert!(consumer.try_read().is_none());
         }
     }
 
