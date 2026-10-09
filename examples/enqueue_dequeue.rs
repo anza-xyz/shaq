@@ -473,7 +473,7 @@ fn run_broadcast_producer(
     producer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
-        // SAFETY: every reserved slot is initialized before `batch` is dropped.
+        // SAFETY: every reserved slot is initialized before publication.
         let Some(mut batch) = (unsafe { producer.try_reserve_write_batch(SYNC_CADENCE) }) else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -482,7 +482,9 @@ fn run_broadcast_producer(
             // SAFETY: `index < len`; the reserved cell is ours to initialize.
             unsafe { batch.as_mut(index).write(Item { data: [42; 512] }) };
         }
-        Some(batch.len())
+        let len = batch.len();
+        batch.publish();
+        Some(len)
     });
 }
 

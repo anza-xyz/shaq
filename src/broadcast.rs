@@ -910,10 +910,11 @@ impl<T: Copy> Producer<T> {
     /// has not freed the cell that publishing would overwrite).
     pub fn try_write(&mut self, value: T) -> Result<(), T> {
         // SAFETY: on successful reservation, `value` is written before the guard
-        // is dropped and publishes the cell.
+        // publishes the cell.
         match unsafe { self.try_reserve_write() } {
-            Some(guard) => {
+            Some(mut guard) => {
                 guard.write(value);
+                guard.publish();
                 Ok(())
             }
             None => Err(value),
@@ -939,15 +940,16 @@ impl<T: Copy> Producer<T> {
             // SAFETY: `index` comes from enumerating exactly `len` items.
             unsafe { batch.write(index, item) };
         }
+        batch.publish();
         true
     }
 
     /// Reserves a single cell for an in-place write, or `None` on backpressure.
-    /// The cell becomes visible when the returned guard is dropped.
+    /// The cell becomes visible when [`WriteGuard::publish`] is called. Dropping
+    /// the guard without publishing leaves the cell available for a later write.
     ///
     /// # Safety
-    /// - The caller must initialize the reserved cell before the guard is
-    ///   dropped.
+    /// - The caller must initialize the reserved cell before publishing it.
     #[must_use]
     pub unsafe fn try_reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
         let start = self.lane.try_reserve(NonZeroUsize::MIN)?;
@@ -958,11 +960,12 @@ impl<T: Copy> Producer<T> {
     }
 
     /// Reserves `count` consecutive cells for in-place writes, or `None` on
-    /// backpressure. The cells become visible when the returned batch is dropped.
+    /// backpressure. The cells become visible when [`WriteBatch::publish`] is
+    /// called. Dropping the batch without publishing leaves them available for
+    /// a later write.
     ///
     /// # Safety
-    /// - The caller must initialize every reserved cell before the batch is
-    ///   dropped.
+    /// - The caller must initialize every reserved cell before publishing them.
     #[must_use]
     pub unsafe fn try_reserve_write_batch(
         &mut self,
@@ -988,7 +991,8 @@ impl<T: Copy> Drop for Producer<T> {
 unsafe impl<T: Copy + Send> Send for Producer<T> {}
 
 /// A reservation of one cell in a producer's lane. Write it via
-/// [`Self::write`]/[`Self::as_mut`], then drop the guard to publish it.
+/// [`Self::write`]/[`Self::as_mut`], then call [`Self::publish`]. Dropping the
+/// guard without publishing leaves the cell available for a later write.
 #[must_use]
 pub struct WriteGuard<'a, T: Copy> {
     producer: &'a mut Producer<T>,
@@ -1013,23 +1017,24 @@ impl<T: Copy> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
 }
 
 impl<T: Copy> WriteGuard<'_, T> {
-    /// Writes `value` into the reserved cell; the guard publishes it on drop.
-    pub fn write(self, value: T) {
+    /// Writes `value` into the reserved cell. Call [`Self::publish`] to make it
+    /// visible to consumers.
+    pub fn write(&mut self, value: T) {
         let ptr = self.producer.lane.payload_ptr(self.start).cast();
         // SAFETY: the cell is reserved and not yet published; `T` is moved in.
         unsafe { ptr.write(value) };
     }
-}
 
-impl<T: Copy> Drop for WriteGuard<'_, T> {
-    fn drop(&mut self) {
+    /// Publishes the initialized cell and wakes waiting consumers.
+    pub fn publish(self) {
         self.producer.lane.publish(self.start, NonZeroUsize::MIN);
         self.producer.queue.wake();
     }
 }
 
 /// A reservation of `count` cells in a producer's lane. Write every cell via
-/// [`Self::write`]/[`Self::as_mut`], then drop the batch to publish them.
+/// [`Self::write`]/[`Self::as_mut`], then call [`Self::publish`]. Dropping the
+/// batch without publishing leaves its cells available for a later write.
 #[must_use]
 pub struct WriteBatch<'a, T: Copy> {
     producer: &'a mut Producer<T>,
@@ -1075,10 +1080,9 @@ impl<T: Copy> WriteBatch<'_, T> {
         // SAFETY: forwarded; `index < len` and the cell is reserved.
         unsafe { self.as_mut(index).write(value) };
     }
-}
 
-impl<T: Copy> Drop for WriteBatch<'_, T> {
-    fn drop(&mut self) {
+    /// Publishes all initialized cells together and wakes waiting consumers.
+    pub fn publish(self) {
         self.producer.lane.publish(self.start, self.count);
         self.producer.queue.wake();
     }
@@ -2126,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_publishes_on_drop() {
+    fn write_batch_publishes_explicitly() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
                 capacity: 8,
@@ -2143,6 +2147,8 @@ mod tests {
                     // SAFETY: index < len.
                     unsafe { batch.write(index, (index as u64) + 1) };
                 }
+                assert_eq!(c.try_read(), None);
+                batch.publish();
             }
             for value in 1..=3u64 {
                 assert_eq!(c.try_read(), Some(value));
@@ -2512,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn write_guard_publishes_on_drop_and_read_guard_reads() {
+    fn write_guard_publishes_explicitly_and_read_guard_reads() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
                 capacity: 4,
@@ -2521,15 +2527,19 @@ mod tests {
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
 
-            // A single write guard publishes its cell when dropped.
+            // A single write guard publishes its cell only when requested.
             {
-                // SAFETY: the reserved slot is initialized before `guard` is dropped.
+                // SAFETY: the reserved slot is initialized before publication.
                 let mut guard = unsafe { p.try_reserve_write() }.unwrap();
                 guard.as_mut().write(42);
+                assert!(c.try_reserve_read().is_none());
+                guard.publish();
             }
-            // `write` consumes the guard and publishes on drop too.
-            // SAFETY: `write` initializes the reserved slot before publishing.
-            unsafe { p.try_reserve_write() }.unwrap().write(43);
+            // `write` initializes the slot; publication remains explicit.
+            // SAFETY: `write` initializes the reserved slot before publication.
+            let mut guard = unsafe { p.try_reserve_write() }.unwrap();
+            guard.write(43);
+            guard.publish();
 
             assert_eq!(c.try_reserve_read().unwrap().read(), 42);
             assert_eq!(c.try_reserve_read().unwrap().read(), 43);
@@ -2664,13 +2674,13 @@ mod tests {
         let queue = recovery_queue(&config);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
 
-        // SAFETY: the reserved slot is initialized before the guard is dropped.
+        // SAFETY: the reserved slot is initialized before publication.
         let mut guard = unsafe { producer.try_reserve_write() }.unwrap();
         let mut consumer = Consumer::from_queue(queue.clone()).unwrap();
 
         assert!(consumer.try_reserve_read().is_none());
         guard.as_mut().write(42);
-        drop(guard);
+        guard.publish();
 
         assert_eq!(consumer.try_read(), Some(42));
         assert_eq!(consumer.try_read(), None);
@@ -2690,7 +2700,7 @@ mod tests {
             });
             let broadcast = producer.broadcast_handle();
             assert!(producer.try_write_slice(&[0, 1]));
-            // SAFETY: every cell is initialized before the batch is dropped.
+            // SAFETY: every cell is initialized before publication.
             let mut batch =
                 unsafe { producer.try_reserve_write_batch(NonZeroUsize::new(4).unwrap()) }.unwrap();
             let mut consumer = broadcast.consumer().unwrap();
@@ -2699,7 +2709,7 @@ mod tests {
                 // SAFETY: index is within the batch.
                 unsafe { batch.write(index, index as u64 + 2) };
             }
-            drop(batch);
+            batch.publish();
             // The joined consumer pins the entire batch, including its wrap.
             assert_eq!(producer.try_write(6), Err(6));
             let read = consumer
@@ -2714,7 +2724,7 @@ mod tests {
     }
 
     #[test]
-    fn forgotten_write_batch_can_be_reused_by_same_producer() {
+    fn dropped_write_batch_can_be_reused_by_same_producer() {
         for create in producer_creators() {
             let mut producer = create(BroadcastConfig {
                 capacity: 2,
@@ -2722,18 +2732,38 @@ mod tests {
                 consumer_slots: 1,
             });
             let broadcast = producer.broadcast_handle();
-            // SAFETY: the batch is forgotten and never publishes any cell.
+            // SAFETY: the batch is dropped without publishing any cell.
             let mut batch =
                 unsafe { producer.try_reserve_write_batch(NonZeroUsize::new(2).unwrap()) }.unwrap();
             // SAFETY: index zero is within the batch; the other cell stays untouched.
             unsafe { batch.write(0, 99) };
             let mut consumer = broadcast.consumer().unwrap();
-            std::mem::forget(batch);
+            drop(batch);
             assert_eq!(consumer.try_read(), None);
             assert!(producer.try_write_slice(&[1, 2]));
             assert_eq!(consumer.try_read(), Some(1));
             assert_eq!(consumer.try_read(), Some(2));
             assert_eq!(consumer.try_read(), None);
+        }
+    }
+
+    #[test]
+    fn dropped_write_guard_can_be_reused_by_same_producer() {
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 1,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let mut consumer = producer.broadcast_handle().consumer().unwrap();
+            // SAFETY: the initialized cell is dropped without publication.
+            let mut guard = unsafe { producer.try_reserve_write() }.unwrap();
+            guard.write(99);
+            drop(guard);
+
+            assert_eq!(consumer.try_read(), None);
+            producer.try_write(1).unwrap();
+            assert_eq!(consumer.try_read(), Some(1));
         }
     }
 
@@ -3042,15 +3072,15 @@ mod tests {
                 let mut consumer = broadcast.consumer().unwrap();
                 producer.try_write(1).unwrap();
                 if batch {
-                    // SAFETY: the uninitialized reservation is forgotten, never published.
+                    // SAFETY: the uninitialized reservation is dropped without publication.
                     let guard =
                         unsafe { producer.try_reserve_write_batch(NonZeroUsize::new(2).unwrap()) }
                             .unwrap();
-                    std::mem::forget(guard);
+                    drop(guard);
                 } else {
-                    // SAFETY: the uninitialized reservation is forgotten, never published.
+                    // SAFETY: the uninitialized reservation is dropped without publication.
                     let guard = unsafe { producer.try_reserve_write() }.unwrap();
-                    std::mem::forget(guard);
+                    drop(guard);
                 }
                 drop(producer);
 
