@@ -263,7 +263,7 @@ impl ProducerLane {
         // The previous publication is ordered before these limit loads by the
         // unconditional fence in the broadcast's futex wake path. Together with
         // the consumer's double-sampled join, this prevents overwriting data a
-        // joining consumer may read. See tests/broadcast_join_loom.rs.
+        // joining consumer may read. See src/broadcast/loom_tests.rs.
         // Each slot already stores `next_to_read + capacity`, so the gate is a
         // plain comparison: rejecting once the batch would reach a sequence a
         // consumer still needs. Unowned slots sit at the top, so they never

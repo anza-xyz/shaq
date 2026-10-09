@@ -228,7 +228,7 @@ impl LaneConsumerState {
     /// the provisional limit or this consumer sees the preceding publication
     /// and skips those values. An unpublished batch starts at publication and
     /// fits in the ring, so it is future data for a consumer joining there.
-    /// See tests/broadcast_join_loom.rs for the capacity-one model.
+    /// See src/broadcast/loom_tests.rs for the capacity-one model.
     pub(crate) fn join(&self, consumer_index: usize, read_published: impl Fn() -> usize) -> usize {
         let initial_start = read_published();
         let initial_limit = initial_start.wrapping_add(self.capacity);
