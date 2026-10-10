@@ -191,9 +191,17 @@ impl<T> Producer<T> {
     }
 
     /// Start a batched write.
+    ///
+    /// The batch must be published with [`WriteBatch::publish`] to make its
+    /// writes visible to the consumer. Dropping it without publishing
+    /// discards the writes and recycles the reserved slots.
     pub fn write_batch(&mut self) -> WriteBatch<'_, T> {
         self.sync();
-        WriteBatch { producer: self }
+        let initial_write = self.queue.cached_write;
+        WriteBatch {
+            producer: self,
+            initial_write,
+        }
     }
 
     /// Writes item into the queue or returns it if there is not enough space.
@@ -268,10 +276,16 @@ impl<T> Producer<T> {
 // to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Producer<T> {}
 
-/// A batch of writes published on drop.
+/// A batch of writes that must be published explicitly.
+///
+/// Call [`WriteBatch::publish`] to make reserved writes visible to the
+/// consumer. Dropping the batch without publishing discards the writes and
+/// rolls back to the write cursor from batch creation, recycling the reserved
+/// slots for subsequent writes.
 #[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
+    initial_write: usize,
 }
 
 impl<'a, T> WriteBatch<'a, T> {
@@ -281,12 +295,24 @@ impl<'a, T> WriteBatch<'a, T> {
         self.producer.try_write_inner(item)
     }
 
+    /// Publishes all reserved writes together and wakes the consumer.
+    ///
+    /// Every reserved slot must contain a valid `T` before calling this. See
+    /// [`WriteBatch::try_as_mut`].
+    pub fn publish(mut self) {
+        self.producer.commit();
+        // Neutralize the Drop rollback so it does not undo the publish.
+        self.initial_write = self.producer.queue.cached_write;
+    }
+
     /// Returns a mutable reference to the next reserved position if one is available.
     ///
     /// # Safety
     /// If this returns `Some`, the caller must initialize the reserved slot with a
-    /// valid `T` before the batch is dropped and publishes it. This requirement
-    /// also applies if control exits by unwinding.
+    /// valid `T` before calling [`WriteBatch::publish`]. This requirement also
+    /// applies if control exits by unwinding. If the batch is dropped without
+    /// publishing, initialization is no longer required and the slot is
+    /// recycled without running destructors.
     pub unsafe fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
         // SAFETY: The reserved slot belongs exclusively to this producer.
         let mut reserved = unsafe { self.producer.reserve() }?.cast();
@@ -297,8 +323,10 @@ impl<'a, T> WriteBatch<'a, T> {
 
 impl<'a, T> Drop for WriteBatch<'a, T> {
     fn drop(&mut self) {
-        // Commit any written items
-        self.producer.commit();
+        // Discard unpublished writes without waking the consumer. After
+        // `publish` this is a no-op because `initial_write` was advanced to
+        // the published cursor.
+        self.producer.queue.cached_write = self.initial_write;
     }
 }
 
@@ -1253,6 +1281,7 @@ mod tests {
                     assert!(batch.try_write(AtomicU64::new(1)).is_ok());
                 }
                 assert!(batch.try_write(AtomicU64::new(1)).is_err());
+                batch.publish();
             }
             {
                 let batch = consumer
@@ -1348,6 +1377,79 @@ mod tests {
             // Can still read the message from the shared consumer
             let val = consumer.try_read().expect("read after producer drop");
             assert_eq!(val, 7);
+        }
+    }
+
+    #[test]
+    fn test_write_batch_publishes_explicitly() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            // Writes are invisible until `publish`, like broadcast.
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(10).unwrap();
+                batch.try_write(11).unwrap();
+                assert!(consumer.try_read().is_none());
+                batch.publish();
+            }
+            assert_eq!(consumer.try_read(), Some(10));
+            assert_eq!(consumer.try_read(), Some(11));
+        }
+    }
+
+    #[test]
+    fn test_dropped_write_batch_discards_and_recycles() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            // Dropping without publishing exposes nothing.
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(99).unwrap();
+                batch.try_write(100).unwrap();
+            }
+            assert!(consumer.try_read().is_none());
+
+            // Reserved slots are recycled.
+            producer.try_write(42).unwrap();
+            assert_eq!(consumer.try_read(), Some(42));
+
+            // Dropping an empty batch without publishing is safe.
+            {
+                let _batch = producer.write_batch();
+            }
+            assert!(consumer.try_read().is_none());
+        }
+    }
+
+    #[test]
+    fn test_write_batch_fallible_write_is_discarded() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            // Mirrors the `wincode::serialize_into(guard.as_mut(), ...)?` pattern
+            // from the tracking issue: a failed in-place write must not publish
+            // partial data. Simply return / drop without publishing.
+            {
+                let mut batch = producer.write_batch();
+                // SAFETY: slot would be initialized before publishing below.
+                let slot = unsafe { batch.try_as_mut() }.expect("reserve failed");
+                slot.write(77);
+                let res: Result<(), ()> = Err(());
+                if res.is_ok() {
+                    batch.publish();
+                }
+            }
+            assert!(consumer.try_read().is_none());
+
+            // Queue remains usable after the aborted write.
+            {
+                let mut batch = producer.write_batch();
+                batch.try_write(7).unwrap();
+                batch.publish();
+            }
+            assert_eq!(consumer.try_read(), Some(7));
         }
     }
 

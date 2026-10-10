@@ -230,7 +230,12 @@ fn run_spsc_producer(
                     break;
                 }
             }
-            (produced > 0).then_some(produced)
+            if produced > 0 {
+                batch.publish();
+                Some(produced)
+            } else {
+                None
+            }
         },
     );
 }
