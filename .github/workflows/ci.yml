@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Tombi
-        uses: tombi-toml/setup-tombi@4824562ec33016ac33ae1f5ae48173f79e4d983c # v1.8.1
+        uses: tombi-toml/setup-tombi@ebc771afde2bfb9192c91338a71b2c5d6152e2c3 # v1.8.4
 
       - name: Check TOML formatting and sorting
         run: tombi format --check --diff
