@@ -25,6 +25,11 @@ pub struct Producer<T> {
 }
 
 impl<T> Producer<T> {
+    /// Returns the capacity of the queue in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     /// Returns the identifier of the queue.
     ///
     /// Returns `0` when created without an explicit identifier.
@@ -237,6 +242,11 @@ pub struct Consumer<T> {
 }
 
 impl<T> Consumer<T> {
+    /// Returns the capacity of the queue in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     /// Returns the identifier of the queue.
     ///
     /// Returns `0` when created without an explicit identifier.
@@ -1881,8 +1891,8 @@ mod tests {
         for create_queue in test_queue_creators::<u64>() {
             let (producer, consumer) = create_queue(3);
 
-            assert_eq!(producer.queue.capacity(), 4);
-            assert_eq!(consumer.queue.capacity(), 4);
+            assert_eq!(producer.capacity(), 4);
+            assert_eq!(consumer.capacity(), 4);
         }
     }
 

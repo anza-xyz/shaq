@@ -328,6 +328,11 @@ impl<T> Broadcast<T> {
         self.shared_queue.producer_slots()
     }
 
+    /// Returns the capacity of each producer lane in items.
+    pub fn capacity(&self) -> usize {
+        self.shared_queue.capacity as usize
+    }
+
     /// Returns the identifier of the queue.
     ///
     /// Returns `0` when created without an explicit identifier.
@@ -859,6 +864,11 @@ impl<T: Copy> core::fmt::Debug for Producer<T> {
 }
 
 impl<T: Copy> Producer<T> {
+    /// Returns the capacity of this producer's lane in items.
+    pub fn capacity(&self) -> usize {
+        self.lane.capacity()
+    }
+
     /// Creates a broadcast queue in `file` and joins as a producer.
     ///
     /// # Safety
@@ -1335,6 +1345,11 @@ impl<T: Copy> core::fmt::Debug for Consumer<T> {
 }
 
 impl<T: Copy> Consumer<T> {
+    /// Returns the capacity of each producer lane in items.
+    pub fn capacity(&self) -> usize {
+        self.core.queue.capacity as usize
+    }
+
     /// Creates a broadcast queue in `file` and joins as a consumer.
     ///
     /// # Safety
@@ -2082,6 +2097,23 @@ mod tests {
         // SAFETY: u64 has fully initialized, process-portable payload bytes.
         let untyped = unsafe { Broadcast::join_untyped(&file) }.unwrap();
         assert_eq!(untyped.queue_identifier(), 0);
+    }
+
+    #[test]
+    fn capacity_rounds_up_per_lane() {
+        for create in producer_creators() {
+            let producer = create(BroadcastConfig {
+                capacity: 3,
+                producer_slots: 2,
+                consumer_slots: 1,
+            });
+            let broadcast = producer.broadcast_handle();
+            let consumer = broadcast.consumer().unwrap();
+
+            assert_eq!(broadcast.capacity(), 4);
+            assert_eq!(producer.capacity(), 4);
+            assert_eq!(consumer.capacity(), 4);
+        }
     }
 
     #[test]
