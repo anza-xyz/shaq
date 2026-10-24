@@ -193,7 +193,11 @@ impl<T> Producer<T> {
     /// Start a batched write.
     pub fn write_batch(&mut self) -> WriteBatch<'_, T> {
         self.sync();
-        WriteBatch { producer: self }
+        let write = self.queue.cached_write;
+        WriteBatch {
+            producer: self,
+            write,
+        }
     }
 
     /// Writes item into the queue or returns it if there is not enough space.
@@ -201,47 +205,10 @@ impl<T> Producer<T> {
     /// When writing multiple items, prefer [`Self::write_batch`] to amortize
     /// synchronization and publication across the batch.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
-        self.sync();
-        self.try_write_inner(item)?;
-        self.commit();
+        let mut batch = self.write_batch();
+        batch.try_write(item)?;
+        batch.publish();
         Ok(())
-    }
-
-    /// Writes item into the queue or returns it if there is not enough space.
-    /// Does not perform synchronization of cached cursors.
-    fn try_write_inner(&mut self, item: T) -> Result<(), T> {
-        // SAFETY: pointer is written below if successfully reserved.
-        match unsafe { self.reserve() } {
-            Some(p) => {
-                // SAFETY: `reserve` returns a properly aligned ptr with enough
-                //         space to write T.
-                unsafe { p.write(item) };
-                Ok(())
-            }
-            None => Err(item),
-        }
-    }
-
-    /// Reserves a position, and increments the cached write position.
-    /// Returns `None` if the queue is full.
-    /// Returns a pointer to the reserved position.
-    ///
-    /// # Safety
-    /// All reserved positions must be fully initialized before calling `commit`.
-    /// Pointers should be dropped before calling `commit`.
-    unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
-        // If write is > read + buffer_mask, the queue is written one iteration
-        // ahead of the consumer, and we cannot reserve more space.
-        if self.queue.cached_write.wrapping_sub(self.queue.cached_read) > self.queue.buffer_mask {
-            return None;
-        }
-
-        let reserved_index = self.queue.mask(self.queue.cached_write);
-        // SAFETY: The reserved index is guaranteed to be within bounds given the mask.
-        let reserved_ptr = unsafe { self.queue.buffer.add(reserved_index) };
-        self.queue.cached_write = self.queue.cached_write.wrapping_add(1);
-
-        Some(reserved_ptr)
     }
 
     /// Commits the reserved position, making it visible to the consumer.
@@ -268,37 +235,71 @@ impl<T> Producer<T> {
 // to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Producer<T> {}
 
-/// A batch of writes published on drop.
+/// A reserved batch of writes that offers infallible publishing of messages with [`WriteBatch::publish`]
+///
+/// Unpublished values are leaked, not dropped, when the batch is discarded
+/// without publishing.
 #[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
+    write: usize,
 }
 
 impl<'a, T> WriteBatch<'a, T> {
     /// If the next sequence number is available, writes the item and returns Ok(()).
     /// Otherwise, returns an error with the item.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
-        self.producer.try_write_inner(item)
+        // SAFETY: pointer is written below if successfully reserved.
+        match unsafe { self.reserve() } {
+            Some(p) => {
+                // SAFETY: `reserve` returns a properly aligned ptr with enough
+                //         space to write T.
+                unsafe { p.write(item) };
+                Ok(())
+            }
+            None => Err(item),
+        }
+    }
+
+    /// Publishes all reserved writes together and wakes the consumer.
+    pub fn publish(self) {
+        self.producer.queue.cached_write = self.write;
+        self.producer.commit();
+    }
+
+    /// Reserves the next position for this batch without moving the producer
+    /// cursor. Returns `None` if the queue is full.
+    ///
+    /// # Safety
+    /// The caller must fully initialize the returned pointer before calling
+    /// [`WriteBatch::publish`]. Pointers must not be used after the batch is
+    /// published, dropped, or leaked.
+    unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
+        let queue = &self.producer.queue;
+        // If write is > read + buffer_mask, the queue is written one iteration
+        // ahead of the consumer, and we cannot reserve more space.
+        if self.write.wrapping_sub(queue.cached_read) > queue.buffer_mask {
+            return None;
+        }
+
+        let reserved_index = queue.mask(self.write);
+        // SAFETY: The reserved index is guaranteed to be within bounds given the mask.
+        let reserved_ptr = unsafe { queue.buffer.add(reserved_index) };
+        self.write = self.write.wrapping_add(1);
+
+        Some(reserved_ptr)
     }
 
     /// Returns a mutable reference to the next reserved position if one is available.
     ///
     /// # Safety
     /// If this returns `Some`, the caller must initialize the reserved slot with a
-    /// valid `T` before the batch is dropped and publishes it. This requirement
-    /// also applies if control exits by unwinding.
+    /// valid `T` before calling [`WriteBatch::publish`].
     pub unsafe fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
-        // SAFETY: The reserved slot belongs exclusively to this producer.
-        let mut reserved = unsafe { self.producer.reserve() }?.cast();
+        // SAFETY: The reserved slot belongs exclusively to this batch.
+        let mut reserved = unsafe { self.reserve() }?.cast();
         // SAFETY: The mutable reference is tied to the borrow of this batch.
         Some(unsafe { reserved.as_mut() })
-    }
-}
-
-impl<'a, T> Drop for WriteBatch<'a, T> {
-    fn drop(&mut self) {
-        // Commit any written items
-        self.producer.commit();
     }
 }
 
@@ -1236,12 +1237,13 @@ mod tests {
             assert_eq!(producer.capacity(), BUFFER_CAPACITY);
             assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
 
-            // SAFETY: single producer over a freshly created queue.
-            let spot = unsafe { producer.reserve() }.expect("Failed to reserve");
-            // SAFETY: spot is a valid reserved slot.
-            unsafe { spot.as_ref() }.store(42, Ordering::Release);
-            assert!(consumer.try_read().is_none()); // not committed yet
-            producer.commit();
+            let mut batch = producer.write_batch();
+            // SAFETY: the slot is written before the batch is published.
+            unsafe { batch.try_as_mut() }
+                .expect("reserve failed")
+                .write(Item::new(42));
+            assert!(consumer.try_read().is_none(), "not committed yet");
+            batch.publish();
             let item = consumer.try_read().expect("Failed to read item");
             assert_eq!(item.load(Ordering::Acquire), 42);
             assert!(consumer.try_read().is_none()); // no more items to read
@@ -1253,6 +1255,7 @@ mod tests {
                     assert!(batch.try_write(AtomicU64::new(1)).is_ok());
                 }
                 assert!(batch.try_write(AtomicU64::new(1)).is_err());
+                batch.publish();
             }
             {
                 let batch = consumer
@@ -1352,6 +1355,80 @@ mod tests {
     }
 
     #[test]
+    fn test_write_batch_requires_explicit_publish() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            let mut batch = producer.write_batch();
+            batch.try_write(10).unwrap();
+            batch.try_write(11).unwrap();
+            assert!(
+                consumer.try_read().is_none(),
+                "writes are invisible until publish"
+            );
+            batch.publish();
+            assert_eq!(consumer.try_read(), Some(10));
+            assert_eq!(consumer.try_read(), Some(11));
+
+            let mut batch = producer.write_batch();
+            // SAFETY: the slot is written before the batch is dropped.
+            unsafe { batch.try_as_mut() }
+                .expect("reserve failed")
+                .write(77);
+            drop(batch);
+            assert!(
+                consumer.try_read().is_none(),
+                "dropped batch exposes nothing"
+            );
+            producer.try_write(42).unwrap();
+            assert_eq!(consumer.try_read(), Some(42));
+
+            let mut batch = producer.write_batch();
+            // SAFETY: the slot is written before the batch is forgotten.
+            unsafe { batch.try_as_mut() }
+                .expect("reserve failed")
+                .write(77);
+            core::mem::forget(batch);
+            assert!(
+                consumer.try_read().is_none(),
+                "forgotten batch exposes nothing"
+            );
+            producer.try_write(7).unwrap();
+            assert_eq!(consumer.try_read(), Some(7));
+        }
+    }
+
+    #[test]
+    fn discarded_write_batch_does_not_drop_values() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (mut producer, mut consumer) = create_queue(4);
+
+            let mut batch = producer.write_batch();
+            batch
+                .try_write(CountedItem {
+                    value: 1,
+                    drops: Arc::clone(&drops),
+                })
+                .unwrap_or_else(|_| panic!("write failed"));
+            drop(batch);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+            // The queue is still usable after the discard.
+            producer
+                .try_write(CountedItem {
+                    value: 2,
+                    drops: Arc::clone(&drops),
+                })
+                .unwrap_or_else(|_| panic!("write failed"));
+            let item = consumer.try_read().expect("read failed");
+            assert_eq!(item.value, 2);
+            drop(item);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
     fn test_capacity_rounds_up() {
         for create_queue in test_queue_creators::<u64>() {
             let (producer, _consumer) = create_queue(3);
@@ -1364,17 +1441,18 @@ mod tests {
         for create_queue in test_queue_creators::<u64>() {
             let (mut producer, mut consumer) = create_queue(64);
 
-            // SAFETY: single producer over a freshly created queue.
-            let spot = unsafe { producer.reserve() }.expect("reserve failed");
-            // SAFETY: spot is a valid reserved slot.
-            unsafe { spot.write(42) };
+            let mut batch = producer.write_batch();
+            // SAFETY: the slot is written before the batch is published.
+            unsafe { batch.try_as_mut() }
+                .expect("reserve failed")
+                .write(42);
 
             assert!(matches!(
                 consumer.wait_readable_timeout(Duration::ZERO),
                 Err(WaitError::Timeout)
             ));
 
-            producer.commit();
+            batch.publish();
 
             let value = match consumer.read_timeout(Duration::ZERO) {
                 Ok(value) => value,
