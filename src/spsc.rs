@@ -180,6 +180,16 @@ impl<T> Producer<T> {
         self.queue.capacity()
     }
 
+    /// Return the number of items that can currently be written.
+    pub fn current_capacity(&self) -> usize {
+        let read_cursor = self.queue.header().read.load(Ordering::Relaxed);
+        let write_cursor = self.queue.cached_write;
+
+        let used_capacity = write_cursor.wrapping_sub(read_cursor);
+
+        self.capacity().saturating_sub(used_capacity)
+    }
+
     /// Return the current length of the queue.
     pub fn len(&self) -> usize {
         self.queue.len()
@@ -398,6 +408,16 @@ impl<T> Consumer<T> {
     /// Return the capacity of the queue in items.
     pub fn capacity(&self) -> usize {
         self.queue.capacity()
+    }
+
+    /// Return the number of items the producer can currently write.
+    pub fn current_capacity(&self) -> usize {
+        let read_cursor = self.queue.cached_read;
+        let write_cursor = self.queue.header().write.load(Ordering::Relaxed);
+
+        let used_capacity = write_cursor.wrapping_sub(read_cursor);
+
+        self.capacity().saturating_sub(used_capacity)
     }
 
     /// Return the current length of the queue.
@@ -1356,6 +1376,25 @@ mod tests {
         for create_queue in test_queue_creators::<u64>() {
             let (producer, _consumer) = create_queue(3);
             assert_eq!(producer.capacity(), 4);
+        }
+    }
+
+    #[test]
+    fn test_current_capacity_tracks_free_slots() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+            assert_eq!(producer.current_capacity(), 4);
+
+            assert!(producer.try_write(1).is_ok());
+            assert!(producer.try_write(2).is_ok());
+            assert_eq!(producer.current_capacity(), 2);
+
+            assert_eq!(consumer.try_read(), Some(1));
+            assert_eq!(producer.current_capacity(), 3);
+            assert_eq!(consumer.current_capacity(), 3);
+
+            assert!(producer.try_write(3).is_ok());
+            assert_eq!(consumer.current_capacity(), 2);
         }
     }
 

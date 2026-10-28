@@ -30,6 +30,11 @@ impl<T> Producer<T> {
         self.queue.capacity()
     }
 
+    /// Returns the number of items that can currently be reserved for writing.
+    pub fn current_capacity(&self) -> usize {
+        self.queue.current_capacity()
+    }
+
     /// Returns the identifier of the queue.
     ///
     /// Returns `0` when created without an explicit identifier.
@@ -245,6 +250,11 @@ impl<T> Consumer<T> {
     /// Returns the capacity of the queue in items.
     pub fn capacity(&self) -> usize {
         self.queue.capacity()
+    }
+
+    /// Returns the number of items that can currently be reserved for writing.
+    pub fn current_capacity(&self) -> usize {
+        self.queue.current_capacity()
     }
 
     /// Returns the identifier of the queue.
@@ -623,6 +633,20 @@ impl<T> SharedQueue<T> {
     #[inline]
     fn capacity(&self) -> usize {
         self.buffer_mask.wrapping_add(1)
+    }
+
+    fn current_capacity(&self) -> usize {
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+
+        // Load the consumer cursor first to avoid producer trailing it.
+        let consumer_release = header.consumer_release.load(Ordering::Acquire);
+        let producer_reservation = header.producer_reservation.load(Ordering::Relaxed);
+        let unreleased_slots = producer_reservation.wrapping_sub(consumer_release);
+
+        // Use `saturating_sub` since the cursors above can advance between the loads, which can overstate
+        // `unreleased_slots`.
+        self.capacity().saturating_sub(unreleased_slots)
     }
 
     fn reserve_write(&self) -> Option<(NonNull<T>, usize)> {
@@ -1893,6 +1917,23 @@ mod tests {
 
             assert_eq!(producer.capacity(), 4);
             assert_eq!(consumer.capacity(), 4);
+        }
+    }
+
+    #[test]
+    fn test_current_capacity_tracks_free_slots() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (producer, consumer) = create_queue(4);
+            assert_eq!(producer.current_capacity(), 4);
+
+            assert!(producer.try_write_slice(&[1, 2, 3]));
+            assert_eq!(producer.current_capacity(), 1);
+            assert_eq!(consumer.current_capacity(), 1);
+
+            let guard = consumer.try_reserve_read().unwrap();
+            assert_eq!(producer.current_capacity(), 1);
+            drop(guard);
+            assert_eq!(producer.current_capacity(), 2);
         }
     }
 

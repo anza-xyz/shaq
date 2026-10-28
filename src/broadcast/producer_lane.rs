@@ -203,6 +203,14 @@ impl ProducerLane {
     }
 
     #[inline]
+    pub(crate) fn current_capacity(&self) -> usize {
+        match self.consumer_state.reserve_limit() {
+            Some(limit) => limit.saturating_sub(self.published()),
+            None => self.capacity(),
+        }
+    }
+
+    #[inline]
     pub(crate) fn mask(&self, sequence: usize) -> usize {
         sequence & self.mask
     }
@@ -266,9 +274,12 @@ impl ProducerLane {
         // joining consumer may read. See src/broadcast/loom_tests.rs.
         // Each slot already stores `next_to_read + capacity`, so the gate is a
         // plain comparison: rejecting once the batch would reach a sequence a
-        // consumer still needs. Unowned slots sit at the top, so they never
-        // gate.
-        if start.wrapping_add(count.get()) > self.consumer_state.reserve_limit() {
+        // consumer still needs.
+        if self
+            .consumer_state
+            .reserve_limit()
+            .is_some_and(|limit| start.wrapping_add(count.get()) > limit)
+        {
             self.header()
                 .rejected_items
                 .fetch_add(count.get() as u64, Ordering::Relaxed);

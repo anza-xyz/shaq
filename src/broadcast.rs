@@ -869,6 +869,12 @@ impl<T: Copy> Producer<T> {
         self.lane.capacity()
     }
 
+    /// Returns the number of items this producer can currently write before
+    /// the slowest active consumer back-pressures it.
+    pub fn current_capacity(&self) -> usize {
+        self.lane.current_capacity()
+    }
+
     /// Creates a broadcast queue in `file` and joins as a producer.
     ///
     /// # Safety
@@ -2495,6 +2501,35 @@ mod tests {
             for consumer_thread in consumer_threads {
                 assert_eq!(consumer_thread.join().expect("consumer thread"), expected);
             }
+        }
+    }
+
+    #[test]
+    fn current_capacity_tracks_slowest_consumer() {
+        for create in producer_creators() {
+            let mut p = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 2,
+            });
+            assert_eq!(p.current_capacity(), 4);
+
+            let mut fast = p.broadcast_handle().consumer().unwrap();
+            let mut slow = p.broadcast_handle().consumer().unwrap();
+            for value in 0..3u64 {
+                assert!(p.try_write(value).is_ok());
+            }
+            assert_eq!(p.current_capacity(), 1);
+
+            assert_eq!(fast.try_read(), Some(0));
+            assert_eq!(fast.try_read(), Some(1));
+            assert_eq!(p.current_capacity(), 1);
+
+            assert_eq!(slow.try_read(), Some(0));
+            assert_eq!(p.current_capacity(), 2);
+
+            drop(slow);
+            assert_eq!(p.current_capacity(), 3);
         }
     }
 
