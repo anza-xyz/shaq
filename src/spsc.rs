@@ -3,7 +3,10 @@ use crate::{
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
     shmem::Region,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
 };
 use core::{
@@ -13,7 +16,7 @@ use core::{
     ops::{Index, Range},
     ptr::NonNull,
 };
-use std::{fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{fs::File, num::NonZeroUsize, time::Duration};
 
 /// Magic signature for SPSC queues in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
@@ -1070,7 +1073,17 @@ impl SharedQueueHeader {
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.identifier = identifier;
-        header.magic.store(MAGIC, Ordering::Release);
+        header.publish_initialization();
+    }
+
+    /// Publishes all header fields written by the sole initializer.
+    fn publish_initialization(&self) {
+        self.magic.store(MAGIC, Ordering::Release);
+    }
+
+    /// A successful check acquires the initialized, immutable header metadata.
+    fn is_initialized(&self) -> bool {
+        self.magic.load(Ordering::Acquire) == MAGIC
     }
 
     fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
@@ -1089,7 +1102,7 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.magic.load(Ordering::Acquire) != MAGIC {
+            if !header.is_initialized() {
                 return Err(Error::InvalidMagic);
             }
             if header.version != VERSION {
@@ -1108,6 +1121,9 @@ impl SharedQueueHeader {
         Ok(header)
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests;
 
 #[cfg(all(test, not(loom)))]
 mod tests {

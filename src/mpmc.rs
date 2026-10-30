@@ -5,7 +5,10 @@ use crate::{
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
     shmem::Region,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
 };
 use core::{
@@ -15,7 +18,7 @@ use core::{
     ops::{Index, Range},
     ptr::NonNull,
 };
-use std::{fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{fs::File, num::NonZeroUsize, time::Duration};
 
 /// Magic signature for MPMC queues in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
