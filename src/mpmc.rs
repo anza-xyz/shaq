@@ -918,7 +918,17 @@ impl SharedQueueHeader {
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.identifier = identifier;
-        header.magic.store(MAGIC, Ordering::Release);
+        header.publish_initialization();
+    }
+
+    /// Publishes all header fields written by the sole initializer.
+    fn publish_initialization(&self) {
+        self.magic.store(MAGIC, Ordering::Release);
+    }
+
+    /// A successful check acquires the initialized, immutable header metadata.
+    fn is_initialized(&self) -> bool {
+        self.magic.load(Ordering::Acquire) == MAGIC
     }
 
     fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
@@ -937,7 +947,7 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.magic.load(Ordering::Acquire) != MAGIC {
+            if !header.is_initialized() {
                 return Err(Error::InvalidMagic);
             }
             if header.version != VERSION {
