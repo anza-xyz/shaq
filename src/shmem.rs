@@ -1,5 +1,5 @@
-use crate::error::Error;
-use std::{fs::File, num::NonZeroUsize, ptr::NonNull, sync::Arc};
+use crate::{error::Error, sync::Arc};
+use std::{fs::File, num::NonZeroUsize, ptr::NonNull};
 
 pub(crate) const MINIMUM_REGION_ALIGNMENT: usize = 4096;
 
@@ -178,7 +178,7 @@ unsafe fn unmap_file(addr: NonNull<u8>, _size: usize) {
     };
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(all(test, not(miri), not(loom)))]
 pub(crate) fn create_temp_shmem_file() -> Result<File, Error> {
     use std::fs::OpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,7 +214,7 @@ pub(crate) fn create_temp_shmem_file() -> Result<File, Error> {
     Ok(file)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
