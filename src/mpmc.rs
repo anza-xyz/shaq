@@ -7,6 +7,7 @@ use crate::{
     shmem::Region,
     sync::{
         atomic::{AtomicU64, Ordering},
+        hint::spin_loop,
         Arc,
     },
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
@@ -696,6 +697,8 @@ impl<T> SharedQueue<T> {
             let available = producer_publication.wrapping_sub(consumer_reservation);
             let reservation_is_stale = available > capacity;
             if reservation_is_stale {
+                // A stale publication snapshot may require repeated retries.
+                spin_loop();
                 consumer_reservation = header.consumer_reservation.load(Ordering::Relaxed);
                 continue;
             }
@@ -962,7 +965,7 @@ impl SharedQueueHeader {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.producer_publication.load(Ordering::Acquire) != start {
-            core::hint::spin_loop();
+            spin_loop();
         }
         // Release publication; `wake` supplies the fence that pairs it with
         // a registering waiter and must be called unconditionally; see the
@@ -985,7 +988,7 @@ impl SharedQueueHeader {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.consumer_release.load(Ordering::Acquire) != start {
-            core::hint::spin_loop();
+            spin_loop();
         }
         header
             .consumer_release
