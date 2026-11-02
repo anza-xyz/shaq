@@ -205,7 +205,12 @@ const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 /// Baseline `check` attempts before a waiter's first sleep in
 /// [`Waiters::wait_for`], for a unit-cost `check`. Callers with a costlier
 /// `check` scale this down so the total spin work stays comparable.
+#[cfg(not(loom))]
 pub(crate) const SPIN_ATTEMPTS: usize = 2048;
+
+// Explore registration and sleep races directly, without modeling busy spins.
+#[cfg(loom)]
+pub(crate) const SPIN_ATTEMPTS: usize = 0;
 
 #[cfg(all(target_os = "linux", not(loom)))]
 mod imp {

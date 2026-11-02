@@ -488,19 +488,9 @@ fn publication_wakes_waiting_consumer() {
         let cell = Arc::new(UnsafeCell::new(0));
         let reader_cell = cell.clone();
         let reader = thread::spawn(move || {
-            let header = consumer.queue.header;
-            // SAFETY: the consumer keeps its initialized header alive.
-            let header = unsafe { header.as_ref() };
-            // Match reserve_read_batch_timeout, omitting its 2048 spin attempts
-            // so Loom explores registration, recheck, and compare-and-sleep.
-            let reservation = header
-                .waiters
-                .wait_for(&header.write, 0, Duration::MAX, || {
-                    consumer.queue.load_write();
-                    consumer.try_reserve_read_range(NonZeroUsize::MIN)
-                })
+            let batch = consumer
+                .reserve_read_batch_timeout(NonZeroUsize::MIN, Duration::MAX)
                 .unwrap();
-            let batch = consumer.read_batch_for(reservation);
             assert_eq!(batch.len(), 1);
             assert_eq!(read(&reader_cell), 42);
         });
