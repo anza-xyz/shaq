@@ -92,10 +92,17 @@ fn read_batch(
 
 #[test]
 fn initialization_publishes_header_metadata() {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct HeaderMetadata {
+        version: u32,
+        buffer_mask: u32,
+        identifier: u64,
+    }
+
     loom::model(|| {
         // Raw metadata accesses are invisible to Loom. The shadow starts empty
         // and is filled before the real header publication operation.
-        let metadata = Arc::new(UnsafeCell::new((0, 0, 0)));
+        let metadata = Arc::new(UnsafeCell::new(HeaderMetadata::default()));
         let header = Arc::new(SharedQueueHeader {
             magic: AtomicU64::new(0),
             version: VERSION,
@@ -112,7 +119,13 @@ fn initialization_publishes_header_metadata() {
             initializer_metadata.with_mut(|ptr| {
                 // SAFETY: the sole initializer owns the metadata until it
                 // publishes magic. Loom checks the joining reader's ordering.
-                unsafe { *ptr = (VERSION, 1, 42) };
+                unsafe {
+                    *ptr = HeaderMetadata {
+                        version: VERSION,
+                        buffer_mask: 1,
+                        identifier: 42,
+                    }
+                };
             });
             initializer_header.publish_initialization();
         });
@@ -126,7 +139,11 @@ fn initialization_publishes_header_metadata() {
                 let initialized = unsafe { *ptr };
                 assert_eq!(
                     initialized,
-                    (header.version, header.buffer_mask, header.identifier)
+                    HeaderMetadata {
+                        version: header.version,
+                        buffer_mask: header.buffer_mask,
+                        identifier: header.identifier,
+                    }
                 );
             });
         }
