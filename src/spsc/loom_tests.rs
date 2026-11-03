@@ -5,6 +5,8 @@
 //! is detected without concurrently dereferencing untracked queue payloads.
 //! Initialization uses shadow metadata; allocation and mapping are not modeled.
 //! These bounded models do not cover timeouts or OS futex behavior.
+//! Concurrent operations run in workers to avoid
+//! [Loom #392](https://github.com/tokio-rs/loom/issues/392).
 
 use super::*;
 use loom::{cell::UnsafeCell, sync::Arc, thread};
@@ -130,23 +132,27 @@ fn initialization_publishes_header_metadata() {
             initializer_header.publish_initialization();
         });
 
-        // The join may reject an unfinished header. Observing magic must make
-        // all initialized metadata visible without joining the writer first.
-        if header.is_initialized() {
-            metadata.with(|ptr| {
-                // SAFETY: successful initialization publication protects this
-                // access. Loom detects missing release/acquire synchronization.
-                let initialized = unsafe { *ptr };
-                assert_eq!(
-                    initialized,
-                    HeaderMetadata {
-                        version: header.version,
-                        buffer_mask: header.buffer_mask,
-                        identifier: header.identifier,
-                    }
-                );
-            });
-        }
+        let joiner_header = header.clone();
+        let joiner = thread::spawn(move || {
+            // The join may reject an unfinished header. Observing magic must make
+            // all initialized metadata visible without joining the writer first.
+            if joiner_header.is_initialized() {
+                metadata.with(|ptr| {
+                    // SAFETY: successful initialization publication protects this
+                    // access. Loom detects missing release/acquire synchronization.
+                    let initialized = unsafe { *ptr };
+                    assert_eq!(
+                        initialized,
+                        HeaderMetadata {
+                            version: joiner_header.version,
+                            buffer_mask: joiner_header.buffer_mask,
+                            identifier: joiner_header.identifier,
+                        }
+                    );
+                });
+            }
+        });
+        joiner.join().unwrap();
         initializer.join().unwrap();
         assert!(header.is_initialized());
     });
@@ -158,12 +164,16 @@ fn batch_publication_orders_payload() {
         // Both values fit contiguously, with no cursor or buffer wraparound.
         let (mut producer, mut consumer, cells) = queue_with_payloads(4, 0);
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             write_batch(&mut producer, &writer_cells, &[10, 11]);
         });
-
-        // Race publication: the complete batch must be visible or nothing yet.
-        let items = read_batch(&mut consumer, &cells, 2);
+        let reader = thread::spawn(move || {
+            // Race publication: the complete batch must be visible or nothing yet.
+            let items = read_batch(&mut consumer, &reader_cells, 2);
+            (consumer, items)
+        });
+        let (mut consumer, items) = reader.join().unwrap();
         writer.join().unwrap();
         let items = items
             .or_else(|| read_batch(&mut consumer, &cells, 2))
@@ -180,12 +190,16 @@ fn batch_publication_orders_payload_across_cursor_wrap() {
         // The logical cursor advances from usize::MAX to zero.
         let (mut producer, mut consumer, cells) = queue_with_payloads(4, usize::MAX);
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             write_batch(&mut producer, &writer_cells, &[10, 11]);
         });
-
-        // Race publication: the complete batch must be visible or nothing yet.
-        let items = read_batch(&mut consumer, &cells, 2);
+        let reader = thread::spawn(move || {
+            // Race publication: the complete batch must be visible or nothing yet.
+            let items = read_batch(&mut consumer, &reader_cells, 2);
+            (consumer, items)
+        });
+        let (mut consumer, items) = reader.join().unwrap();
         writer.join().unwrap();
         let items = items
             .or_else(|| read_batch(&mut consumer, &cells, 2))
@@ -202,12 +216,16 @@ fn batch_publication_orders_payload_across_buffer_wrap() {
         // Physical slots three and zero, while the logical cursor advances normally.
         let (mut producer, mut consumer, cells) = queue_with_payloads(4, 3);
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             write_batch(&mut producer, &writer_cells, &[10, 11]);
         });
-
-        // Race publication: the complete batch must be visible or nothing yet.
-        let items = read_batch(&mut consumer, &cells, 2);
+        let reader = thread::spawn(move || {
+            // Race publication: the complete batch must be visible or nothing yet.
+            let items = read_batch(&mut consumer, &reader_cells, 2);
+            (consumer, items)
+        });
+        let (mut consumer, items) = reader.join().unwrap();
         writer.join().unwrap();
         let items = items
             .or_else(|| read_batch(&mut consumer, &cells, 2))
@@ -226,6 +244,7 @@ fn repeated_batches_preserve_fifo_during_slot_reuse() {
         assert_eq!(producer.try_write(0), Err(0));
 
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             let mut written = 0;
             // Bounded attempts let Loom explore both full and reusable slots
@@ -239,16 +258,19 @@ fn repeated_batches_preserve_fifo_during_slot_reuse() {
             }
             (producer, written)
         });
-
-        let mut next = 10;
-        for _ in 0..2 {
-            if let Some(items) = read_batch(&mut consumer, &cells, 2) {
-                for value in items {
-                    assert_eq!(value, next);
-                    next += 1;
+        let reader = thread::spawn(move || {
+            let mut next = 10;
+            for _ in 0..2 {
+                if let Some(items) = read_batch(&mut consumer, &reader_cells, 2) {
+                    for value in items {
+                        assert_eq!(value, next);
+                        next += 1;
+                    }
                 }
             }
-        }
+            (consumer, next)
+        });
+        let (mut consumer, mut next) = reader.join().unwrap();
         let (_producer, written) = writer.join().unwrap();
         if let Some(items) = read_batch(&mut consumer, &cells, 2) {
             for value in items {
@@ -267,16 +289,20 @@ fn read_reservation_orders_slot_reuse_across_cursor_wrap() {
         let (mut producer, mut consumer) = queue(1, usize::MAX);
         let cell = Arc::new(UnsafeCell::new(0));
         assert!(write(&mut producer.write_batch(), &cell, 1));
-        let batch = consumer.try_reserve_read_batch(NonZeroUsize::MIN).unwrap();
-
         let writer_cell = cell.clone();
+        let reader_cell = cell.clone();
         let writer = thread::spawn(move || {
             let written = write(&mut producer.write_batch(), &writer_cell, 2);
             (producer, written)
         });
-        // Advancing the private read cursor must not release this live batch.
-        assert_eq!(read(&cell), 1);
-        drop(batch);
+        let reader = thread::spawn(move || {
+            let batch = consumer.try_reserve_read_batch(NonZeroUsize::MIN).unwrap();
+            // Advancing the private read cursor must not release this live batch.
+            assert_eq!(read(&reader_cell), 1);
+            drop(batch);
+            consumer
+        });
+        let mut consumer = reader.join().unwrap();
         let (mut producer, written) = writer.join().unwrap();
         if !written {
             assert!(write(&mut producer.write_batch(), &cell, 2));
@@ -367,17 +393,20 @@ fn try_reuse_after_drops(
 fn batch_drop_finishes_all_destructors_before_slot_reuse() {
     loom::model(|| {
         let (mut producer, mut consumer, cells) = queue_with_drop_payloads();
-        let batch = consumer
-            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
-            .unwrap();
-        assert_eq!(batch.len(), 2);
-
         let writer_cells = cells.clone();
         let writer = thread::spawn(move || {
             let reused = try_reuse_after_drops(&mut producer, &writer_cells);
             (producer, reused)
         });
-        drop(batch);
+        let reader = thread::spawn(move || {
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .unwrap();
+            assert_eq!(batch.len(), 2);
+            drop(batch);
+            consumer
+        });
+        let _consumer = reader.join().unwrap();
         let (mut producer, reused) = writer.join().unwrap();
         if !reused {
             assert!(try_reuse_after_drops(&mut producer, &cells));
@@ -392,23 +421,27 @@ fn batch_drop_finishes_all_destructors_before_slot_reuse() {
 fn partial_iterator_drop_finishes_suffix_before_slot_reuse() {
     loom::model(|| {
         let (mut producer, mut consumer, cells) = queue_with_drop_payloads();
-        let batch = consumer
-            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
-            .unwrap();
-        assert_eq!(batch.len(), 2);
-        let mut iter = batch.into_iter();
-        drop(iter.next().unwrap());
-        assert_eq!(read(&cells[1]), 2);
-        assert_eq!(read(&cells[0]), 1);
-
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             let reused = try_reuse_after_drops(&mut producer, &writer_cells);
             (producer, reused)
         });
-        // The first item is gone, but its slot stays reserved along with the
-        // suffix until dropping the iterator finishes the remaining destructor.
-        drop(iter);
+        let reader = thread::spawn(move || {
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .unwrap();
+            assert_eq!(batch.len(), 2);
+            let mut iter = batch.into_iter();
+            drop(iter.next().unwrap());
+            assert_eq!(read(&reader_cells[1]), 2);
+            assert_eq!(read(&reader_cells[0]), 1);
+            // The first item is gone, but its slot stays reserved along with the
+            // suffix until dropping the iterator finishes the remaining destructor.
+            drop(iter);
+            consumer
+        });
+        let _consumer = reader.join().unwrap();
         let (mut producer, reused) = writer.join().unwrap();
         if !reused {
             assert!(try_reuse_after_drops(&mut producer, &cells));
@@ -423,6 +456,7 @@ fn last_endpoint_reclaims_buffered_values() {
     loom::model(|| {
         let (producer, consumer, cells) = queue_with_drop_payloads();
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             // Even if the consumer is gone, this endpoint keeps the values live.
             for cell in writer_cells.iter() {
@@ -430,13 +464,15 @@ fn last_endpoint_reclaims_buffered_values() {
             }
             drop(producer);
         });
-
-        // Either endpoint may disappear first, but neither may reclaim values
-        // while the other still owns the queue.
-        for cell in cells.iter() {
-            assert_eq!(read(cell), 1);
-        }
-        drop(consumer);
+        let reader = thread::spawn(move || {
+            // Either endpoint may disappear first, but neither may reclaim values
+            // while the other still owns the queue.
+            for cell in reader_cells.iter() {
+                assert_eq!(read(cell), 1);
+            }
+            drop(consumer);
+        });
+        reader.join().unwrap();
         writer.join().unwrap();
         for cell in cells.iter() {
             assert_eq!(read(cell), 2);
@@ -455,6 +491,7 @@ fn reclamation_observes_final_publication_and_consumer_progress() {
             .is_ok());
 
         let writer_cells = cells.clone();
+        let reader_cells = cells.clone();
         let writer = thread::spawn(move || {
             writer_cells[1].with_mut(|ptr| {
                 // SAFETY: this value has not been published yet, so its shadow
@@ -466,13 +503,15 @@ fn reclamation_observes_final_publication_and_consumer_progress() {
                 .is_ok());
             drop(producer);
         });
-
-        // Consume only the first value. Cleanup must skip its released slot
-        // and destroy the final publication exactly once, across cursor wrap.
-        let batch = consumer.try_reserve_read_batch(NonZeroUsize::MIN).unwrap();
-        drop(batch);
-        assert_eq!(read(&cells[0]), 2);
-        drop(consumer);
+        let reader = thread::spawn(move || {
+            // Consume only the first value. Cleanup must skip its released slot
+            // and destroy the final publication exactly once, across cursor wrap.
+            let batch = consumer.try_reserve_read_batch(NonZeroUsize::MIN).unwrap();
+            drop(batch);
+            assert_eq!(read(&reader_cells[0]), 2);
+            drop(consumer);
+        });
+        reader.join().unwrap();
         writer.join().unwrap();
         for cell in cells.iter() {
             assert_eq!(read(cell), 2);
@@ -487,6 +526,7 @@ fn publication_wakes_waiting_consumer() {
         let (mut producer, mut consumer) = queue(1, usize::MAX);
         let cell = Arc::new(UnsafeCell::new(0));
         let reader_cell = cell.clone();
+        let writer_cell = cell.clone();
         let reader = thread::spawn(move || {
             let batch = consumer
                 .reserve_read_batch_timeout(NonZeroUsize::MIN, Duration::MAX)
@@ -494,8 +534,10 @@ fn publication_wakes_waiting_consumer() {
             assert_eq!(batch.len(), 1);
             assert_eq!(read(&reader_cell), 42);
         });
-
-        assert!(write(&mut producer.write_batch(), &cell, 42));
+        let writer = thread::spawn(move || {
+            assert!(write(&mut producer.write_batch(), &writer_cell, 42));
+        });
         reader.join().unwrap();
+        writer.join().unwrap();
     });
 }
