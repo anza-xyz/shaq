@@ -196,7 +196,13 @@ impl<T> Producer<T> {
     /// Start a batched write.
     pub fn write_batch(&mut self) -> WriteBatch<'_, T> {
         self.sync();
-        WriteBatch { producer: self }
+        let base = self.queue.cached_write;
+        WriteBatch {
+            producer: self,
+            base,
+            len: 0,
+            init: 0,
+        }
     }
 
     /// Writes item into the queue or returns it if there is not enough space.
@@ -204,47 +210,10 @@ impl<T> Producer<T> {
     /// When writing multiple items, prefer [`Self::write_batch`] to amortize
     /// synchronization and publication across the batch.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
-        self.sync();
-        self.try_write_inner(item)?;
-        self.commit();
+        let mut batch = self.write_batch();
+        batch.try_write(item)?;
+        batch.publish();
         Ok(())
-    }
-
-    /// Writes item into the queue or returns it if there is not enough space.
-    /// Does not perform synchronization of cached cursors.
-    fn try_write_inner(&mut self, item: T) -> Result<(), T> {
-        // SAFETY: pointer is written below if successfully reserved.
-        match unsafe { self.reserve() } {
-            Some(p) => {
-                // SAFETY: `reserve` returns a properly aligned ptr with enough
-                //         space to write T.
-                unsafe { p.write(item) };
-                Ok(())
-            }
-            None => Err(item),
-        }
-    }
-
-    /// Reserves a position, and increments the cached write position.
-    /// Returns `None` if the queue is full.
-    /// Returns a pointer to the reserved position.
-    ///
-    /// # Safety
-    /// All reserved positions must be fully initialized before calling `commit`.
-    /// Pointers should be dropped before calling `commit`.
-    unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
-        // If write is > read + buffer_mask, the queue is written one iteration
-        // ahead of the consumer, and we cannot reserve more space.
-        if self.queue.cached_write.wrapping_sub(self.queue.cached_read) > self.queue.buffer_mask {
-            return None;
-        }
-
-        let reserved_index = self.queue.mask(self.queue.cached_write);
-        // SAFETY: The reserved index is guaranteed to be within bounds given the mask.
-        let reserved_ptr = unsafe { self.queue.buffer.add(reserved_index) };
-        self.queue.cached_write = self.queue.cached_write.wrapping_add(1);
-
-        Some(reserved_ptr)
     }
 
     /// Commits the reserved position, making it visible to the consumer.
@@ -271,37 +240,162 @@ impl<T> Producer<T> {
 // to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Producer<T> {}
 
-/// A batch of writes published on drop.
+/// A reserved batch of writes that offers infallible publishing of messages with [`WriteBatch::publish`]
+///
+/// Cells are reserved with [`WriteBatch::try_reserve`] and initialized through
+/// [`WriteGuard`]. [`WriteBatch::publish`] publishes the cells marked with
+/// [`WriteGuard::assume_init`].
+///
+/// Dropping the batch without publishing runs the destructors of the marked
+/// cells and recycles them for a later write. Cells never marked to hold a
+/// valid `T` are discarded without running destructors, since they may hold
+/// partial writes. Forgetting the batch leaks the marked values, like
+/// forgetting any other collection.
 #[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
+    /// Queue write cursor when the batch was created. It never advances until
+    /// publishing, so dropped batches recycle their cells.
+    base: usize,
+    /// Cells reserved so far, including any not initialized.
+    len: usize,
+    /// Cells marked as initialized. They form the published prefix.
+    init: usize,
 }
 
 impl<'a, T> WriteBatch<'a, T> {
     /// If the next sequence number is available, writes the item and returns Ok(()).
     /// Otherwise, returns an error with the item.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
-        self.producer.try_write_inner(item)
+        // A cell reserved but not initialized leaves the batch unable to
+        // reserve cleanly behind it; refuse further items.
+        if self.init < self.len {
+            return Err(item);
+        }
+        match self.head_cell() {
+            Some(ptr) => {
+                // SAFETY: the cell is reserved exclusively for this batch and
+                // holds a valid `T` before `Ok` is returned.
+                unsafe { ptr.write(item) };
+                self.len += 1;
+                self.init += 1;
+                Ok(())
+            }
+            None => Err(item),
+        }
     }
 
-    /// Returns a mutable reference to the next reserved position if one is available.
+    /// Publishes every marked cell together and wakes the consumer.
     ///
-    /// # Safety
-    /// If this returns `Some`, the caller must initialize the reserved slot with a
-    /// valid `T` before the batch is dropped and publishes it. This requirement
-    /// also applies if control exits by unwinding.
-    pub unsafe fn try_as_mut(&mut self) -> Option<&mut MaybeUninit<T>> {
-        // SAFETY: The reserved slot belongs exclusively to this producer.
-        let mut reserved = unsafe { self.producer.reserve() }?.cast();
-        // SAFETY: The mutable reference is tied to the borrow of this batch.
-        Some(unsafe { reserved.as_mut() })
+    /// Reserved cells never marked with [`WriteGuard::assume_init`] stay
+    /// unpublished; the queue recycles them for a later write.
+    pub fn publish(mut self) {
+        self.publish_now();
+    }
+
+    fn publish_now(&mut self) {
+        self.producer.queue.cached_write = self.base.wrapping_add(self.init);
+        self.producer.commit();
+        // Marked cells now belong to the consumer, so Drop must not run their
+        // destructors; the batch continues from the new cursor.
+        self.base = self.producer.queue.cached_write;
+        self.len = 0;
+        self.init = 0;
+    }
+
+    /// Reserves the next cell of this batch, returning a guard over it.
+    ///
+    /// Returns `None` if the queue is full or the last reserved cell was
+    /// dropped or forgotten without [`WriteGuard::assume_init`]; mark cells
+    /// as they are reserved to continue writing into this batch.
+    pub fn try_reserve(&mut self) -> Option<WriteGuard<'_, 'a, T>> {
+        if self.init < self.len {
+            return None;
+        }
+        let ptr = self.head_cell()?;
+        self.len += 1;
+        Some(WriteGuard {
+            ptr: ptr.cast(),
+            batch: self,
+            marked: false,
+        })
+    }
+
+    /// Returns the pointer to the next cell to reserve, or `None` if the
+    /// queue is full.
+    fn head_cell(&self) -> Option<NonNull<T>> {
+        let queue = &self.producer.queue;
+        // If the queue is written one iteration ahead of the consumer, we
+        // cannot reserve more space.
+        let absolute = self.base.wrapping_add(self.len);
+        if absolute.wrapping_sub(queue.cached_read) > queue.buffer_mask {
+            return None;
+        }
+        // SAFETY: the masked index is guaranteed to be within bounds of the
+        // buffer.
+        Some(unsafe { queue.buffer.add(queue.mask(absolute)) })
     }
 }
 
-impl<'a, T> Drop for WriteBatch<'a, T> {
+impl<T> Drop for WriteBatch<'_, T> {
     fn drop(&mut self) {
-        // Commit any written items
-        self.producer.commit();
+        // Discard the batch without publishing: run the destructors of the
+        // marked cells so their values are not leaked. Cells never marked may
+        // hold partial writes and are left to the queue to overwrite. The
+        // producer cursor is untouched, so even a forgotten batch can never
+        // expose its cells to the consumer.
+        let queue = &self.producer.queue;
+        for i in 0..self.init {
+            // SAFETY: the masked index of the marked cell is in bounds, and
+            // the cell is owned by this batch until the cursor advances.
+            let cell = unsafe { queue.buffer.add(queue.mask(self.base.wrapping_add(i))) };
+            // SAFETY: marked cells hold fully initialized `T`s.
+            unsafe { cell.as_ptr().drop_in_place() };
+        }
+    }
+}
+
+/// A single reserved cell within a [`WriteBatch`].
+///
+/// Write into the cell via [`Self::as_mut`], then mark it valid with
+/// [`Self::assume_init`]. While the guard exists, the batch cannot reserve
+/// another cell or be published.
+///
+/// Dropping the guard without marking it discards the cell without running
+/// destructors (the cell may hold partial writes); the batch refuses further
+/// reservations, but the cells marked earlier can still be published.
+pub struct WriteGuard<'a, 'b, T> {
+    ptr: NonNull<MaybeUninit<T>>,
+    batch: &'a mut WriteBatch<'b, T>,
+    marked: bool,
+}
+
+impl<'a, T> WriteGuard<'a, '_, T> {
+    /// Mutable reference to the reserved cell.
+    pub fn as_mut(&mut self) -> &mut MaybeUninit<T> {
+        // SAFETY: the cell is reserved exclusively for this batch, and the
+        // mutable reference is tied to this guard's borrow.
+        unsafe { self.ptr.as_mut() }
+    }
+
+    /// Marks the reserved cell as holding a valid `T`, extending the prefix
+    /// that [`WriteBatch::publish`] makes visible.
+    ///
+    /// # Safety
+    /// The cell must contain a fully initialized `T`, including when control
+    /// exits by unwinding: an unmarked cell is never dropped. This must be
+    /// called at most once per guard, and guards must be marked in
+    /// reservation order.
+    pub unsafe fn assume_init(&mut self) {
+        debug_assert!(!self.marked, "cell already marked");
+        self.marked = true;
+        self.batch.init += 1;
+    }
+
+    /// Publishes every marked cell in the batch and wakes the consumer. The
+    /// batch continues reserving from the new cursor.
+    pub fn publish(self) {
+        self.batch.publish_now();
     }
 }
 
@@ -1252,12 +1346,15 @@ mod tests {
             assert_eq!(producer.capacity(), BUFFER_CAPACITY);
             assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
 
-            // SAFETY: single producer over a freshly created queue.
-            let spot = unsafe { producer.reserve() }.expect("Failed to reserve");
-            // SAFETY: spot is a valid reserved slot.
-            unsafe { spot.as_ref() }.store(42, Ordering::Release);
-            assert!(consumer.try_read().is_none()); // not committed yet
-            producer.commit();
+            let mut batch = producer.write_batch();
+            {
+                let mut guard = batch.try_reserve().expect("reserve failed");
+                guard.as_mut().write(Item::new(42));
+                // SAFETY: the slot is written before the batch is published.
+                unsafe { guard.assume_init() };
+            }
+            assert!(consumer.try_read().is_none(), "not committed yet");
+            batch.publish();
             let item = consumer.try_read().expect("Failed to read item");
             assert_eq!(item.load(Ordering::Acquire), 42);
             assert!(consumer.try_read().is_none()); // no more items to read
@@ -1269,6 +1366,7 @@ mod tests {
                     assert!(batch.try_write(AtomicU64::new(1)).is_ok());
                 }
                 assert!(batch.try_write(AtomicU64::new(1)).is_err());
+                batch.publish();
             }
             {
                 let batch = consumer
@@ -1368,6 +1466,209 @@ mod tests {
     }
 
     #[test]
+    fn test_write_batch_requires_explicit_publish() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            let mut batch = producer.write_batch();
+            batch.try_write(10).unwrap();
+            batch.try_write(11).unwrap();
+            assert!(
+                consumer.try_read().is_none(),
+                "writes are invisible until publish"
+            );
+            batch.publish();
+            assert_eq!(consumer.try_read(), Some(10));
+            assert_eq!(consumer.try_read(), Some(11));
+
+            let mut batch = producer.write_batch();
+            {
+                let mut guard = batch.try_reserve().expect("reserve failed");
+                guard.as_mut().write(77);
+                // SAFETY: the slot is written before the batch is dropped.
+                unsafe { guard.assume_init() };
+            }
+            drop(batch);
+            assert!(
+                consumer.try_read().is_none(),
+                "dropped batch exposes nothing"
+            );
+            producer.try_write(42).unwrap();
+            assert_eq!(consumer.try_read(), Some(42));
+
+            let mut batch = producer.write_batch();
+            {
+                let mut guard = batch.try_reserve().expect("reserve failed");
+                guard.as_mut().write(77);
+                // SAFETY: the slot is written before the batch is forgotten.
+                unsafe { guard.assume_init() };
+            }
+            core::mem::forget(batch);
+            assert!(
+                consumer.try_read().is_none(),
+                "forgotten batch exposes nothing"
+            );
+            producer.try_write(7).unwrap();
+            assert_eq!(consumer.try_read(), Some(7));
+        }
+    }
+
+    #[test]
+    fn discarded_write_batch_drops_marked_values() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (mut producer, mut consumer) = create_queue(4);
+
+            // Marked values run their destructors when the batch is discarded.
+            let mut batch = producer.write_batch();
+            batch
+                .try_write(CountedItem {
+                    value: 1,
+                    drops: Arc::clone(&drops),
+                })
+                .unwrap_or_else(|_| panic!("write failed"));
+            drop(batch);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+            // Unmarked cells are discarded without running destructors.
+            let mut batch = producer.write_batch();
+            drop(batch.try_reserve().expect("reserve failed"));
+            drop(batch);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+            // The queue is still usable after the discards.
+            producer
+                .try_write(CountedItem {
+                    value: 2,
+                    drops: Arc::clone(&drops),
+                })
+                .unwrap_or_else(|_| panic!("write failed"));
+            let item = consumer.try_read().expect("read failed");
+            assert_eq!(item.value, 2);
+            drop(item);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+
+            // Forgotten batches leak, like forgetting any other collection.
+            let mut batch = producer.write_batch();
+            batch
+                .try_write(CountedItem {
+                    value: 3,
+                    drops: Arc::clone(&drops),
+                })
+                .unwrap_or_else(|_| panic!("write failed"));
+            core::mem::forget(batch);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn unmarked_guard_publishes_only_marked_prefix() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            let mut batch = producer.write_batch();
+            {
+                let mut guard = batch.try_reserve().expect("reserve failed");
+                guard.as_mut().write(10);
+                // SAFETY: the slot is written before the batch is published.
+                unsafe { guard.assume_init() };
+            }
+            // Dropping an unmarked guard discards its cell and stops this
+            // batch from reserving further cells.
+            drop(batch.try_reserve().expect("reserve failed"));
+            assert!(batch.try_reserve().is_none());
+            assert_eq!(batch.try_write(11), Err(11));
+
+            // The marked prefix still publishes.
+            batch.publish();
+            assert_eq!(consumer.try_read(), Some(10));
+            assert!(
+                consumer.try_read().is_none(),
+                "unmarked cell is not published"
+            );
+
+            // The queue continues from the published prefix.
+            producer.try_write(42).unwrap();
+            assert_eq!(consumer.try_read(), Some(42));
+        }
+    }
+
+    #[test]
+    fn write_guard_reserves_up_to_capacity() {
+        for create_queue in test_queue_creators::<u64>() {
+            let (mut producer, mut consumer) = create_queue(4);
+
+            let mut batch = producer.write_batch();
+            for i in 0..4 {
+                let mut guard = batch.try_reserve().expect("reserve failed");
+                guard.as_mut().write(i);
+                // SAFETY: the slot is written before the next reservation.
+                unsafe { guard.assume_init() };
+            }
+            assert!(
+                batch.try_reserve().is_none(),
+                "no cell can be reserved beyond capacity"
+            );
+            assert_eq!(batch.try_write(4), Err(4));
+            batch.publish();
+            for value in 0..4 {
+                assert_eq!(consumer.try_read(), Some(value));
+            }
+
+            // Publishing wraps the cursor for the next batch.
+            let mut batch = producer.write_batch();
+            batch.try_write(5).unwrap();
+            batch.publish();
+            assert_eq!(consumer.try_read(), Some(5));
+        }
+    }
+
+    #[test]
+    fn panicking_write_batch_drops_marked_values() {
+        for create_queue in test_queue_creators::<CountedItem>() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (mut producer, mut consumer) = create_queue(4);
+
+            let unwound = catch_unwind(AssertUnwindSafe(|| {
+                let mut batch = producer.write_batch();
+                batch
+                    .try_write(CountedItem {
+                        value: 1,
+                        drops: Arc::clone(&drops),
+                    })
+                    .unwrap_or_else(|_| panic!("write failed"));
+                {
+                    let mut guard = batch.try_reserve().expect("reserve failed");
+                    guard.as_mut().write(CountedItem {
+                        value: 2,
+                        drops: Arc::clone(&drops),
+                    });
+                    // SAFETY: the slot is written before the batch unwinds.
+                    unsafe { guard.assume_init() };
+                }
+                let _unmarked = batch.try_reserve().expect("reserve failed");
+                panic!("unwinding while the batch is open");
+            }));
+            assert!(unwound.is_err());
+
+            // Marked cells are dropped during the unwind and the queue is
+            // left consistent.
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            assert!(consumer.try_read().is_none(), "nothing was published");
+            producer
+                .try_write(CountedItem {
+                    value: 3,
+                    drops: Arc::clone(&drops),
+                })
+                .unwrap_or_else(|_| panic!("write failed"));
+            let item = consumer.try_read().expect("read failed");
+            assert_eq!(item.value, 3);
+            drop(item);
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+        }
+    }
+
+    #[test]
     fn test_capacity_rounds_up() {
         for create_queue in test_queue_creators::<u64>() {
             let (producer, _consumer) = create_queue(3);
@@ -1380,17 +1681,20 @@ mod tests {
         for create_queue in test_queue_creators::<u64>() {
             let (mut producer, mut consumer) = create_queue(64);
 
-            // SAFETY: single producer over a freshly created queue.
-            let spot = unsafe { producer.reserve() }.expect("reserve failed");
-            // SAFETY: spot is a valid reserved slot.
-            unsafe { spot.write(42) };
+            let mut batch = producer.write_batch();
+            {
+                let mut guard = batch.try_reserve().expect("reserve failed");
+                guard.as_mut().write(42);
+                // SAFETY: the slot is written before the batch is published.
+                unsafe { guard.assume_init() };
+            }
 
             assert!(matches!(
                 consumer.wait_readable_timeout(Duration::ZERO),
                 Err(WaitError::Timeout)
             ));
 
-            producer.commit();
+            batch.publish();
 
             let value = match consumer.read_timeout(Duration::ZERO) {
                 Ok(value) => value,
