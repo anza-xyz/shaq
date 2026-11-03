@@ -1,6 +1,12 @@
 //! Synchronization primitives selected for production or Loom model checking.
 
 #[cfg(not(loom))]
+pub(crate) use core::hint;
+
+#[cfg(loom)]
+pub(crate) use loom::hint;
+
+#[cfg(not(loom))]
 pub(crate) use core::sync::atomic;
 
 #[cfg(loom)]

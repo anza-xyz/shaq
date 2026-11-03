@@ -7,6 +7,7 @@ use crate::{
     shmem::Region,
     sync::{
         atomic::{AtomicU64, Ordering},
+        hint::spin_loop,
         Arc,
     },
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
@@ -696,6 +697,8 @@ impl<T> SharedQueue<T> {
             let available = producer_publication.wrapping_sub(consumer_reservation);
             let reservation_is_stale = available > capacity;
             if reservation_is_stale {
+                // A stale publication snapshot may require repeated retries.
+                spin_loop();
                 consumer_reservation = header.consumer_reservation.load(Ordering::Relaxed);
                 continue;
             }
@@ -915,7 +918,17 @@ impl SharedQueueHeader {
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.identifier = identifier;
-        header.magic.store(MAGIC, Ordering::Release);
+        header.publish_initialization();
+    }
+
+    /// Publishes all header fields written by the sole initializer.
+    fn publish_initialization(&self) {
+        self.magic.store(MAGIC, Ordering::Release);
+    }
+
+    /// A successful check acquires the initialized, immutable header metadata.
+    fn is_initialized(&self) -> bool {
+        self.magic.load(Ordering::Acquire) == MAGIC
     }
 
     fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
@@ -934,7 +947,7 @@ impl SharedQueueHeader {
             //         memory is aligned to the page size, which is sufficient for the
             //         alignment of `SharedQueueHeader`.
             let header = unsafe { header.as_ref() };
-            if header.magic.load(Ordering::Acquire) != MAGIC {
+            if !header.is_initialized() {
                 return Err(Error::InvalidMagic);
             }
             if header.version != VERSION {
@@ -962,7 +975,7 @@ impl SharedQueueHeader {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.producer_publication.load(Ordering::Acquire) != start {
-            core::hint::spin_loop();
+            spin_loop();
         }
         // Release publication; `wake` supplies the fence that pairs it with
         // a registering waiter and must be called unconditionally; see the
@@ -985,7 +998,7 @@ impl SharedQueueHeader {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.consumer_release.load(Ordering::Acquire) != start {
-            core::hint::spin_loop();
+            spin_loop();
         }
         header
             .consumer_release
@@ -1427,101 +1440,7 @@ impl<T> Drop for ReadBatchIntoIter<'_, T> {
 }
 
 #[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-
-    fn queue() -> (Producer<u64>, Consumer<u64>) {
-        let size = minimum_region_size::<u64>(2);
-        let region = Region::alloc(NonZeroUsize::new(size).unwrap()).unwrap();
-        let header = region.addr().cast::<SharedQueueHeader>();
-        // Construct Loom atomics explicitly: zeroed shared memory does not
-        // register atomic objects with Loom's runtime.
-        let value = SharedQueueHeader {
-            magic: AtomicU64::new(MAGIC),
-            version: VERSION,
-            buffer_mask: 1,
-            identifier: DEFAULT_QUEUE_IDENTIFIER,
-            producer_reservation: CacheAlignedAtomicSize::default(),
-            producer_publication: CacheAlignedAtomicSize::default(),
-            consumer_reservation: CacheAlignedAtomicSize::default(),
-            consumer_release: CacheAlignedAtomicSize::default(),
-            waiters: Waiters::default(),
-        };
-        // SAFETY: the fresh region is sized and aligned for this header and
-        // two u64 slots, and has no other users.
-        unsafe { header.write(value) };
-        // SAFETY: the header was just initialized in this region.
-        let producer = unsafe { Producer::from_header(region, header) }.unwrap();
-        let consumer = producer.join_as_consumer();
-        (producer, consumer)
-    }
-
-    #[test]
-    fn write_does_not_report_full_with_spare_capacity() {
-        loom::model(|| {
-            let (producer, consumer) = queue();
-            let other_producer = producer.clone();
-            let worker = loom::thread::spawn(move || {
-                // Model a competing producer/consumer cycle using only
-                // cursors; no payload is accessed by this test.
-
-                // SAFETY: the endpoint keeps the initialized header alive.
-                let header = unsafe { other_producer.queue.header.as_ref() };
-                if header
-                    .producer_reservation
-                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    header.producer_publication.store(1, Ordering::Release);
-                    header.consumer_reservation.store(1, Ordering::Release);
-                    header.consumer_release.store(1, Ordering::Release);
-                }
-            });
-
-            // Each producer writes once, so this queue can never be full
-            // before this write, even if the worker completes an entire cycle.
-            assert!(producer
-                .queue
-                .reserve_write_batch(NON_ZERO_USIZE_ONE)
-                .is_some());
-            worker.join().unwrap();
-            drop(consumer);
-        });
-    }
-
-    #[test]
-    fn read_does_not_report_empty_with_readable_items() {
-        loom::model(|| {
-            let (producer, consumer) = queue();
-            producer.try_write(1).unwrap();
-            producer.try_write(2).unwrap();
-            let other_consumer = consumer.clone();
-            let worker = loom::thread::spawn(move || {
-                // Model consuming one item and publishing its replacement.
-
-                // SAFETY: the endpoint keeps the initialized header alive.
-                let header = unsafe { other_consumer.queue.header.as_ref() };
-                if header
-                    .consumer_reservation
-                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    header.consumer_release.store(1, Ordering::Release);
-                    header.producer_reservation.store(3, Ordering::Release);
-                    header.producer_publication.store(3, Ordering::Release);
-                }
-            });
-
-            // The worker consumes only one of the two initial items, so an
-            // item remains readable throughout this reservation attempt.
-            assert!(consumer
-                .queue
-                .reserve_read_batch(NON_ZERO_USIZE_ONE)
-                .is_some());
-            worker.join().unwrap();
-        });
-    }
-}
+mod loom_tests;
 
 #[cfg(all(test, not(loom)))]
 mod tests {
