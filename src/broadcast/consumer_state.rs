@@ -30,9 +30,7 @@ pub(crate) enum ConsumerRecoveryMode {
 /// Value stored in a lane consumer slot that no consumer owns.
 ///
 /// A real reserve limit never reaches `usize::MAX` — that would take millennia
-/// at any real publish rate — so this is an unambiguous "no constraint"
-/// sentinel: it sits at the top, so it drops out of the producer's `min` and
-/// never gates a reserve.
+/// at any real publish rate — so this cannot be mistaken for one.
 const UNCLAIMED: usize = usize::MAX;
 
 /// Global consumer-index ownership table.
@@ -204,15 +202,14 @@ impl LaneConsumerState {
     }
 
     /// The binding reserve limit across consumers: the lowest sequence the
-    /// producer may NOT yet reserve. Each slot holds `next_to_read + capacity`;
-    /// unowned slots hold [`UNCLAIMED`] and so drop out of the `min`. With every
-    /// slot unowned the result is [`UNCLAIMED`] (no constraint).
-    pub(crate) fn reserve_limit(&self) -> usize {
+    /// producer may NOT yet reserve. Each slot holds `next_to_read + capacity`.
+    /// `None` when no slot is owned, so nothing constrains the producer.
+    pub(crate) fn reserve_limit(&self) -> Option<usize> {
         self.limits()
             .iter()
             .map(|limit| limit.load(Ordering::Acquire))
+            .filter(|&limit| limit != UNCLAIMED)
             .min()
-            .unwrap_or(UNCLAIMED)
     }
 
     /// Joins `consumer_index` to this lane at the current publication frontier.
@@ -384,22 +381,22 @@ mod tests {
     fn lane_consumer_state_tracks_minimum_reserve_limit() {
         let (_region, state) = lane_consumer_state(2, 4);
 
-        assert_eq!(state.reserve_limit(), UNCLAIMED);
+        assert_eq!(state.reserve_limit(), None);
 
         assert_eq!(state.join(0, || 10), 10);
-        assert_eq!(state.reserve_limit(), 14);
+        assert_eq!(state.reserve_limit(), Some(14));
 
         state.set_cursor(0, 12);
-        assert_eq!(state.reserve_limit(), 16);
+        assert_eq!(state.reserve_limit(), Some(16));
 
         assert_eq!(state.join(1, || 10), 10);
-        assert_eq!(state.reserve_limit(), 14);
+        assert_eq!(state.reserve_limit(), Some(14));
 
         state.release(1);
-        assert_eq!(state.reserve_limit(), 16);
+        assert_eq!(state.reserve_limit(), Some(16));
 
         state.release(0);
-        assert_eq!(state.reserve_limit(), UNCLAIMED);
+        assert_eq!(state.reserve_limit(), None);
     }
 
     #[test]
@@ -414,14 +411,14 @@ mod tests {
                 sample_index.set(index + 1);
                 let sample = samples[index];
                 if sample == 13 {
-                    assert_eq!(state.reserve_limit(), 14);
+                    assert_eq!(state.reserve_limit(), Some(14));
                 }
                 sample
             }),
             13
         );
         assert_eq!(sample_index.get(), 2);
-        assert_eq!(state.reserve_limit(), 17);
+        assert_eq!(state.reserve_limit(), Some(17));
     }
 
     #[test]
@@ -433,7 +430,7 @@ mod tests {
             state.recover(0, || panic!("claimed slot should not rejoin")),
             7
         );
-        assert_eq!(state.reserve_limit(), 11);
+        assert_eq!(state.reserve_limit(), Some(11));
     }
 
     #[test]
@@ -441,6 +438,6 @@ mod tests {
         let (_region, state) = lane_consumer_state(1, 4);
 
         assert_eq!(state.recover(0, || 12), 12);
-        assert_eq!(state.reserve_limit(), 16);
+        assert_eq!(state.reserve_limit(), Some(16));
     }
 }
