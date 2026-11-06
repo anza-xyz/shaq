@@ -20,6 +20,10 @@
 //! never sleeps. Without the fences both loads can be stale and a wake can be
 //! lost.
 //!
+//! A thread waiting on several queues at once ([`Waiters::wait_for_any`])
+//! increments every queue's `waiters` before its single fence, so the argument
+//! holds for each queue independently.
+//!
 //! # The futex word
 //!
 //! Userspace accesses the word only as a 64-bit atomic; the kernel's 32-bit
@@ -67,21 +71,34 @@ impl Waiters {
 
     /// Runs `check` until it returns a value or `timeout` elapses.
     ///
-    /// `cursor` is the queue's publication cursor used as the futex word
-    /// while sleeping; an advance of `cursor` must imply that `check` can
-    /// observe new data.
+    /// Each source's cursor is used as the futex word while sleeping; an
+    /// advance of any source's cursor must imply that `check` can observe new
+    /// data.
     ///
     /// `spins` is how many times to re-`check` before the first sleep. A caller
     /// whose `check` is itself expensive (e.g. it scans many lanes) should pass
     /// a smaller count so the total spin work stays bounded; see
     /// [`SPIN_ATTEMPTS`] for the baseline used by a unit-cost check.
-    pub(crate) fn wait_for<T>(
-        &self,
-        cursor: &AtomicUsize,
+    ///
+    /// With more than one source, a returning caller may have absorbed a wake
+    /// meant for a source it did not take data from. A woken multi-source
+    /// sleeper can also still count toward wakes issued on its other words
+    /// until it runs (as with Linux `futex_waitv`). Callers whose sources can
+    /// have competing waiters must therefore pass a wake on to those sources
+    /// after sleeping, or another waiter can sleep next to available data.
+    pub(crate) fn wait_for_any<const N: usize, T>(
+        sources: &[WaitSource<'_>; N],
         spins: usize,
         timeout: Duration,
         mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, WaitError> {
+        const {
+            assert!(
+                N >= 1 && N <= MAX_WAIT_SOURCES,
+                "wait sources must be between 1 and MAX_WAIT_SOURCES"
+            )
+        };
+
         if let Some(value) = check() {
             return Ok(value);
         }
@@ -99,22 +116,23 @@ impl Waiters {
             }
         }
 
+        let mut snapshots = [0; N];
         loop {
-            let snapshot = self.register(cursor);
+            Self::register(sources, &mut snapshots);
             // Recheck after registering because a producer can publish after
             // the unregistered check and before this thread starts waiting;
             // the fence in `register` makes this recheck reliable (see
             // module docs).
             if let Some(value) = check() {
-                self.unregister();
+                Self::unregister(sources);
                 return Ok(value);
             }
 
             // Platform waits can return after a matching wake or a spurious
             // wake, so success only means the caller's condition should be
             // checked again.
-            let wait_result = Self::wait(cursor, snapshot, deadline);
-            self.unregister();
+            let wait_result = Self::wait(sources, &snapshots, deadline);
+            Self::unregister(sources);
             wait_result?;
 
             if let Some(value) = check() {
@@ -123,33 +141,64 @@ impl Waiters {
         }
     }
 
+    /// [`Self::wait_for_any`] on this queue alone, with `cursor` (the queue's
+    /// publication cursor or wake counter) as the futex word.
+    pub(crate) fn wait_for<T>(
+        &self,
+        cursor: &AtomicUsize,
+        spins: usize,
+        timeout: Duration,
+        check: impl FnMut() -> Option<T>,
+    ) -> Result<T, WaitError> {
+        Self::wait_for_any(&[WaitSource::new(self, cursor)], spins, timeout, check)
+    }
+
     /// Registers this thread as a waiter and snapshots the cursor.
+    /// Done for every source.
     ///
     /// Increment-then-fence is the waiter half of the lost-wake protocol
     /// (see module docs); the caller must recheck for data after this call,
     /// before sleeping.
-    fn register(&self, cursor: &AtomicUsize) -> SequenceNumber {
-        self.waiters.fetch_add(1, Ordering::Relaxed);
+    ///
+    /// One fence after all increments suffices: each increment is sequenced
+    /// before it, so a producer whose fence follows this one observes the
+    /// increment on its own source.
+    fn register<const N: usize>(
+        sources: &[WaitSource<'_>; N],
+        snapshots: &mut [SequenceNumber; N],
+    ) {
+        for source in sources {
+            source.waiters.waiters.fetch_add(1, Ordering::Relaxed);
+        }
         fence(Ordering::SeqCst);
-        cursor.load(Ordering::Acquire)
+        for (source, snapshot) in sources.iter().zip(snapshots.iter_mut()) {
+            *snapshot = source.word.load(Ordering::Acquire);
+        }
     }
 
-    fn unregister(&self) {
-        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    fn unregister<const N: usize>(sources: &[WaitSource<'_>; N]) {
+        for source in sources {
+            source.waiters.waiters.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
-    fn wait(
-        cursor: &AtomicUsize,
-        expected: SequenceNumber,
+    fn wait<const N: usize>(
+        sources: &[WaitSource<'_>; N],
+        expected: &[SequenceNumber; N],
         deadline: Option<Instant>,
     ) -> Result<(), WaitError> {
         // Avoid entering the platform wait backend if a publication already
         // advanced the cursor after the caller's post-registration recheck.
-        if cursor.load(Ordering::Acquire) != expected {
+        if any_changed(sources, expected) {
             return Ok(());
         }
 
-        imp::wait(cursor, expected, deadline)
+        // A single source keeps using plain `FUTEX_WAIT`
+        if N == 1 {
+            imp::wait(sources[0].word, expected[0], deadline)
+        } else {
+            imp::wait_any(sources, expected, deadline)
+        }
     }
 
     /// Wakes up to `count` waiters registered against `cursor`.
@@ -202,6 +251,61 @@ impl Waiters {
 
 const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 
+/// Maximum number of queues one wait can sleep on at once.
+///
+/// Checked at compile time by [`Waiters::wait_for_any`], below the kernel's
+/// `FUTEX_WAITV_MAX` (128).
+pub(crate) const MAX_WAIT_SOURCES: usize = 32;
+
+/// One queue a waiter can sleep on: the queue's waiter count and the futex
+/// word its producers advance (or bump) before waking.
+#[derive(Clone, Copy)]
+pub(crate) struct WaitSource<'a> {
+    waiters: &'a Waiters,
+    word: &'a AtomicUsize,
+}
+
+impl<'a> WaitSource<'a> {
+    pub(crate) fn new(waiters: &'a Waiters, word: &'a AtomicUsize) -> Self {
+        Self { waiters, word }
+    }
+}
+
+/// Returns whether any source's word moved away from its snapshot.
+fn any_changed<const N: usize>(
+    sources: &[WaitSource<'_>; N],
+    expected: &[SequenceNumber; N],
+) -> bool {
+    sources
+        .iter()
+        .zip(expected)
+        .any(|(source, &expected)| source.word.load(Ordering::Acquire) != expected)
+}
+
+/// Polls until any source's word no longer equals its snapshot or the
+/// deadline passes, yielding the thread between checks.
+///
+/// While a thread polls here it stays registered on every source, so each
+/// publish on those sources still issues a wake syscall that finds no sleeper.
+#[cfg(not(loom))]
+fn poll_any<const N: usize>(
+    sources: &[WaitSource<'_>; N],
+    expected: &[SequenceNumber; N],
+    deadline: Option<Instant>,
+) -> Result<(), WaitError> {
+    loop {
+        if any_changed(sources, expected) {
+            return Ok(());
+        }
+
+        if let Some(deadline) = deadline {
+            remaining_until(deadline)?;
+        }
+
+        std::thread::yield_now();
+    }
+}
+
 /// Baseline `check` attempts before a waiter's first sleep in
 /// [`Waiters::wait_for`], for a unit-cost `check`. Callers with a costlier
 /// `check` scale this down so the total spin work stays comparable.
@@ -214,10 +318,22 @@ pub(crate) const SPIN_ATTEMPTS: usize = 0;
 
 #[cfg(all(target_os = "linux", not(loom)))]
 mod imp {
-    use super::{remaining_until, SequenceNumber};
+    use super::{poll_any, remaining_until, SequenceNumber, WaitSource};
     use crate::error::WaitError;
     use crate::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
+
+    /// Polls until any source's word changes; see [`super::poll_any`].
+    ///
+    /// Only waits on more than one source get here; single-source waits use
+    /// [`wait`] (`FUTEX_WAIT`).
+    pub(super) fn wait_any<const N: usize>(
+        sources: &[WaitSource<'_>; N],
+        expected: &[SequenceNumber; N],
+        deadline: Option<Instant>,
+    ) -> Result<(), WaitError> {
+        poll_any(sources, expected, deadline)
+    }
 
     /// Returns the futex word: the low 32 bits of the 64-bit cursor, the
     /// half that changes on every publication.
@@ -343,7 +459,7 @@ mod imp {
 
 #[cfg(all(not(target_os = "linux"), not(loom)))]
 mod imp {
-    use super::{remaining_until, SequenceNumber};
+    use super::{poll_any, remaining_until, SequenceNumber, WaitSource};
     use crate::error::WaitError;
     use crate::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -370,15 +486,29 @@ mod imp {
         }
     }
 
+    /// Polls until any source's word changes; see [`super::poll_any`].
+    pub(super) fn wait_any<const N: usize>(
+        sources: &[WaitSource<'_>; N],
+        expected: &[SequenceNumber; N],
+        deadline: Option<Instant>,
+    ) -> Result<(), WaitError> {
+        poll_any(sources, expected, deadline)
+    }
+
     /// No-ops because spin waiters observe the shared cursor directly.
     pub(super) fn wake(_cursor: &AtomicUsize, _count: u32) {}
 }
 
 // Model the kernel's atomic compare-and-sleep operation. Timeouts and spurious
 // wakes are omitted; threads remain asleep until explicitly woken.
+//
+// `wait_any` models `futex_waitv`: a sleeper may wait on several cursors at
+// once. As in the kernel, a wake unqueues it only from the woken cursor; it
+// stays queued on its other cursors, still counting toward wakes issued there,
+// until it runs and unqueues itself.
 #[cfg(loom)]
 mod imp {
-    use super::SequenceNumber;
+    use super::{SequenceNumber, WaitSource};
     use crate::{
         error::WaitError,
         sync::atomic::{AtomicUsize, Ordering},
@@ -386,8 +516,18 @@ mod imp {
     use loom::{sync::Mutex, thread};
     use std::time::Instant;
 
+    /// Words a sleeper is still queued on, its thread, and whether a wake has
+    /// already reached it.
+    type Sleeper = (Vec<usize>, thread::Thread, bool);
+
     loom::lazy_static! {
-        static ref SLEEPERS: Mutex<Vec<(usize, thread::Thread)>> = Mutex::new(Vec::new());
+        static ref SLEEPERS: Mutex<Vec<Sleeper>> = Mutex::new(Vec::new());
+    }
+
+    /// Number of sleepers still queued on any word.
+    #[cfg(test)]
+    pub(super) fn queued_sleepers() -> usize {
+        SLEEPERS.lock().unwrap().len()
     }
 
     pub(super) fn wait(
@@ -405,10 +545,51 @@ mod imp {
             if cursor.load(Ordering::Relaxed) as u32 != expected as u32 {
                 return Ok(());
             }
-            sleepers.push((cursor as *const AtomicUsize as usize, thread::current()));
+            sleepers.push((
+                vec![cursor as *const AtomicUsize as usize],
+                thread::current(),
+                false,
+            ));
         }
         // Unpark retains a token if wake happens between registration and park.
         thread::park();
+        Ok(())
+    }
+
+    pub(super) fn wait_any<const N: usize>(
+        sources: &[WaitSource<'_>; N],
+        expected: &[SequenceNumber; N],
+        deadline: Option<Instant>,
+    ) -> Result<(), WaitError> {
+        assert!(
+            deadline.is_none(),
+            "Loom futex model does not model timeouts"
+        );
+        {
+            // Serialize the comparison and sleeper registration against wake.
+            let mut sleepers = SLEEPERS.lock().unwrap();
+            // Like the kernel: a plain 32-bit compare, no synchronization.
+            let changed = sources.iter().zip(expected).any(|(source, &expected)| {
+                source.word.load(Ordering::Relaxed) as u32 != expected as u32
+            });
+            if changed {
+                return Ok(());
+            }
+            let addresses = sources
+                .iter()
+                .map(|source| source.word as *const AtomicUsize as usize)
+                .collect();
+            sleepers.push((addresses, thread::current(), false));
+        }
+        // Unpark retains a token if wake happens between registration and park.
+        thread::park();
+        // Like `futex_unqueue_multiple`: once running, leave the words that
+        // did not wake this thread.
+        let current = thread::current().id();
+        SLEEPERS
+            .lock()
+            .unwrap()
+            .retain(|(_, sleeper, _)| sleeper.id() != current);
         Ok(())
     }
 
@@ -417,13 +598,92 @@ mod imp {
         let mut sleepers = SLEEPERS.lock().unwrap();
         let mut index = 0;
         while index < sleepers.len() && count > 0 {
-            if sleepers[index].0 == address {
-                let (_, sleeper) = sleepers.swap_remove(index);
-                sleeper.unpark();
+            let (addresses, sleeper, woken) = &mut sleepers[index];
+            if let Some(position) = addresses.iter().position(|&queued| queued == address) {
+                // Unqueue from this word only. A sleeper already woken via
+                // another word still consumes one of `count`, as in the kernel.
+                addresses.swap_remove(position);
+                if !*woken {
+                    *woken = true;
+                    sleeper.unpark();
+                }
                 count -= 1;
-            } else {
-                index += 1;
+                if addresses.is_empty() {
+                    sleepers.swap_remove(index);
+                    continue;
+                }
             }
+            index += 1;
+        }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests;
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, thread};
+
+    #[derive(Default)]
+    struct Source {
+        waiters: Waiters,
+        word: AtomicUsize,
+    }
+
+    impl Source {
+        fn publish(&self) {
+            self.word.fetch_add(1, Ordering::Release);
+            self.waiters.wake(&self.word, 1);
+        }
+
+        fn wait_source(&self) -> WaitSource<'_> {
+            WaitSource::new(&self.waiters, &self.word)
+        }
+    }
+
+    fn ready(sources: &[Arc<Source>; 2]) -> Option<usize> {
+        sources
+            .iter()
+            .position(|source| source.word.load(Ordering::Acquire) != 0)
+    }
+
+    #[test]
+    fn wait_for_any_wakes_on_publication_to_any_source() {
+        for target in 0..2 {
+            let sources = [Arc::new(Source::default()), Arc::new(Source::default())];
+            let publisher = {
+                let source = sources[target].clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(50));
+                    source.publish();
+                })
+            };
+
+            let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
+            let woken = Waiters::wait_for_any(&wait_sources, 0, Duration::from_secs(10), || {
+                ready(&sources)
+            });
+            assert_eq!(woken, Ok(target));
+            publisher.join().unwrap();
+            for source in &sources {
+                assert_eq!(source.waiters.waiters.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wait_for_any_times_out_and_unregisters() {
+        let sources = [Arc::new(Source::default()), Arc::new(Source::default())];
+        let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
+        let timeout = Duration::from_millis(50);
+        let start = Instant::now();
+        let result = Waiters::wait_for_any(&wait_sources, 0, timeout, || ready(&sources));
+        assert_eq!(result, Err(WaitError::Timeout));
+        assert!(start.elapsed() >= timeout);
+        for source in &sources {
+            assert_eq!(source.waiters.waiters.load(Ordering::Relaxed), 0);
         }
     }
 }
