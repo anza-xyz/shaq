@@ -251,10 +251,13 @@ impl Waiters {
 
 const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 
-/// Maximum number of queues one wait can sleep on at once.
-///
-/// Checked at compile time by [`Waiters::wait_for_any`], equal to kernel's
-/// `FUTEX_WAITV_MAX` (128).
+/// Maximum number of queues one wait can sleep on at once: the kernel's
+/// `FUTEX_WAITV_MAX`. Checked at compile time by [`Waiters::wait_for_any`].
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_WAIT_SOURCES: usize = libc::FUTEX_WAITV_MAX as usize;
+
+/// Same limit as on Linux
+#[cfg(not(target_os = "linux"))]
 pub(crate) const MAX_WAIT_SOURCES: usize = 128;
 
 /// One queue a waiter can sleep on: the queue's waiter count and the futex
@@ -323,16 +326,89 @@ mod imp {
     use crate::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
-    /// Polls until any source's word changes; see [`super::poll_any`].
+    /// Blocks with Linux `futex_waitv` (5.16+) until any source's word no
+    /// longer equals the low 32 bits of its snapshot.
     ///
     /// Only waits on more than one source get here; single-source waits use
     /// [`wait`] (`FUTEX_WAIT`).
+    ///
+    /// `Ok(())` means the caller should recheck its own condition; Linux can
+    /// return success for ordinary wakes and for spurious wakes. Fallbacks to
+    /// [`poll_any`] if the kernel does not support `futex_waitv`.
     pub(super) fn wait_any<const N: usize>(
         sources: &[WaitSource<'_>; N],
         expected: &[SequenceNumber; N],
         deadline: Option<Instant>,
     ) -> Result<(), WaitError> {
-        poll_any(sources, expected, deadline)
+        // `futex_waitv` flags field rejects anything but 0.
+        const EMPTY_FLAGS: libc::c_uint = 0;
+
+        // SAFETY: `futex_waitv` is plain integers, for which all-zero is
+        // valid; Also the kernel requires its reserved field (private in libc crate) to be zero.
+        let mut waiters: [libc::futex_waitv; N] = unsafe { core::mem::zeroed() };
+        for ((waiter, source), &expected) in waiters.iter_mut().zip(sources).zip(expected) {
+            waiter.val = u64::from(expected as u32);
+            waiter.uaddr = futex_word(source.word) as u64;
+            waiter.flags = libc::FUTEX2_SIZE_U32 as u32;
+        }
+
+        loop {
+            let timeout_storage = deadline
+                .map(remaining_until)
+                .transpose()?
+                .map(monotonic_deadline);
+            let timeout_ptr = timeout_storage
+                .as_ref()
+                .map_or(core::ptr::null(), |timeout| {
+                    timeout as *const libc::timespec
+                });
+
+            // SAFETY:
+            // - `waiters` holds `N` entries, each pointing at a valid, 4-byte
+            //   aligned word inside a live 64-bit atomic; the kernel only
+            //   reads 32 bits through them.
+            // - `timeout_ptr` is null (block indefinitely) or points to a
+            //   live `timespec` on `CLOCK_MONOTONIC`.
+            // - The kernel only blocks if every word still equals its `val`.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_futex_waitv,
+                    waiters.as_ptr(),
+                    N as libc::c_uint,
+                    EMPTY_FLAGS,
+                    timeout_ptr,
+                    libc::CLOCK_MONOTONIC,
+                )
+            };
+
+            // The result is the index of a woken word; it is not used.
+            if result >= 0 {
+                return Ok(());
+            }
+
+            match errno() {
+                libc::EAGAIN => return Ok(()),
+                libc::EINTR => continue,
+                libc::ETIMEDOUT => return Err(WaitError::Timeout),
+                libc::ENOSYS | libc::EPERM => return poll_any(sources, expected, deadline),
+                errno => panic!("unexpected futex_waitv error: errno={errno}"),
+            }
+        }
+    }
+
+    /// Converts a relative timeout to an absolute `CLOCK_MONOTONIC` time, as
+    /// expected by `futex_waitv`, saturating on overflow.
+    pub(super) fn monotonic_deadline(remaining: Duration) -> libc::timespec {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid, writable `timespec`.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+        debug_assert_eq!(result, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+
+        let now = Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+        duration_to_timespec(now.saturating_add(remaining))
     }
 
     /// Returns the futex word: the low 32 bits of the 64-bit cursor, the
@@ -685,5 +761,90 @@ mod tests {
         for source in &sources {
             assert_eq!(source.waiters.waiters.load(Ordering::Relaxed), 0);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn futex_waitv_returns_if_any_word_differs() {
+        let sources = [Source::default(), Source::default()];
+        sources[1].word.store(1, Ordering::Relaxed);
+        let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
+        assert_eq!(imp::wait_any(&wait_sources, &[0, 0], None), Ok(()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn futex_waitv_is_woken_by_futex_wake_on_any_word() {
+        use std::sync::atomic::AtomicBool;
+
+        for target in 0..2 {
+            let sources = Arc::new([Source::default(), Source::default()]);
+            let done = Arc::new(AtomicBool::new(false));
+            let waker = {
+                let (sources, done) = (sources.clone(), done.clone());
+                thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        imp::wake(&sources[target].word, 1);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            };
+
+            let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let result = imp::wait_any(&wait_sources, &[0, 0], Some(deadline));
+            done.store(true, Ordering::Relaxed);
+            waker.join().unwrap();
+            assert_eq!(result, Ok(()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn futex_waitv_times_out() {
+        let sources = [Source::default(), Source::default()];
+        let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
+        let timeout = Duration::from_millis(50);
+        let start = Instant::now();
+        let result = imp::wait_any(&wait_sources, &[0, 0], Some(start + timeout));
+        assert_eq!(result, Err(WaitError::Timeout));
+        assert!(start.elapsed() >= timeout);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn monotonic_deadline_saturates() {
+        let deadline = imp::monotonic_deadline(Duration::MAX);
+        assert_eq!(
+            (deadline.tv_sec, deadline.tv_nsec),
+            (libc::time_t::MAX, 999_999_999)
+        );
+    }
+
+    /// The deadline lies between `remaining` past the clock read just before
+    /// the call and `remaining` past the clock read just after it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn monotonic_deadline_is_remaining_past_now() {
+        fn now() -> Duration {
+            let mut now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `now` is a valid, writable `timespec`.
+            let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+            assert_eq!(result, 0);
+            Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+        }
+
+        // The nanosecond part makes the addition carry into seconds unless
+        // the clock reads a whole second.
+        let remaining = Duration::new(10, 999_999_999);
+        let before = now();
+        let deadline = imp::monotonic_deadline(remaining);
+        let after = now();
+        let deadline = Duration::new(deadline.tv_sec as u64, deadline.tv_nsec as u32);
+        assert!(before + remaining <= deadline);
+        assert!(deadline <= after + remaining);
     }
 }
