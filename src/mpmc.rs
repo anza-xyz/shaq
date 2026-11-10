@@ -585,6 +585,17 @@ pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Erro
     Ok((producer, consumer))
 }
 
+/// Returns a heap-backed [`Consumer`] that never receives anything.
+///
+/// Its producer is dropped before it is returned, so unless a producer is
+/// joined through [`Consumer::join_as_producer`], no value can ever be written:
+/// reads, including on clones, always find the queue empty and timed reads wait
+/// out their full timeout.
+pub fn never<T: Send>() -> Consumer<T> {
+    let (_, consumer) = pair(1).expect("a capacity of one is always valid");
+    consumer
+}
+
 struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
@@ -1454,6 +1465,18 @@ mod tests {
     };
 
     type Item = u64;
+
+    #[test]
+    fn never_receives() {
+        let consumer = never::<Item>();
+        let clone = consumer.clone();
+        assert_eq!(consumer.try_read(), None);
+        assert_eq!(clone.try_read(), None);
+        assert!(matches!(
+            consumer.read_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+    }
     const BUFFER_CAPACITY: usize = 512;
 
     type CreateQueue<T> = fn(usize) -> (Producer<T>, Consumer<T>);
