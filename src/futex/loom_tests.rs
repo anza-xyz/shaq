@@ -71,7 +71,10 @@ const KINDS: [(Kind, Kind); 3] = [
 
 fn wait_for_either(a: &Source, b: &Source) -> usize {
     let sources = [a.wait_source(), b.wait_source()];
-    Waiters::wait_for_any(&sources, 0, Duration::MAX, || {
+    Waiters::wait_for_any(&sources, 0, Duration::MAX, |hint| {
+        if let Some(index) = hint {
+            assert!([a, b][index].published());
+        }
         [a, b].iter().position(|source| source.published())
     })
     .unwrap()

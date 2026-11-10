@@ -86,11 +86,17 @@ impl Waiters {
     /// until it runs (as with Linux `futex_waitv`). Callers whose sources can
     /// have competing waiters must therefore pass a wake on to those sources
     /// after sleeping, or another waiter can sleep next to available data.
+    ///
+    /// `check` receives a hint: `Some(index)` after a sleep that ended because
+    /// `sources[index]` changed or was woken, `None` otherwise. It is advisory
+    /// only (other sources may be ready too, and if several were woken there
+    /// is no guarantee which one is hinted), so `check` must still be able to
+    /// find data on any source.
     pub(crate) fn wait_for_any<const N: usize, T>(
         sources: &[WaitSource<'_>; N],
         spins: usize,
         timeout: Duration,
-        mut check: impl FnMut() -> Option<T>,
+        mut check: impl FnMut(Option<usize>) -> Option<T>,
     ) -> Result<T, WaitError> {
         const {
             assert!(
@@ -99,7 +105,7 @@ impl Waiters {
             )
         };
 
-        if let Some(value) = check() {
+        if let Some(value) = check(None) {
             return Ok(value);
         }
 
@@ -111,7 +117,7 @@ impl Waiters {
         // is on the slow path and goes straight back to waiting.
         for _ in 0..spins {
             spin_loop();
-            if let Some(value) = check() {
+            if let Some(value) = check(None) {
                 return Ok(value);
             }
         }
@@ -123,7 +129,7 @@ impl Waiters {
             // the unregistered check and before this thread starts waiting;
             // the fence in `register` makes this recheck reliable (see
             // module docs).
-            if let Some(value) = check() {
+            if let Some(value) = check(None) {
                 Self::unregister(sources);
                 return Ok(value);
             }
@@ -133,9 +139,9 @@ impl Waiters {
             // checked again.
             let wait_result = Self::wait(sources, &snapshots, deadline);
             Self::unregister(sources);
-            wait_result?;
+            let hint = wait_result?;
 
-            if let Some(value) = check() {
+            if let Some(value) = check(hint) {
                 return Ok(value);
             }
         }
@@ -148,9 +154,11 @@ impl Waiters {
         cursor: &AtomicUsize,
         spins: usize,
         timeout: Duration,
-        check: impl FnMut() -> Option<T>,
+        mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, WaitError> {
-        Self::wait_for_any(&[WaitSource::new(self, cursor)], spins, timeout, check)
+        Self::wait_for_any(&[WaitSource::new(self, cursor)], spins, timeout, |_| {
+            check()
+        })
     }
 
     /// Registers this thread as a waiter and snapshots the cursor.
@@ -186,16 +194,16 @@ impl Waiters {
         sources: &[WaitSource<'_>; N],
         expected: &[SequenceNumber; N],
         deadline: Option<Instant>,
-    ) -> Result<(), WaitError> {
+    ) -> Result<Option<usize>, WaitError> {
         // Avoid entering the platform wait backend if a publication already
         // advanced the cursor after the caller's post-registration recheck.
-        if any_changed(sources, expected) {
-            return Ok(());
+        if let Some(index) = changed_source(sources, expected) {
+            return Ok(Some(index));
         }
 
         // A single source keeps using plain `FUTEX_WAIT`
         if N == 1 {
-            imp::wait(sources[0].word, expected[0], deadline)
+            imp::wait(sources[0].word, expected[0], deadline).map(|()| Some(0))
         } else {
             imp::wait_any(sources, expected, deadline)
         }
@@ -274,19 +282,21 @@ impl<'a> WaitSource<'a> {
     }
 }
 
-/// Returns whether any source's word moved away from its snapshot.
-fn any_changed<const N: usize>(
+/// Returns the index of the source whose word moved away from its
+/// snapshot, if any.
+fn changed_source<const N: usize>(
     sources: &[WaitSource<'_>; N],
     expected: &[SequenceNumber; N],
-) -> bool {
+) -> Option<usize> {
     sources
         .iter()
         .zip(expected)
-        .any(|(source, &expected)| source.word.load(Ordering::Acquire) != expected)
+        .position(|(source, &expected)| source.word.load(Ordering::Acquire) != expected)
 }
 
 /// Polls until any source's word no longer equals its snapshot or the
-/// deadline passes, yielding the thread between checks.
+/// deadline passes, yielding the thread between checks. Returns the index of
+/// a changed source.
 ///
 /// While a thread polls here it stays registered on every source, so each
 /// publish on those sources still issues a wake syscall that finds no sleeper.
@@ -295,10 +305,10 @@ fn poll_any<const N: usize>(
     sources: &[WaitSource<'_>; N],
     expected: &[SequenceNumber; N],
     deadline: Option<Instant>,
-) -> Result<(), WaitError> {
+) -> Result<usize, WaitError> {
     loop {
-        if any_changed(sources, expected) {
-            return Ok(());
+        if let Some(index) = changed_source(sources, expected) {
+            return Ok(index);
         }
 
         if let Some(deadline) = deadline {
@@ -332,14 +342,15 @@ mod imp {
     /// Only waits on more than one source get here; single-source waits use
     /// [`wait`] (`FUTEX_WAIT`).
     ///
-    /// `Ok(())` means the caller should recheck its own condition; Linux can
+    /// `Ok(None)` means the caller should recheck its own condition; Linux can
     /// return success for ordinary wakes and for spurious wakes. Fallbacks to
-    /// [`poll_any`] if the kernel does not support `futex_waitv`.
+    /// [`poll_any`] if the kernel does not support `futex_waitv`. Return hint
+    /// to which word triggered wake if possible.
     pub(super) fn wait_any<const N: usize>(
         sources: &[WaitSource<'_>; N],
         expected: &[SequenceNumber; N],
         deadline: Option<Instant>,
-    ) -> Result<(), WaitError> {
+    ) -> Result<Option<usize>, WaitError> {
         // `futex_waitv` flags field rejects anything but 0.
         const EMPTY_FLAGS: libc::c_uint = 0;
 
@@ -381,16 +392,18 @@ mod imp {
                 )
             };
 
-            // The result is the index of a woken word; it is not used.
+            // The result is the index of a woken word.
             if result >= 0 {
-                return Ok(());
+                return Ok(Some(result as usize));
             }
 
             match errno() {
-                libc::EAGAIN => return Ok(()),
+                libc::EAGAIN => return Ok(None),
                 libc::EINTR => continue,
                 libc::ETIMEDOUT => return Err(WaitError::Timeout),
-                libc::ENOSYS | libc::EPERM => return poll_any(sources, expected, deadline),
+                libc::ENOSYS | libc::EPERM => {
+                    return poll_any(sources, expected, deadline).map(Some)
+                }
                 errno => panic!("unexpected futex_waitv error: errno={errno}"),
             }
         }
@@ -567,8 +580,8 @@ mod imp {
         sources: &[WaitSource<'_>; N],
         expected: &[SequenceNumber; N],
         deadline: Option<Instant>,
-    ) -> Result<(), WaitError> {
-        poll_any(sources, expected, deadline)
+    ) -> Result<Option<usize>, WaitError> {
+        poll_any(sources, expected, deadline).map(Some)
     }
 
     /// No-ops because spin waiters observe the shared cursor directly.
@@ -631,16 +644,19 @@ mod imp {
     ///
     /// As in the kernel, a wake unqueues it only from the woken cursor; it
     /// stays queued on its other cursors, still counting toward wakes issued
-    /// there, until it runs and unqueues itself.
+    /// there, until it runs and unqueues itself. It then reports the highest
+    /// index among the cursors that woke it, like `futex_unqueue_multiple`, or
+    /// `None` if a cursor had already changed (the kernel's `EAGAIN`).
     pub(super) fn wait_any<const N: usize>(
         sources: &[WaitSource<'_>; N],
         expected: &[SequenceNumber; N],
         deadline: Option<Instant>,
-    ) -> Result<(), WaitError> {
+    ) -> Result<Option<usize>, WaitError> {
         assert!(
             deadline.is_none(),
             "Loom futex model does not model timeouts"
         );
+        let addresses = sources.map(|source| source.word as *const AtomicUsize as usize);
         {
             // Serialize the comparison and sleeper registration against wake.
             let mut sleepers = SLEEPERS.lock().unwrap();
@@ -649,24 +665,25 @@ mod imp {
                 source.word.load(Ordering::Relaxed) as u32 != expected as u32
             });
             if changed {
-                return Ok(());
+                return Ok(None);
             }
-            let addresses = sources
-                .iter()
-                .map(|source| source.word as *const AtomicUsize as usize)
-                .collect();
-            sleepers.push((addresses, thread::current(), false));
+            sleepers.push((addresses.to_vec(), thread::current(), false));
         }
         // Unpark retains a token if wake happens between registration and park.
         thread::park();
         // Like `futex_unqueue_multiple`: once running, leave the words that
         // did not wake this thread.
         let current = thread::current().id();
-        SLEEPERS
-            .lock()
-            .unwrap()
-            .retain(|(_, sleeper, _)| sleeper.id() != current);
-        Ok(())
+        let mut sleepers = SLEEPERS.lock().unwrap();
+        let queued = sleepers
+            .iter()
+            .find(|(_, sleeper, _)| sleeper.id() == current)
+            .map_or(&[][..], |(queued, _, _)| &queued[..]);
+        let woken = addresses
+            .iter()
+            .rposition(|address| !queued.contains(address));
+        sleepers.retain(|(_, sleeper, _)| sleeper.id() != current);
+        Ok(woken)
     }
 
     pub(super) fn wake(cursor: &AtomicUsize, mut count: u32) {
@@ -738,7 +755,8 @@ mod tests {
             };
 
             let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
-            let woken = Waiters::wait_for_any(&wait_sources, 0, Duration::from_secs(10), || {
+            let woken = Waiters::wait_for_any(&wait_sources, 0, Duration::from_secs(10), |hint| {
+                assert!(hint.is_none() || hint == Some(target));
                 ready(&sources)
             });
             assert_eq!(woken, Ok(target));
@@ -755,7 +773,7 @@ mod tests {
         let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
         let timeout = Duration::from_millis(50);
         let start = Instant::now();
-        let result = Waiters::wait_for_any(&wait_sources, 0, timeout, || ready(&sources));
+        let result = Waiters::wait_for_any(&wait_sources, 0, timeout, |_| ready(&sources));
         assert_eq!(result, Err(WaitError::Timeout));
         assert!(start.elapsed() >= timeout);
         for source in &sources {
@@ -769,7 +787,7 @@ mod tests {
         let sources = [Source::default(), Source::default()];
         sources[1].word.store(1, Ordering::Relaxed);
         let wait_sources = [sources[0].wait_source(), sources[1].wait_source()];
-        assert_eq!(imp::wait_any(&wait_sources, &[0, 0], None), Ok(()));
+        assert_eq!(imp::wait_any(&wait_sources, &[0, 0], None), Ok(None));
     }
 
     #[cfg(target_os = "linux")]
@@ -795,7 +813,7 @@ mod tests {
             let result = imp::wait_any(&wait_sources, &[0, 0], Some(deadline));
             done.store(true, Ordering::Relaxed);
             waker.join().unwrap();
-            assert_eq!(result, Ok(()));
+            assert_eq!(result, Ok(Some(target)));
         }
     }
 
