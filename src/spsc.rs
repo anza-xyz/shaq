@@ -85,6 +85,17 @@ pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Erro
     Ok((producer, consumer))
 }
 
+/// Returns a heap-backed [`Consumer`] that never receives anything.
+///
+/// Its producer is dropped before it is returned, so unless a producer is
+/// joined through [`Consumer::join_as_producer`], no value can ever be written:
+/// reads always find the queue empty and timed reads wait out their full
+/// timeout.
+pub fn never<T: Send>() -> Consumer<T> {
+    let (_, consumer) = pair(1).expect("a capacity of one is always valid");
+    consumer
+}
+
 /// Producer side of the SPSC shared queue.
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -1137,6 +1148,21 @@ mod tests {
     };
 
     type CreateQueue<T> = fn(usize) -> (Producer<T>, Consumer<T>);
+
+    #[test]
+    fn never_receives() {
+        let mut consumer = never::<u64>();
+        assert!(consumer.is_empty());
+        assert_eq!(consumer.try_read(), None);
+        assert!(matches!(
+            consumer.wait_readable_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+        assert!(matches!(
+            consumer.read_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+    }
 
     #[cfg(not(miri))]
     #[test]

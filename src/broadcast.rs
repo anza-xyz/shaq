@@ -122,6 +122,35 @@ impl<MessageType> Clone for Broadcast<MessageType> {
 #[derive(Debug)]
 pub struct UnknownType;
 
+/// Returns a heap-backed [`Consumer`] that never receives anything.
+///
+/// The queue has a single producer lane that is never claimed, so unless a
+/// producer is created through [`Consumer::broadcast_handle`], no value can
+/// ever be published: reads always find the queue empty and timed reads wait
+/// out their full timeout.
+pub fn never<T: Copy>() -> Consumer<T> {
+    let smallest_valid_config = BroadcastConfig {
+        capacity: 1,
+        producer_slots: 1,
+        consumer_slots: 1,
+    };
+    let size = QueueLayout::new::<T>(&smallest_valid_config)
+        .expect("the minimal configuration is always valid")
+        .total;
+    let region = Region::alloc(NonZeroUsize::new(size).expect("the layout includes a header"))
+        .expect("allocation aborts rather than fails");
+    // SAFETY: `region` is freshly allocated and initialized exactly once here.
+    let queue = unsafe {
+        SharedQueue::create_in_region::<T>(
+            &region,
+            &smallest_valid_config,
+            DEFAULT_QUEUE_IDENTIFIER,
+        )
+    }
+    .expect("the minimal configuration is always valid");
+    Consumer::from_queue(queue).expect("the queue has one free consumer slot")
+}
+
 impl<T> Broadcast<T>
 where
     T: Copy,
@@ -1983,6 +2012,16 @@ mod tests {
     use crate::shmem::create_temp_shmem_file;
 
     fn assert_debug<T: core::fmt::Debug>() {}
+
+    #[test]
+    fn never_receives() {
+        let mut consumer = never::<u64>();
+        assert_eq!(consumer.try_read(), None);
+        assert!(matches!(
+            consumer.read_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+    }
 
     #[test]
     fn public_debug_trait_bounds() {
